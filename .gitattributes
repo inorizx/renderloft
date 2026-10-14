@@ -1,0 +1,13 @@
+# 换行符统一为 LF。
+#
+# 为什么需要这个文件：本机 `core.autocrlf=true`，而仓库里**没有** .gitattributes，
+# 于是 `git checkout` / 切分支 / pull 会把工作区文件写成 **CRLF**；prettier 默认要求 LF，
+# 所以每次 checkout 之后 `pnpm verify` 都会因为格式检查失败而变红——而文件内容其实没变。
+# 这个坑在加格式门禁之后才暴露出来（此前没人检查格式，CRLF 也就一直没被注意到）。
+#
+# `text=auto eol=lf`：仓库里按 LF 存，checkout 也按 LF 取。
+* text=auto eol=lf
+
+# Windows 脚本保持 CRLF：某些老工具链对 LF 的 .bat/.cmd 不友好。
+*.bat text eol=crlf
+*.cmd text eol=crlf

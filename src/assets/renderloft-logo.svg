@@ -1,0 +1,12 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024" aria-hidden="true">
+  <defs>
+    <linearGradient id="renderloft-gradient" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#8e7aff" />
+      <stop offset="1" stop-color="#6149e9" />
+    </linearGradient>
+  </defs>
+  <g transform="translate(61 142) scale(.923)" fill="url(#renderloft-gradient)">
+    <path d="M574.5,622.5,828,829l-242,1L391,627H343L242.5,818.5l-177,2L226,506l326-1s57.14-15,58-66c1-59-64.5-71.5-64.5-71.5L230,368,138.5,243.5,551,246s188,18,208,171C780.13,578.62,574.5,622.5,574.5,622.5Z" transform="translate(-65.5 -90.5)" />
+    <path d="M1042.5,270.5S949,280,909,320c-30,30-46.5,130.5-46.5,130.5s-12-97-47.5-132.5c-35-35-132.5-47.5-132.5-47.5S779.94,258.06,815,223c34.5-34.5,47.5-132.5,47.5-132.5s16,99,48.5,131.5C948,259,1042.5,270.5,1042.5,270.5Z" transform="translate(-65.5 -90.5)" />
+  </g>
+</svg>

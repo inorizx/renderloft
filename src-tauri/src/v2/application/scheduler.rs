@@ -1,0 +1,1349 @@
+use serde_json::json;
+use std::sync::Arc;
+
+use crate::v2::application::credential_reference;
+use crate::v2::domain::errors::{DomainResult, ErrorKind, SafeError};
+use crate::v2::domain::execution::{RecoveryProof, SubmitOutcome};
+use crate::v2::domain::ids::ArtifactId;
+use crate::v2::domain::model::Timestamp;
+use crate::v2::domain::operation::Transition;
+use crate::v2::ports::provider::{driver_key, DriverRegistry, PrepareRequest};
+use crate::v2::ports::repositories::{
+    AssetRepository, AttemptResolution, ConnectionRepository, EventSpec, LeaseStore,
+    OperationRepository,
+};
+use crate::v2::ports::stores::ArtifactStore;
+
+pub const LEASE_TTL_SECONDS: u64 = 30;
+// 「默认跟踪死线」那个数字的所有者是 `domain::connection_options`（这里原来也有一份，
+// 而且从来没被用过——真正用它的是 `Run::apply_tracking` 与两处恢复路径）。
+/// 可重试错误（限流/5xx）进入 RETRY_WAIT 后的退避间隔。
+pub const RETRY_BACKOFF_MILLIS: u64 = 30_000;
+
+#[derive(Debug, Clone, Default)]
+pub struct SchedulerTickResult {
+    pub claimed: usize,
+    pub submitted: usize,
+    pub succeeded: usize,
+    pub accepted: usize,
+    pub uncertain: usize,
+    pub retry_wait: usize,
+    pub failed: usize,
+    pub recovered: usize,
+    pub busy: bool,
+}
+
+pub struct SchedulerService {
+    pub owner: String,
+    pub repositories: Arc<dyn OperationRepository>,
+    pub leases: Arc<dyn LeaseStore>,
+    pub connections: Arc<dyn ConnectionRepository>,
+    pub assets: Arc<dyn AssetRepository>,
+    pub artifacts: Arc<dyn ArtifactStore>,
+    pub drivers: Arc<DriverRegistry>,
+}
+
+impl SchedulerService {
+    /// 完成 attempt 并推进 run 状态。若 attempt 已被 cancel fencing
+    /// （complete_attempt 返回 None），run 已取消，跳过 transition，
+    /// 避免 ILLEGAL_RUN_TRANSITION 噪音。
+    async fn complete_and_transition(
+        &self,
+        run_id: crate::v2::domain::ids::RunId,
+        fencing_token: &str,
+        resolution: AttemptResolution,
+        transition: Transition,
+        event: EventSpec,
+    ) -> DomainResult<()> {
+        let completed = self
+            .repositories
+            .complete_attempt(run_id, fencing_token, resolution)
+            .await?;
+        if completed.is_none() {
+            return Ok(());
+        }
+        self.repositories
+            .transition_run(run_id, transition, vec![event])
+            .await?;
+        Ok(())
+    }
+
+    pub async fn tick(&self) -> DomainResult<SchedulerTickResult> {
+        let token = format!("sch-{}", uuid::Uuid::new_v4().simple());
+        let mut result = SchedulerTickResult::default();
+        if self
+            .leases
+            .acquire(&self.owner, &token, LEASE_TTL_SECONDS)
+            .await
+            .is_err()
+        {
+            result.busy = true;
+            return Ok(result);
+        }
+        let outcome = self.tick_claimed(&token).await;
+        let _ = self.leases.release(&self.owner, &token).await;
+        let mut result = outcome?;
+        result.recovered = self.repositories.recover_expired_submissions().await?;
+        Ok(result)
+    }
+
+    async fn tick_claimed(&self, token: &str) -> DomainResult<SchedulerTickResult> {
+        let mut result = SchedulerTickResult::default();
+        let now = Timestamp::now();
+        let revisions = self.connections.list_revisions().await?;
+        for (vendor, protocol, revision) in revisions {
+            let key = driver_key(&vendor, &protocol);
+            let driver = match self.drivers.get(&key) {
+                Ok(driver) => driver,
+                Err(_) => continue,
+            };
+            let slots = driver.available_slots();
+            // ⚠️ `available_slots` 是"这个 provider **总共**允许几个并发"，**不是**
+            // "每个 tick 可以领几个"。此前只按前者当循环次数用，于是 tick 2 会在
+            // tick 1 的任务还在跑时继续提交——被平台拒。
+            //
+            // 实测（并发上限为 1 的 RunningHub 账号）：同时提交 2 个任务，
+            // 第 2 个必然以 `RUNNINGHUB_REJECTED / TASK_QUEUE_MAXED` 失败，
+            // 而且这个**我们自己造成的**失败会被当成"任务失败"报给用户。
+            // 用户看到的是"两张图里有一张失败了"，而真正的原因是我们在抢执行位。
+            let in_flight = self
+                .repositories
+                .count_active_runs_for_connection(revision.id)
+                .await?;
+            let remaining = slots.saturating_sub(in_flight);
+            for _ in 0..remaining {
+                let Some(claimed) = self
+                    .repositories
+                    .claim_next_run(&self.owner, token, revision.id, now.clone())
+                    .await?
+                else {
+                    break;
+                };
+                result.claimed += 1;
+                match self.execute_claimed(&claimed, driver.clone()).await {
+                    Ok(outcome) => match outcome {
+                        ExecuteOutcome::Succeeded => result.succeeded += 1,
+                        ExecuteOutcome::Accepted => result.accepted += 1,
+                        ExecuteOutcome::Uncertain => result.uncertain += 1,
+                        ExecuteOutcome::RetryWait => result.retry_wait += 1,
+                        ExecuteOutcome::Failed => result.failed += 1,
+                        ExecuteOutcome::Cancelled => {}
+                    },
+                    Err(_) => {
+                        // 调度错误不使整个 tick 失败；Run 已通过 claim 被标记，留在 SUBMITTING
+                        // 由 recover_expired_submissions 在下一轮转为 UNCERTAIN。
+                        result.uncertain += 1;
+                    }
+                }
+                result.submitted += 1;
+            }
+        }
+        Ok(result)
+    }
+
+    async fn execute_claimed(
+        &self,
+        claimed: &crate::v2::ports::repositories::ClaimedRun,
+        driver: Arc<dyn crate::v2::ports::provider::ProviderDriver>,
+    ) -> DomainResult<ExecuteOutcome> {
+        let run_id = claimed.run.id;
+        let fingerprint = format!("run-{}:attempt-{}", run_id.0, claimed.attempt.number);
+        // 凭据引用：提交前把"借来的密钥绑定"装到 revision 上（见 credential_reference）。
+        // ⚠️ 失败要走 `resolve_submit_error`（与 prepare 失败同一条路）：那条路会按错误的
+        // 可重试性把 run 判死或排重试。若让它从 `execute_claimed` 直接冒泡出去，调用方只会
+        // 记一个 `uncertain`，run 留在 SUBMITTING 里等对账兜底——用户看到的是"卡住"，
+        // 而不是"引用的连接已被删除"。
+        let connection_revision = match credential_reference::resolve(
+            self.connections.as_ref(),
+            claimed.connection_revision.clone(),
+        )
+        .await
+        {
+            Ok(revision) => revision,
+            Err(error) => {
+                self.resolve_submit_error(claimed, &error).await?;
+                return Ok(error_outcome(&error));
+            }
+        };
+        let mut resolved_assets = Vec::with_capacity(claimed.run.assets.len());
+        for asset_ref in &claimed.run.assets {
+            let bytes = self
+                .assets
+                .read_bytes(asset_ref.asset_id)
+                .await?
+                .unwrap_or_default();
+            resolved_assets.push(crate::v2::ports::provider::ResolvedAsset {
+                asset_ref: asset_ref.clone(),
+                bytes,
+            });
+        }
+        let prepared = driver
+            .prepare(PrepareRequest {
+                connection_revision: connection_revision.clone(),
+                recipe_binding: claimed.recipe_revision.binding.clone(),
+                inputs: claimed.run.inputs.clone(),
+                assets: resolved_assets,
+                request_fingerprint: fingerprint,
+            })
+            .await;
+
+        let prepared = match prepared {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                self.resolve_submit_error(claimed, &error).await?;
+                return Ok(error_outcome(&error));
+            }
+        };
+
+        let outcome = driver.submit(prepared).await;
+        match outcome {
+            Ok(SubmitOutcome::Completed(mut artifacts)) => {
+                // 落库前保证同一 run 内文件名互不相同（**所有 driver 的统一保证**，不靠各 driver
+                // 自己记得）：库里两条不同 id 的记录叫同一个名字，人就没法认哪张是哪张。
+                // 名字由应用名 + artifactId 组成时本来就不会撞，这条只在"查不到应用名"的
+                // 兜底路径上还有活干。
+                crate::v2::domain::execution::ArtifactDraft::make_filenames_unique(&mut artifacts);
+                for (index, artifact) in artifacts.iter().enumerate() {
+                    let id = ArtifactId(run_id.0 * 1000 + index as u64);
+                    // ⚠️ 名字在**落库前**定下来，不是下载时才定：这样界面、CLI、API 看到的是
+                    // 同一个名字，而且它进了库——改名规则要变时只动这一处，不用回头修数据。
+                    let filename = crate::v2::domain::execution::ArtifactDraft::compose_filename(
+                        &claimed.recipe_name,
+                        id,
+                        &artifact.filename,
+                    );
+                    let (url, bytes) = match &artifact.data {
+                        crate::v2::domain::execution::ArtifactData::Bytes(bytes) => {
+                            (None, bytes.clone())
+                        }
+                        crate::v2::domain::execution::ArtifactData::Url { url, .. } => {
+                            (Some(url.clone()), Vec::new())
+                        }
+                    };
+                    self.artifacts
+                        .store(crate::v2::ports::stores::ArtifactObject {
+                            id,
+                            run_id: Some(run_id.0),
+                            filename,
+                            mime_type: artifact.mime_type.clone(),
+                            byte_size: artifact.byte_size,
+                            checksum: artifact.checksum.clone(),
+                            storage_key: format!("{id}"),
+                            url,
+                            bytes,
+                        })
+                        .await?;
+                }
+                self.complete_and_transition(
+                    run_id,
+                    &claimed.attempt.fencing_token,
+                    AttemptResolution::Succeeded {
+                        remote_handle: None,
+                    },
+                    Transition::ToSucceeded,
+                    EventSpec {
+                        event_type: "run.succeeded".to_string(),
+                        run_id: Some(run_id),
+                        safe_payload: json!({ "artifactCount": artifacts.len() }),
+                    },
+                )
+                .await?;
+                Ok(ExecuteOutcome::Succeeded)
+            }
+            Ok(SubmitOutcome::Accepted(handle)) => {
+                // transition_run(ToAccepted) 通过 apply_tracking 会把 tracking 设为 Active，
+                // 并补一条**默认**的 tracking_deadline，从而进入 reconcile 的 active 对账队列。
+                self.complete_and_transition(
+                    run_id,
+                    &claimed.attempt.fencing_token,
+                    AttemptResolution::Succeeded {
+                        remote_handle: Some(handle),
+                    },
+                    Transition::ToAccepted,
+                    EventSpec {
+                        event_type: "run.accepted".to_string(),
+                        run_id: Some(run_id),
+                        safe_payload: json!({}),
+                    },
+                )
+                .await?;
+                // 这条连接**显式配了**"跟多久"就现在写定：死线是"这一次提交最多跟多久"，
+                // 而只有用户知道他的工作流要跑 90 分钟还是 10 秒（写死 1 小时会把长任务
+                // 本地判失败，见 domain::connection_options 的文件头）。
+                //
+                // 为什么在这里写、而不是让仓库层去读配置：仓库（infrastructure）拿不到
+                // 连接 revision，而**策略属于 application**。`next_poll_at` 传 None =
+                // "现在就到期"（`list_active_runs` 的判据里有 `OR next_poll_at IS NULL`），
+                // reconcile 下一拍就会接手，并原样保留这条死线。
+                if let Some(deadline) =
+                    crate::v2::domain::connection_options::configured_tracking_deadline_millis(
+                        &connection_revision.config,
+                    )
+                {
+                    self.repositories
+                        .set_tracking(
+                            run_id,
+                            crate::v2::domain::operation::TrackingState::Active,
+                            None,
+                            Some(crate::v2::domain::model::Timestamp::from_millis(
+                                crate::v2::domain::model::Timestamp::now_millis() + deadline,
+                            )),
+                        )
+                        .await?;
+                }
+                Ok(ExecuteOutcome::Accepted)
+            }
+            Ok(SubmitOutcome::Uncertain(submission)) => {
+                let remote_handle = match &submission.recovery {
+                    RecoveryProof::LookupByRequestId(request_id) => {
+                        Some(crate::v2::domain::execution::RemoteHandle {
+                            provider: driver.descriptor().protocol_id.clone(),
+                            remote_id: request_id.clone(),
+                        })
+                    }
+                    _ => None,
+                };
+                let completed = self
+                    .repositories
+                    .complete_attempt(
+                        run_id,
+                        &claimed.attempt.fencing_token,
+                        AttemptResolution::Uncertain { remote_handle },
+                    )
+                    .await?;
+                // 已被 cancel fencing：放弃后续状态推进。
+                if completed.is_none() {
+                    return Ok(ExecuteOutcome::Cancelled);
+                }
+                match submission.recovery {
+                    RecoveryProof::Idempotent => {
+                        self.repositories
+                            .transition_run(
+                                run_id,
+                                Transition::ToRetryWait,
+                                vec![EventSpec {
+                                    event_type: "run.retry_wait".to_string(),
+                                    run_id: Some(run_id),
+                                    safe_payload: json!({ "reason": "uncertain-idempotent" }),
+                                }],
+                            )
+                            .await?;
+                        self.repositories
+                            .set_tracking(
+                                run_id,
+                                crate::v2::domain::operation::TrackingState::Inactive,
+                                Some(Timestamp::from_millis(
+                                    Timestamp::now_millis() + RETRY_BACKOFF_MILLIS,
+                                )),
+                                None,
+                            )
+                            .await?;
+                        Ok(ExecuteOutcome::RetryWait)
+                    }
+                    _ => {
+                        self.repositories
+                            .transition_run(
+                                run_id,
+                                Transition::ToSubmissionUncertain,
+                                vec![EventSpec {
+                                    event_type: "run.submission_uncertain".to_string(),
+                                    run_id: Some(run_id),
+                                    safe_payload: json!({ "reason": submission.reason }),
+                                }],
+                            )
+                            .await?;
+                        Ok(ExecuteOutcome::Uncertain)
+                    }
+                }
+            }
+            Err(error) => {
+                self.resolve_submit_error(claimed, &error).await?;
+                Ok(error_outcome(&error))
+            }
+        }
+    }
+
+    async fn resolve_submit_error(
+        &self,
+        claimed: &crate::v2::ports::repositories::ClaimedRun,
+        error: &SafeError,
+    ) -> DomainResult<()> {
+        let run_id = claimed.run.id;
+        let unknown = matches!(error.kind, ErrorKind::Network | ErrorKind::Timeout);
+        if unknown {
+            self.repositories
+                .complete_attempt(
+                    run_id,
+                    &claimed.attempt.fencing_token,
+                    AttemptResolution::Uncertain {
+                        remote_handle: None,
+                    },
+                )
+                .await?;
+            self.repositories
+                .transition_run(
+                    run_id,
+                    Transition::ToSubmissionUncertain,
+                    vec![EventSpec {
+                        event_type: "run.submission_uncertain".to_string(),
+                        run_id: Some(run_id),
+                        safe_payload: json!({ "reason": error.message }),
+                    }],
+                )
+                .await?;
+        } else if error.retryable {
+            self.complete_and_transition(
+                run_id,
+                &claimed.attempt.fencing_token,
+                AttemptResolution::Failed {
+                    error: error.clone(),
+                    retryable: true,
+                },
+                Transition::ToRetryWait,
+                EventSpec {
+                    event_type: "run.retry_wait".to_string(),
+                    run_id: Some(run_id),
+                    safe_payload: json!({ "reason": error.message }),
+                },
+            )
+            .await?;
+            // 退避：设置下次可认领时间，防止 scheduler 每 2 秒无限快速重试，
+            // 对限流/5xx 错误加重 Provider 压力。
+            self.repositories
+                .set_tracking(
+                    run_id,
+                    crate::v2::domain::operation::TrackingState::Inactive,
+                    Some(Timestamp::from_millis(
+                        Timestamp::now_millis() + RETRY_BACKOFF_MILLIS,
+                    )),
+                    None,
+                )
+                .await?;
+        } else {
+            // 出事了：写一行固定形状的（用户在日志里能查到"这条为什么失败"）。
+            // 只记不可重试的终态失败——可重试的那些会自己再试，记下来只会把日志灌满。
+            crate::v2::logging::log_failure(
+                "run",
+                &format!("run={}", run_id.0),
+                &error.code,
+                &error.message,
+            );
+            self.repositories
+                .set_run_error(run_id, Some(error.clone()))
+                .await?;
+            self.complete_and_transition(
+                run_id,
+                &claimed.attempt.fencing_token,
+                AttemptResolution::Failed {
+                    error: error.clone(),
+                    retryable: false,
+                },
+                Transition::ToFailed,
+                EventSpec {
+                    event_type: "run.failed".to_string(),
+                    run_id: Some(run_id),
+                    safe_payload: json!({ "reason": error.message, "error": error }),
+                },
+            )
+            .await?;
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ExecuteOutcome {
+    Succeeded,
+    Accepted,
+    Uncertain,
+    RetryWait,
+    Failed,
+    /// attempt 已被 cancel fencing：run 已取消，跳过一切状态推进。
+    Cancelled,
+}
+
+fn error_outcome(error: &SafeError) -> ExecuteOutcome {
+    if matches!(error.kind, ErrorKind::Network | ErrorKind::Timeout) {
+        ExecuteOutcome::Uncertain
+    } else if error.retryable {
+        ExecuteOutcome::RetryWait
+    } else {
+        ExecuteOutcome::Failed
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::v2::domain::actor::{ActorKind, ActorRef, Scope};
+    use crate::v2::domain::execution::{
+        ProviderDescriptor, RecoveryProof, RemoteHandle, SubmitOutcome, UncertainSubmission,
+    };
+    use crate::v2::domain::ids::{
+        ClientId, ConnectionId, ConnectionRevisionId, OperationId, RecipeId, RecipeRevisionId,
+    };
+    use crate::v2::domain::model::{
+        Connection, ConnectionOverride, ConnectionRevision, LifecycleFeatures, Recipe,
+        RecipeBinding, RecipeRevision, RecipeSource, RecipeVisibility,
+    };
+    use crate::v2::domain::operation::RunStatus;
+    use crate::v2::infrastructure::fakes::{
+        completed_artifact_draft, FakeProviderDriver, InMemoryRepositories,
+    };
+    use crate::v2::ports::provider::driver_key;
+    use serde_json::{json, Value};
+    use std::collections::BTreeMap;
+    use std::sync::Arc;
+
+    const EXECUTE_SCOPE: Scope = Scope::OperationsExecute;
+
+    fn actor() -> ActorRef {
+        ActorRef {
+            id: "actor-1".to_string(),
+            kind: ActorKind::Mcp,
+            client_id: ClientId("client-1".to_string()),
+            scopes: vec![EXECUTE_SCOPE],
+            label: None,
+        }
+    }
+
+    /// 凭据引用的两个夹具：一条 RunningHub"密钥宿主"连接，以及把某条连接指向它。
+    ///
+    /// 复用 `seed_connection` 的覆盖语义（同 id 再种一次即替换），所以不必重建整个环境。
+    fn seed_runninghub_source(repositories: &InMemoryRepositories, id: u64) {
+        repositories.seed_connection(
+            Connection {
+                id: ConnectionId(id),
+                vendor: "runninghub".to_string(),
+                protocol: "runninghub".to_string(),
+                display_name: "RunningHub".to_string(),
+                current_revision_id: ConnectionRevisionId(id * 100),
+                status: crate::v2::domain::model::ConnectionStatus::Active,
+            },
+            vec![ConnectionRevision {
+                id: ConnectionRevisionId(id * 100),
+                connection_id: ConnectionId(id),
+                config: BTreeMap::from([(
+                    "baseUrl".to_string(),
+                    json!("https://www.runninghub.cn"),
+                )]),
+                secret_bindings: vec![crate::v2::domain::model::SecretBinding {
+                    slot: format!("connection-{id}-api_key"),
+                    resolution: crate::v2::domain::model::SecretResolution::Current,
+                }],
+                effective_capabilities: vec!["workflow-execution".to_string()],
+                lifecycle_features: LifecycleFeatures::default(),
+                created_at: Timestamp::now(),
+            }],
+        );
+    }
+
+    fn point_connection_at(
+        repositories: &InMemoryRepositories,
+        connection_id: u64,
+        source_id: u64,
+    ) {
+        let revision = ConnectionRevision {
+            id: ConnectionRevisionId(1),
+            connection_id: ConnectionId(connection_id),
+            config: BTreeMap::from([(
+                credential_reference::SOURCE_CONNECTION_ID.to_string(),
+                json!(source_id),
+            )]),
+            secret_bindings: vec![],
+            effective_capabilities: vec!["text-to-image".to_string()],
+            lifecycle_features: LifecycleFeatures {
+                synchronous_result: true,
+                remote_reconciliation: true,
+                ..Default::default()
+            },
+            created_at: Timestamp::now(),
+        };
+        repositories.seed_connection(
+            Connection {
+                id: ConnectionId(connection_id),
+                vendor: "openai".to_string(),
+                protocol: "openai-images".to_string(),
+                display_name: "OpenAI Images".to_string(),
+                current_revision_id: ConnectionRevisionId(1),
+                status: crate::v2::domain::model::ConnectionStatus::Active,
+            },
+            vec![revision],
+        );
+    }
+
+    fn seed_environment(repositories: &InMemoryRepositories) {
+        seed_environment_with_config(repositories, Default::default());
+    }
+
+    /// 与 `seed_environment` 同一套环境，但**连接的 `config` 可指定**——
+    /// 用来验"连接上配的可选参数真的被用上了"（见下面的跟踪上限那条测试）。
+    fn seed_environment_with_config(
+        repositories: &InMemoryRepositories,
+        config: BTreeMap<String, Value>,
+    ) {
+        let connection = Connection {
+            id: ConnectionId(1),
+            vendor: "openai".to_string(),
+            protocol: "openai-images".to_string(),
+            display_name: "OpenAI Images".to_string(),
+            current_revision_id: ConnectionRevisionId(1),
+            status: crate::v2::domain::model::ConnectionStatus::Active,
+        };
+        let connection_revision = ConnectionRevision {
+            id: ConnectionRevisionId(1),
+            connection_id: ConnectionId(1),
+            config,
+            secret_bindings: vec![],
+            effective_capabilities: vec!["text-to-image".to_string()],
+            lifecycle_features: LifecycleFeatures {
+                synchronous_result: true,
+                remote_reconciliation: true,
+                ..Default::default()
+            },
+            created_at: Timestamp::now(),
+        };
+        repositories.seed_connection(connection, vec![connection_revision]);
+
+        let recipe = Recipe {
+            id: RecipeId(1),
+            name: "Image Recipe".to_string(),
+            description: "text to image".to_string(),
+            labels: vec![],
+            capability: "text-to-image".to_string(),
+            current_revision_id: RecipeRevisionId(1),
+            visibility: RecipeVisibility::Private,
+            created_at: Timestamp::now(),
+            updated_at: Timestamp::now(),
+            favorite: false,
+            group: None,
+            note: None,
+            last_opened_at: None,
+            field_labels: Default::default(),
+            removed_at: None,
+        };
+        let revision = RecipeRevision {
+            id: RecipeRevisionId(1),
+            recipe_id: RecipeId(1),
+            revision: 1,
+            input_schema: json!({
+                "type": "object",
+                "required": ["prompt"],
+                "properties": { "prompt": { "type": "string" } }
+            }),
+            output_schema: json!({ "type": "object" }),
+            binding: RecipeBinding {
+                driver_key: "openai-images".to_string(),
+                provider_config: Default::default(),
+                default_connection_id: ConnectionId(1),
+                allowed_connection_ids: vec![ConnectionId(1)],
+                connection_override: ConnectionOverride::Denied,
+            },
+            defaults: Default::default(),
+            source: RecipeSource::Embedded,
+            created_at: Timestamp::now(),
+        };
+        repositories.seed_recipe(recipe, vec![revision]);
+    }
+
+    async fn create_operation(
+        repositories: &InMemoryRepositories,
+    ) -> (OperationId, crate::v2::domain::ids::RunId) {
+        create_operation_with_key(repositories, "scheduler-test-key").await
+    }
+
+    async fn create_operation_with_key(
+        repositories: &InMemoryRepositories,
+        key: &str,
+    ) -> (OperationId, crate::v2::domain::ids::RunId) {
+        use crate::v2::application::create_operation::{
+            CreateOperation, CreateOperationRequest, Repositories, RunRequest,
+        };
+        use crate::v2::domain::ids::IdempotencyKey;
+        use crate::v2::infrastructure::schema::BasicSchemaValidator;
+        let use_case = CreateOperation::new(
+            Repositories {
+                recipes: Box::new(repositories.clone()),
+                connections: Box::new(repositories.clone()),
+                operations: Box::new(repositories.clone()),
+            },
+            Box::new(crate::v2::infrastructure::fakes::PermitAllAuthorizationPolicy),
+            Box::new(BasicSchemaValidator),
+        );
+        let persisted = use_case
+            .execute(CreateOperationRequest {
+                actor: actor(),
+                origin: "mcp".to_string(),
+                idempotency_key: IdempotencyKey(key.to_string()),
+                runs: vec![RunRequest {
+                    client_run_id: "image-1".to_string(),
+                    recipe_revision_id: RecipeRevisionId(1),
+                    connection_id: None,
+                    inputs: BTreeMap::from([("prompt".to_string(), json!("a red house"))]),
+                    assets: vec![],
+                }],
+                metadata: Default::default(),
+                callback: None,
+            })
+            .await
+            .expect("创建 Operation 应成功");
+        (persisted.operation.id, persisted.runs[0].id)
+    }
+
+    /// 连接上配了「跟踪上限」⇒ 提交成功那一刻写下的死线就是它（而不是默认 1 小时）。
+    ///
+    /// 这条钉的是**跨层的那一步**：策略在 application（调度器读连接 config），而"写死线"的
+    /// 能力在仓库层（`Run::apply_tracking` / `set_tracking`）——两边的单测各自绿的时候，
+    /// 中间那条线断了也没人知道。而它断掉的后果是**用户配的上限不生效**：
+    /// 跑 90 分钟的视频工作流会在 1 小时被本地判失败（`TRACKING_EXHAUSTED`）。
+    ///
+    /// 反向控制：**不配**的连接必须拿到默认 1 小时。少了这半条，一个"永远写死一个数"的
+    /// 实现也能过前半条。
+    #[tokio::test]
+    async fn accepted_run_takes_its_tracking_deadline_from_the_connection() {
+        use crate::v2::domain::connection_options;
+        use crate::v2::domain::model::Timestamp;
+
+        /// 受理一个任务，返回"死线还剩多少毫秒"。
+        async fn remaining_deadline_millis(config: BTreeMap<String, Value>) -> u64 {
+            let repositories = InMemoryRepositories::new();
+            seed_environment_with_config(&repositories, config);
+            create_operation(&repositories).await;
+            let driver = driver_with(SubmitOutcome::Accepted(RemoteHandle {
+                provider: "openai-images".to_string(),
+                remote_id: "task-1".to_string(),
+            }));
+            let service = scheduler(repositories.clone(), driver);
+            let tick = service.tick().await.expect("tick 应成功");
+            assert_eq!(tick.accepted, 1, "应当被受理");
+            let operation = repositories
+                .find_operation(OperationId(1))
+                .await
+                .expect("find")
+                .expect("operation");
+            let run = &operation.runs[0];
+            assert_eq!(run.status, RunStatus::Accepted);
+            run.tracking_deadline
+                .as_ref()
+                .expect("受理后必须有死线")
+                .millis()
+                .saturating_sub(Timestamp::now_millis())
+        }
+
+        // ① 配了 120 秒 ⇒ 死线约 120 秒后（与默认的 3600 秒差得很远，不会看错）。
+        let configured = remaining_deadline_millis(BTreeMap::from([(
+            connection_options::TRACKING_DEADLINE_KEY.to_string(),
+            json!(120),
+        )]))
+        .await;
+        assert!(
+            (100_000..=130_000).contains(&configured),
+            "连接上配了 120 秒，死线就该是约 120 秒，实际剩 {configured} ms"
+        );
+
+        // ② 不配 ⇒ 默认 1 小时。
+        let by_default = remaining_deadline_millis(Default::default()).await;
+        assert!(
+            (3_500_000..=3_700_000).contains(&by_default),
+            "没配就该是默认 1 小时，实际剩 {by_default} ms"
+        );
+    }
+
+    /// **我们一次都不该被平台拒绝**——这条断言落在用户看到的事实上，
+    /// 而不是调度器的内部计数。
+    ///
+    /// ⚠️ 这是"用假平台复现真平台"的第一条：真平台（并发上限 1）在忙时**拒绝**新提交，
+    /// 实测原文 `RUNNINGHUB_REJECTED / TASK_QUEUE_MAXED`。旧替身没有"在跑几个"的状态，
+    /// 所以这个场景**根本写不出来**——调度器抢执行位的 bug 就是这样从 309 个测试里
+    /// 活到真跑的。
+    ///
+    /// 判别点两条：
+    /// 1. 提交 2 个任务、上限 1 ⇒ **零拒绝**；
+    /// 2. 执行位释放后，第二个**必须**被提交（否则任务永远不动）。
+    #[tokio::test]
+    async fn never_gets_refused_by_a_single_slot_provider() {
+        let repositories = InMemoryRepositories::new();
+        seed_environment(&repositories);
+        create_operation(&repositories).await;
+        create_operation_with_key(&repositories, "second-key").await;
+
+        let driver = driver_with(SubmitOutcome::Accepted(RemoteHandle {
+            provider: "openai-images".to_string(),
+            remote_id: "task-1".to_string(),
+        }));
+        // ⚠️ 一次只压**一个**结果：`push_outcome` 是 `Vec::push` 而 `submit` 用 `pop()`
+        // ——取的是**最后压进去的**。一次压两个会让顺序反过来（踩过：release 了一个
+        // 从没进过在跑集合的 id，表现为"释放后仍不提交"）。
+        let service = scheduler(repositories.clone(), driver.clone());
+
+        // tick 1：受理 task-1，占住唯一的执行位。
+        let first = service.tick().await.expect("tick 应成功");
+        assert_eq!(first.accepted, 1, "第一个应当被受理");
+
+        // tick 2：执行位还占着。**这里就是那个 bug 的位置**——
+        // 修复前它会照样提交第二个，被平台拒。
+        let second = service.tick().await.expect("tick 应成功");
+        assert_eq!(
+            driver.refusal_count(),
+            0,
+            "执行位占着时不得再提交——被平台拒就是我们自己造成的失败，\
+             而用户看到的是「任务失败」"
+        );
+        assert_eq!(second.accepted, 0, "没有执行位就不该受理第二个");
+
+        // 2) 执行位释放后，第二个**必须**被提交，否则任务永远不动。
+        //
+        // ⚠️ "执行位"是**两侧**的事，测试要把两侧都推到位（这是踩出来的）：
+        // * **平台侧**：`release` 告诉模拟器"task-1 跑完了"——否则模拟器仍会拒绝；
+        // * **我们账本侧**：把 run 标终态——调度器判"有没有空位"看的是**自己的账本**
+        //   （`count_active_runs_for_connection`），只 release 平台侧的话它仍认为满着。
+        // 两侧都推到位，才是真平台上"任务完成 → 对账标终态 → 可以提交下一个"的完整过程。
+        driver.release("task-1");
+        // 下一个提交要用的脚本结果（一次只压一个，见上面的顺序说明）。
+        driver.push_outcome(SubmitOutcome::Accepted(RemoteHandle {
+            provider: "openai-images".to_string(),
+            remote_id: "task-2".to_string(),
+        }));
+        {
+            let persisted = repositories
+                .find_operation(OperationId(1))
+                .await
+                .expect("find")
+                .expect("operation");
+            let run_id = persisted.runs[0].id;
+            for transition in [crate::v2::domain::operation::Transition::ToSucceeded] {
+                repositories
+                    .transition_run(run_id, transition, Vec::new())
+                    .await
+                    .expect("transition");
+            }
+            repositories
+                .set_tracking(
+                    run_id,
+                    crate::v2::domain::operation::TrackingState::Inactive,
+                    None,
+                    None,
+                )
+                .await
+                .expect("set tracking");
+        }
+        let third = service.tick().await.expect("tick 应成功");
+        assert_eq!(third.accepted, 1, "执行位释放后必须接着提交下一个");
+        // 两个 run 都到达终态/受理（不是被拒、也不是卡在 QUEUED）。
+        let first_run = repositories
+            .find_operation(OperationId(1))
+            .await
+            .expect("find")
+            .expect("operation");
+        assert_eq!(first_run.runs[0].status, RunStatus::Succeeded);
+        let second_run = repositories
+            .find_operation(OperationId(2))
+            .await
+            .expect("find")
+            .expect("operation");
+        assert_eq!(
+            second_run.runs[0].status,
+            RunStatus::Accepted,
+            "第二个应当被受理（而不是被平台拒）"
+        );
+    }
+
+    /// 连接上**已有 run 在跑**时，调度器不得再提交下一个。
+    ///
+    /// 起因是一次真跑：并发上限为 1 的 RunningHub 账号上同时提交 2 个任务，
+    /// 第 2 个必然以 `RUNNINGHUB_REJECTED / TASK_QUEUE_MAXED` 失败——
+    /// **那是我们自己造成的**：`available_slots()` 是"这个 provider 总共允许几个并发"
+    /// （静态值 1），而调度器只把它当"每个 tick 最多领几个"，于是 tick 2 在
+    /// tick 1 的任务还占着执行位时继续提交。用户看到的是"两张图里有一张失败了"。
+    ///
+    /// 判别点两条，缺一条都不算做对：
+    /// 1. 已有活跃 run ⇒ 这一个 tick **一个都不领**（`claimed == 0`）；
+    /// 2. 没有活跃 run 时照常领——反向控制。少了它，一个"永远不领"的实现也能过第 1 条。
+    #[tokio::test]
+    async fn does_not_submit_when_a_run_is_already_in_flight() {
+        use crate::v2::domain::operation::{TrackingState, Transition};
+
+        // 1) 有一个 run 正占着 provider 执行位 ⇒ 这个 tick 一个都不领。
+        let repositories = InMemoryRepositories::new();
+        seed_environment(&repositories);
+        let (_, in_flight_run) = create_operation(&repositories).await;
+        // 走**端口方法**把它推到"已受理且在跟踪"——与生产路径同一套转换，
+        // 而不是戳替身内部状态（那样测的就不是真实可达的状态组合了）。
+        for transition in [
+            Transition::ToPreparing,
+            Transition::ToSubmitting,
+            Transition::ToAccepted,
+        ] {
+            repositories
+                .transition_run(in_flight_run, transition, Vec::new())
+                .await
+                .expect("transition");
+        }
+        repositories
+            .set_tracking(in_flight_run, TrackingState::Active, None, None)
+            .await
+            .expect("set tracking");
+        // 再排一个待跑的：它**不该**被领走。
+        create_operation_with_key(&repositories, "second-key").await;
+
+        let service = scheduler(
+            repositories.clone(),
+            driver_with(SubmitOutcome::Accepted(RemoteHandle {
+                provider: "openai-images".to_string(),
+                remote_id: "task-1".to_string(),
+            })),
+        );
+        let tick = service.tick().await.expect("tick 应成功");
+        assert_eq!(
+            tick.claimed, 0,
+            "已有 run 在跑时不得再领新 run——否则那一个就是被平台拒的（TASK_QUEUE_MAXED）"
+        );
+
+        // 2) 反向控制：没有活跃 run 时必须照常领，否则任务永远不动。
+        let repositories = InMemoryRepositories::new();
+        seed_environment(&repositories);
+        create_operation(&repositories).await;
+        let service = scheduler(
+            repositories,
+            driver_with(SubmitOutcome::Accepted(RemoteHandle {
+                provider: "openai-images".to_string(),
+                remote_id: "task-1".to_string(),
+            })),
+        );
+        let tick = service.tick().await.expect("tick 应成功");
+        assert_eq!(tick.claimed, 1, "没有活跃 run 时必须照常提交");
+    }
+
+    fn driver_with(outcome: SubmitOutcome) -> Arc<FakeProviderDriver> {
+        let driver = Arc::new(FakeProviderDriver::new(ProviderDescriptor {
+            vendor_id: "openai".to_string(),
+            protocol_id: "openai-images".to_string(),
+            display_name: "OpenAI Images".to_string(),
+            business_capabilities: vec!["text-to-image".to_string()],
+            lifecycle_features: LifecycleFeatures {
+                synchronous_result: true,
+                remote_reconciliation: true,
+                ..Default::default()
+            },
+            security_requirements: Default::default(),
+            connection_schema: json!({}),
+            binding_schema: json!({}),
+        }));
+        driver.push_outcome(outcome);
+        driver
+    }
+
+    fn scheduler(
+        repositories: InMemoryRepositories,
+        driver: Arc<FakeProviderDriver>,
+    ) -> SchedulerService {
+        let mut registry = DriverRegistry::new();
+        registry.register(driver_key("openai", "openai-images"), driver);
+        SchedulerService {
+            owner: "test-scheduler".to_string(),
+            repositories: Arc::new(repositories.clone()),
+            leases: Arc::new(repositories.clone()),
+            connections: Arc::new(repositories.clone()),
+            assets: Arc::new(repositories.clone()),
+            artifacts: Arc::new(repositories.clone()),
+            drivers: Arc::new(registry),
+        }
+    }
+
+    /// 凭据引用：引用方的 run 提交时，驱动拿到的必须是**被引用连接**的槽位。
+    ///
+    /// 这条断言落在"驱动收到了什么"上（替身记下了每次 `prepare` 的槽位），而不是
+    /// "我们调过解析函数"——中间任何一环漏掉，用户看到的就是 rh-proxy 地址里没有 key。
+    #[tokio::test]
+    async fn a_referencing_connection_submits_with_the_borrowed_slot() {
+        let repositories = InMemoryRepositories::new();
+        seed_environment(&repositories);
+        seed_runninghub_source(&repositories, 2);
+        point_connection_at(&repositories, 1, 2);
+        create_operation(&repositories).await;
+
+        let driver = driver_with(SubmitOutcome::Accepted(RemoteHandle {
+            provider: "openai-images".to_string(),
+            remote_id: "task-1".to_string(),
+        }));
+        let service = scheduler(repositories.clone(), driver.clone());
+        let result = service.tick().await.expect("调度应成功");
+
+        assert_eq!(result.accepted, 1);
+        assert_eq!(
+            driver.prepare_slots(),
+            vec![vec!["connection-2-api_key".to_string()]],
+            "驱动必须拿到**借来的**槽位（自己那条连接上没有任何绑定）"
+        );
+    }
+
+    /// 引用坏了（目标被删）⇒ run **当场失败**，而不是留在 SUBMITTING 等对账兜底。
+    ///
+    /// 后者是这条测试要防的具体事故：`execute_claimed` 的错误若直接冒泡，调用方只记一个
+    /// `uncertain`，run 会被 recover 成 UNCERTAIN 再重试，用户看到的是"卡住/反复重试"，
+    /// 而真正的原因（引用的连接已被删除）一句话就能说清。
+    #[tokio::test]
+    async fn a_broken_reference_fails_the_run_instead_of_leaving_it_uncertain() {
+        let repositories = InMemoryRepositories::new();
+        seed_environment(&repositories);
+        point_connection_at(&repositories, 1, 99); // 指向不存在的连接
+        let (operation_id, _) = create_operation(&repositories).await;
+
+        let driver = driver_with(SubmitOutcome::Accepted(RemoteHandle {
+            provider: "openai-images".to_string(),
+            remote_id: "task-1".to_string(),
+        }));
+        let service = scheduler(repositories.clone(), driver.clone());
+        let result = service.tick().await.expect("调度应成功");
+
+        assert_eq!(result.failed, 1, "引用坏掉应当判失败");
+        assert_eq!(result.uncertain, 0, "不能落到 uncertain——那会变成「卡住」");
+        assert!(
+            driver.prepare_slots().is_empty(),
+            "解析失败时**一次都不该**去调驱动"
+        );
+        let persisted = repositories
+            .find_operation(operation_id)
+            .await
+            .unwrap()
+            .unwrap();
+        let error = persisted.runs[0].error.clone().expect("run 应当带错误");
+        assert_eq!(error.code, "CONNECTION_SOURCE_NOT_FOUND");
+        assert!(
+            error.message.contains("#99"),
+            "错误信息要指到具体是哪条连接：{}",
+            error.message
+        );
+    }
+
+    #[tokio::test]
+    async fn completed_outcome_marks_run_succeeded_and_stores_artifact() {
+        let repositories = InMemoryRepositories::new();
+        seed_environment(&repositories);
+        let (_, run_id) = create_operation(&repositories).await;
+        let scheduler = scheduler(
+            repositories.clone(),
+            driver_with(SubmitOutcome::Completed(vec![completed_artifact_draft(
+                "out.png",
+            )])),
+        );
+        let result = scheduler.tick().await.expect("调度应成功");
+        assert_eq!(result.succeeded, 1);
+        let persisted = repositories
+            .find_operation(OperationId(1))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(persisted.runs[0].id, run_id);
+        assert_eq!(persisted.runs[0].status, RunStatus::Succeeded);
+        assert_eq!(
+            persisted.operation.status,
+            crate::v2::domain::operation::OperationStatus::Succeeded
+        );
+        assert_eq!(repositories.artifacts().len(), 1);
+        let attempt = repositories.attempts();
+        assert_eq!(
+            attempt[0].status,
+            crate::v2::domain::operation::AttemptStatus::Succeeded
+        );
+    }
+
+    #[tokio::test]
+    async fn accepted_outcome_marks_run_accepted_with_handle() {
+        let repositories = InMemoryRepositories::new();
+        seed_environment(&repositories);
+        create_operation(&repositories).await;
+        let scheduler = scheduler(
+            repositories.clone(),
+            driver_with(SubmitOutcome::Accepted(RemoteHandle {
+                provider: "openai-images".to_string(),
+                remote_id: "task-1".to_string(),
+            })),
+        );
+        let result = scheduler.tick().await.expect("调度应成功");
+        assert_eq!(result.accepted, 1);
+        let persisted = repositories
+            .find_operation(OperationId(1))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(persisted.runs[0].status, RunStatus::Accepted);
+        let attempt = repositories.attempts()[0].clone();
+        assert_eq!(attempt.remote_handle.unwrap().remote_id, "task-1");
+        // Accepted 后进入 active 对账队列（apply_tracking 已处理），
+        // reconcile 可据此轮询远端。
+        assert_eq!(
+            persisted.runs[0].tracking_state,
+            crate::v2::domain::operation::TrackingState::Active
+        );
+    }
+
+    #[tokio::test]
+    async fn uncertain_without_proof_marks_run_submission_uncertain() {
+        let repositories = InMemoryRepositories::new();
+        seed_environment(&repositories);
+        create_operation(&repositories).await;
+        let scheduler = scheduler(
+            repositories.clone(),
+            driver_with(SubmitOutcome::Uncertain(UncertainSubmission {
+                reason: "响应丢失".to_string(),
+                recovery: RecoveryProof::None,
+            })),
+        );
+        let result = scheduler.tick().await.expect("调度应成功");
+        assert_eq!(result.uncertain, 1);
+        let persisted = repositories
+            .find_operation(OperationId(1))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(persisted.runs[0].status, RunStatus::SubmissionUncertain);
+    }
+
+    #[tokio::test]
+    async fn uncertain_with_idempotent_proof_marks_run_retry_wait() {
+        let repositories = InMemoryRepositories::new();
+        seed_environment(&repositories);
+        create_operation(&repositories).await;
+        let scheduler = scheduler(
+            repositories.clone(),
+            driver_with(SubmitOutcome::Uncertain(UncertainSubmission {
+                reason: "超时但请求幂等".to_string(),
+                recovery: RecoveryProof::Idempotent,
+            })),
+        );
+        let result = scheduler.tick().await.expect("调度应成功");
+        assert_eq!(result.retry_wait, 1);
+        let persisted = repositories
+            .find_operation(OperationId(1))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(persisted.runs[0].status, RunStatus::RetryWait);
+    }
+
+    #[tokio::test]
+    async fn retry_wait_run_is_not_claimed_before_backoff() {
+        let repositories = InMemoryRepositories::new();
+        seed_environment(&repositories);
+        create_operation(&repositories).await;
+        let driver = Arc::new(FakeProviderDriver::new(ProviderDescriptor {
+            vendor_id: "openai".to_string(),
+            protocol_id: "openai-images".to_string(),
+            display_name: "OpenAI Images".to_string(),
+            business_capabilities: vec!["text-to-image".to_string()],
+            lifecycle_features: LifecycleFeatures::default(),
+            security_requirements: Default::default(),
+            connection_schema: json!({}),
+            binding_schema: json!({}),
+        }));
+        driver.push_submit_error(SafeError::retryable("RATE_LIMITED", "临时限流"));
+        let mut registry = DriverRegistry::new();
+        registry.register(driver_key("openai", "openai-images"), driver.clone());
+        let scheduler = SchedulerService {
+            owner: "test-scheduler".to_string(),
+            repositories: Arc::new(repositories.clone()),
+            leases: Arc::new(repositories.clone()),
+            connections: Arc::new(repositories.clone()),
+            assets: Arc::new(repositories.clone()),
+            artifacts: Arc::new(repositories.clone()),
+            drivers: Arc::new(registry),
+        };
+        let result = scheduler.tick().await.expect("第一轮应成功");
+        assert_eq!(result.retry_wait, 1);
+        let persisted = repositories
+            .find_operation(OperationId(1))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(persisted.runs[0].status, RunStatus::RetryWait);
+        assert!(
+            persisted.runs[0]
+                .next_poll_at
+                .as_ref()
+                .is_some_and(|next| next.millis() > Timestamp::now_millis()),
+            "RETRY_WAIT 必须设置退避时间"
+        );
+
+        // 退避期内再次调度：run 不应被认领（driver 没有新的 submit 错误可用，
+        // 若被认领会因错误栈为空而 panic 或产生额外提交）。
+        let result2 = scheduler.tick().await.expect("第二轮应成功");
+        assert_eq!(result2.claimed, 0, "退避期内不得认领 RETRY_WAIT run");
+    }
+
+    #[tokio::test]
+    async fn retryable_error_marks_run_retry_wait() {
+        let repositories = InMemoryRepositories::new();
+        seed_environment(&repositories);
+        create_operation(&repositories).await;
+        let driver = Arc::new(FakeProviderDriver::new(ProviderDescriptor {
+            vendor_id: "openai".to_string(),
+            protocol_id: "openai-images".to_string(),
+            display_name: "OpenAI Images".to_string(),
+            business_capabilities: vec!["text-to-image".to_string()],
+            lifecycle_features: LifecycleFeatures::default(),
+            security_requirements: Default::default(),
+            connection_schema: json!({}),
+            binding_schema: json!({}),
+        }));
+        driver.push_submit_error(SafeError::retryable("RATE_LIMITED", "临时限流"));
+        let mut registry = DriverRegistry::new();
+        registry.register(driver_key("openai", "openai-images"), driver);
+        let scheduler = SchedulerService {
+            owner: "test-scheduler".to_string(),
+            repositories: Arc::new(repositories.clone()),
+            leases: Arc::new(repositories.clone()),
+            connections: Arc::new(repositories.clone()),
+            assets: Arc::new(repositories.clone()),
+            artifacts: Arc::new(repositories.clone()),
+            drivers: Arc::new(registry),
+        };
+        let result = scheduler.tick().await.expect("调度应成功");
+        assert_eq!(result.retry_wait, 1);
+        let persisted = repositories
+            .find_operation(OperationId(1))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(persisted.runs[0].status, RunStatus::RetryWait);
+    }
+
+    #[tokio::test]
+    async fn network_error_marks_run_submission_uncertain() {
+        let repositories = InMemoryRepositories::new();
+        seed_environment(&repositories);
+        create_operation(&repositories).await;
+        let driver = Arc::new(FakeProviderDriver::new(ProviderDescriptor {
+            vendor_id: "openai".to_string(),
+            protocol_id: "openai-images".to_string(),
+            display_name: "OpenAI Images".to_string(),
+            business_capabilities: vec!["text-to-image".to_string()],
+            lifecycle_features: LifecycleFeatures::default(),
+            security_requirements: Default::default(),
+            connection_schema: json!({}),
+            binding_schema: json!({}),
+        }));
+        driver.push_submit_error(SafeError::network("SUBMIT_TIMEOUT", "提交超时"));
+        let mut registry = DriverRegistry::new();
+        registry.register(driver_key("openai", "openai-images"), driver);
+        let scheduler = SchedulerService {
+            owner: "test-scheduler".to_string(),
+            repositories: Arc::new(repositories.clone()),
+            leases: Arc::new(repositories.clone()),
+            connections: Arc::new(repositories.clone()),
+            assets: Arc::new(repositories.clone()),
+            artifacts: Arc::new(repositories.clone()),
+            drivers: Arc::new(registry),
+        };
+        let result = scheduler.tick().await.expect("调度应成功");
+        assert_eq!(result.uncertain, 1);
+        let persisted = repositories
+            .find_operation(OperationId(1))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(persisted.runs[0].status, RunStatus::SubmissionUncertain);
+    }
+
+    #[tokio::test]
+    async fn non_retryable_error_marks_run_failed() {
+        let repositories = InMemoryRepositories::new();
+        seed_environment(&repositories);
+        create_operation(&repositories).await;
+        let driver = Arc::new(FakeProviderDriver::new(ProviderDescriptor {
+            vendor_id: "openai".to_string(),
+            protocol_id: "openai-images".to_string(),
+            display_name: "OpenAI Images".to_string(),
+            business_capabilities: vec!["text-to-image".to_string()],
+            lifecycle_features: LifecycleFeatures::default(),
+            security_requirements: Default::default(),
+            connection_schema: json!({}),
+            binding_schema: json!({}),
+        }));
+        driver.push_submit_error(SafeError::validation("MODEL_NOT_FOUND", "模型不存在"));
+        let mut registry = DriverRegistry::new();
+        registry.register(driver_key("openai", "openai-images"), driver);
+        let scheduler = SchedulerService {
+            owner: "test-scheduler".to_string(),
+            repositories: Arc::new(repositories.clone()),
+            leases: Arc::new(repositories.clone()),
+            connections: Arc::new(repositories.clone()),
+            assets: Arc::new(repositories.clone()),
+            artifacts: Arc::new(repositories.clone()),
+            drivers: Arc::new(registry),
+        };
+        let result = scheduler.tick().await.expect("调度应成功");
+        assert_eq!(result.failed, 1);
+        let persisted = repositories
+            .find_operation(OperationId(1))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(persisted.runs[0].status, RunStatus::Failed);
+        assert_eq!(
+            persisted.operation.status,
+            crate::v2::domain::operation::OperationStatus::Failed
+        );
+    }
+
+    #[tokio::test]
+    async fn busy_lease_returns_busy_without_claiming() {
+        let repositories = InMemoryRepositories::new();
+        seed_environment(&repositories);
+        create_operation(&repositories).await;
+        repositories
+            .acquire("other-owner", "other-token", 30)
+            .await
+            .expect("其他所有者应先获取租约");
+        let scheduler = scheduler(
+            repositories.clone(),
+            driver_with(SubmitOutcome::Completed(vec![completed_artifact_draft(
+                "out.png",
+            )])),
+        );
+        let result = scheduler.tick().await.expect("tick 应返回 busy 而非报错");
+        assert!(result.busy);
+        assert_eq!(result.claimed, 0);
+    }
+
+    #[tokio::test]
+    async fn recover_expired_submissions_transitions_stuck_submitting_runs() {
+        let repositories = InMemoryRepositories::new();
+        seed_environment(&repositories);
+        create_operation(&repositories).await;
+        // 模拟进程在提交前崩溃：run 停留在 SUBMITTING 且 attempt 已过期
+        repositories.set_recovery_window(0);
+        let claimed = repositories
+            .claim_next_run(
+                "test-scheduler",
+                "fencing-token-1",
+                ConnectionRevisionId(1),
+                Timestamp::from_millis(0),
+            )
+            .await
+            .expect("claim 应成功")
+            .expect("应有可领取的 Run");
+        assert_eq!(claimed.run.status, RunStatus::Submitting);
+        let recovered = repositories
+            .recover_expired_submissions()
+            .await
+            .expect("恢复应成功");
+        assert_eq!(recovered, 1);
+        let persisted = repositories
+            .find_operation(OperationId(1))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(persisted.runs[0].status, RunStatus::SubmissionUncertain);
+        // 恢复后的 attempt 状态为 UNCERTAIN
+        let attempt = repositories
+            .find_latest_attempt(persisted.runs[0].id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            attempt.status,
+            crate::v2::domain::operation::AttemptStatus::Uncertain
+        );
+    }
+}

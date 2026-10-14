@@ -1,0 +1,47 @@
+{
+  "name": "renderloft",
+  "version": "0.1.0",
+  "description": "RenderLoft - local workspace for RunningHub AI applications",
+  "license": "MIT",
+  "type": "module",
+  "scripts": {
+    "dev": "node scripts/dev.mjs",
+    "build": "vue-tsc -b && vite build",
+    "build:windows": "node scripts/build-windows.mjs",
+    "version:check": "node scripts/version.mjs check",
+    "version:sync": "node scripts/version.mjs sync",
+    "version:bump": "node scripts/version.mjs bump",
+    "verify": "eslint . && prettier --check src/ && node scripts/check-layers.mjs && node scripts/check-contrast.mjs && node scripts/version.mjs check && pnpm build && cargo clippy --offline --manifest-path src-tauri/Cargo.toml --all-targets -- -D warnings && cargo test --offline --manifest-path src-tauri/Cargo.toml --lib && cargo check --offline --manifest-path src-tauri/Cargo.toml --bin renderloft --bin renderloft-cli --bin renderloft-mcp",
+    "preview": "vite preview",
+    "lint": "eslint . --fix",
+    "lint:check": "eslint .",
+    "check:contrast": "node scripts/check-contrast.mjs",
+    "format": "prettier --write src/",
+    "format:check": "prettier --check src/"
+  },
+  "dependencies": {
+    "@lucide/vue": "^1.26.0",
+    "clsx": "^2.1.1",
+    "pinia": "^2.2.2",
+    "tailwind-merge": "^3.6.0",
+    "vue": "^3.5.13",
+    "vue-router": "^4.5.0"
+  },
+  "devDependencies": {
+    "@tailwindcss/postcss": "^4.3.3",
+    "@tauri-apps/cli": "^2.3.0",
+    "@types/node": "^22.15.3",
+    "@vitejs/plugin-vue": "^5.2.0",
+    "@vue/eslint-config-prettier": "^10.1.0",
+    "@vue/eslint-config-typescript": "^14.0.0",
+    "autoprefixer": "^10.4.20",
+    "eslint": "^9.13.0",
+    "eslint-plugin-vue": "^9.31.0",
+    "postcss": "^8.4.49",
+    "prettier": "^3.5.2",
+    "tailwindcss": "^4.3.3",
+    "typescript": "^5.7.2",
+    "vite": "^8.1.5",
+    "vue-tsc": "^3.3.8"
+  }
+}

@@ -1,0 +1,41 @@
+node_modules
+dist
+dist-ssr
+target-e2e
+*.local
+
+src-tauri/target
+src-tauri/.tauri
+desktop/target
+
+# Local editor state and one-off diagnostics
+.trae/
+debug-app-load-failure.md
+外援.html
+
+# Local AI tooling
+.codegraph/
+/AGENTS.md
+opencode.jsonc
+
+# Local browser-test traces and root-level review screenshots
+.playwright-mcp/
+/*.png
+
+# Environment and local secrets
+.env
+.env.*
+!.env.example
+
+# Build and tool caches
+*.tsbuildinfo
+.vite/
+*.log
+
+# 本地演练发布流程时产生的中间物（CI 里只出现在 runner 的工作区，不进仓库）
+/portable/
+/RenderLoft_*.zip
+/SHA256SUMS.txt
+
+# Local package store (never committed)
+.pnpm-store/

@@ -1,0 +1,38 @@
+[package]
+name = "renderloft"
+version = "0.1.0"
+description = "RenderLoft local daemon for RunningHub AI applications"
+license = "MIT"
+edition = "2021"
+default-run = "renderloft"
+
+[dependencies]
+reqwest = { version = "0.12", features = ["json", "multipart"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+dirs = "5.0"
+clap = { version = "4.5", features = ["string"] }
+futures = "0.3"
+tokio = { version = "1", features = ["macros", "net", "rt-multi-thread", "sync", "time"] }
+rusqlite = { version = "0.32", features = ["bundled"] }
+uuid = { version = "1", features = ["v4"] }
+axum = "0.8"
+async-trait = "0.1"
+sha2 = "0.10"
+utoipa = "5"
+
+[target.'cfg(target_os = "windows")'.dependencies]
+keyring = { version = "3", features = ["windows-native"] }
+# 只用到 `GetStdHandle` + `SetHandleInformation`：拉 daemon 之前必须关掉本进程标准句柄的
+# "可继承"位，否则子进程会攥住调用方的管道（机制与实测见 `v2/clients/daemon_boot.rs`）。
+# 版本刻意与锁文件里已有的那份对齐（0.60.2），离线也能构建。
+windows-sys = { version = "0.60", features = ["Win32_Foundation", "Win32_System_Console"] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+keyring = { version = "3", features = ["apple-native"] }
+
+[target.'cfg(not(any(target_os = "windows", target_os = "macos")))'.dependencies]
+keyring = { version = "3", features = ["sync-secret-service"] }
+
+[dev-dependencies]
+tower = { version = "0.5", features = ["util"] }

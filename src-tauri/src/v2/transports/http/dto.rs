@@ -1,0 +1,322 @@
+use serde::{Deserialize, Serialize};
+use serde_json::{json, Value};
+use std::collections::BTreeMap;
+
+use crate::v2::domain::errors::SafeError;
+
+pub const CONTRACT_VERSION: &str = "1";
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Envelope<T: Serialize> {
+    pub contract_version: &'static str,
+    pub ok: bool,
+    pub data: T,
+}
+
+impl<T: Serialize> Envelope<T> {
+    pub fn new(data: T) -> Self {
+        Self {
+            contract_version: CONTRACT_VERSION,
+            ok: true,
+            data,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ErrorEnvelope {
+    pub contract_version: &'static str,
+    pub ok: bool,
+    pub error: ErrorBody,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ErrorBody {
+    pub code: String,
+    pub kind: String,
+    pub message: String,
+    pub retryable: bool,
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub details: BTreeMap<String, Value>,
+}
+
+impl ErrorEnvelope {
+    pub fn from_error(error: &SafeError) -> Self {
+        Self {
+            contract_version: CONTRACT_VERSION,
+            ok: false,
+            error: ErrorBody {
+                code: error.code.clone(),
+                kind: format!("{:?}", error.kind).to_lowercase(),
+                message: error.message.clone(),
+                retryable: error.retryable,
+                details: error.details.clone(),
+            },
+        }
+    }
+}
+
+pub fn ok_json<T: Serialize>(data: T) -> axum::Json<Value> {
+    axum::Json(json!(Envelope::new(data)))
+}
+
+pub fn error_json(error: &SafeError) -> axum::Json<Value> {
+    axum::Json(serde_json::to_value(ErrorEnvelope::from_error(error)).unwrap_or(Value::Null))
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct PaginationQuery {
+    pub limit: Option<usize>,
+    pub after: Option<u64>,
+    #[serde(default)]
+    pub run_id: Option<u64>,
+    #[serde(default)]
+    pub stream: Option<bool>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Page<T: Serialize> {
+    pub items: Vec<T>,
+    pub next_cursor: Option<u64>,
+    pub has_more: bool,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct CreateOperationRequestDto {
+    pub idempotency_key: String,
+    pub runs: Vec<RunRequestDto>,
+    #[serde(default)]
+    pub metadata: BTreeMap<String, Value>,
+    #[serde(default)]
+    pub callback: Option<CallbackDto>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct RunRequestDto {
+    pub client_run_id: String,
+    pub recipe_revision_id: u64,
+    #[serde(default)]
+    pub connection_id: Option<u64>,
+    #[serde(default)]
+    pub inputs: BTreeMap<String, Value>,
+    #[serde(default)]
+    pub assets: Vec<AssetRefDto>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct AssetRefDto {
+    pub asset_id: u64,
+    pub checksum: String,
+}
+
+/// 设置回调签名密钥的请求体。
+///
+/// ⚠️ 这个 DTO **只有人那条路会用到**（CLI `callback set-secret` 从文件读值），MCP 没有
+/// 对应工具。**刻意不派生 `Debug`**：`String` 的 Debug 会把密钥原样打出来，
+/// 而"顺手 `{:?}` 一下"正是密钥泄漏最常见的入口。
+#[derive(Clone, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct CallbackSecretDto {
+    pub value: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct CallbackDto {
+    pub url: String,
+    #[serde(default)]
+    pub events: Vec<String>,
+    #[serde(default)]
+    pub secret_ref: Option<String>,
+    #[serde(default)]
+    pub max_attempts: Option<u32>,
+    #[serde(default)]
+    pub retry_after_seconds: Option<u64>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OperationResponseDto {
+    pub operation_id: u64,
+    pub status: String,
+    pub run_ids: Vec<u64>,
+    pub status_url: String,
+    pub events_url: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RunResponseDto {
+    pub run_id: u64,
+    pub operation_id: u64,
+    pub client_run_id: String,
+    pub sequence: u32,
+    pub recipe_revision_id: u64,
+    pub connection_revision_id: u64,
+    pub status: String,
+    pub tracking_state: String,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EventResponseDto {
+    pub event_id: u64,
+    pub event_type: String,
+    pub operation_id: u64,
+    pub run_id: Option<u64>,
+    pub sequence: u64,
+    pub created_at: String,
+    pub payload: Value,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TokenIssuedDto {
+    pub token_id: i64,
+    pub token: String,
+    pub actor_id: String,
+    pub scopes: Vec<String>,
+    pub expires_at: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TokenSummaryDto {
+    pub token_id: i64,
+    pub actor_id: String,
+    pub kind: String,
+    pub client_id: String,
+    pub scopes: Vec<String>,
+    pub label: Option<String>,
+    pub expires_at: Option<String>,
+    pub revoked: bool,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct IssueTokenRequestDto {
+    pub actor_id: String,
+    pub client_id: String,
+    pub scopes: Vec<String>,
+    #[serde(default)]
+    pub label: Option<String>,
+    #[serde(default)]
+    pub ttl_seconds: Option<u64>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct CreateConnectionRequestDto {
+    pub vendor: Option<String>,
+    pub protocol: Option<String>,
+    #[serde(default)]
+    pub display_name: String,
+    #[serde(default)]
+    pub config: BTreeMap<String, Value>,
+    #[serde(default)]
+    pub capabilities: Vec<String>,
+    #[serde(default)]
+    pub lifecycle_features: Value,
+    #[serde(default)]
+    pub secret_bindings: Vec<SecretBindingEntryDto>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct UpdateConnectionRequestDto {
+    #[serde(default)]
+    pub display_name: Option<String>,
+    #[serde(default)]
+    pub config: Option<BTreeMap<String, Value>>,
+    #[serde(default)]
+    pub capabilities: Option<Vec<String>>,
+    #[serde(default)]
+    pub lifecycle_features: Option<Value>,
+    #[serde(default)]
+    pub secret_bindings: Option<Vec<SecretBindingEntryDto>>,
+}
+
+/// 密钥绑定条目：`value` 仅用于写入 keyring，不回显。
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct SecretBindingEntryDto {
+    pub slot: String,
+    #[serde(default)]
+    pub resolution: Option<String>,
+    #[serde(default)]
+    pub value: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct CreateRecipeRequestDto {
+    pub name: Option<String>,
+    pub capability: Option<String>,
+    pub driver_key: Option<String>,
+    pub default_connection_id: Option<u64>,
+    #[serde(default)]
+    pub allowed_connection_ids: Option<Vec<u64>>,
+    #[serde(default)]
+    pub provider_config: Option<Value>,
+    #[serde(default)]
+    pub description: String,
+    #[serde(default)]
+    pub labels: Vec<String>,
+    #[serde(default)]
+    pub input_schema: Option<Value>,
+    #[serde(default)]
+    pub output_schema: Option<Value>,
+    #[serde(default)]
+    pub defaults: BTreeMap<String, Value>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct CreateAssetRequestDto {
+    pub filename: Option<String>,
+    #[serde(default)]
+    pub mime_type: Option<String>,
+    pub bytes: Option<Vec<u8>>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct UpdateRecipeRequestDto {
+    #[serde(default)]
+    pub name: Option<String>,
+    #[serde(default)]
+    pub description: Option<String>,
+    #[serde(default)]
+    pub labels: Option<Vec<String>>,
+    #[serde(default)]
+    pub favorite: Option<bool>,
+    #[serde(default)]
+    pub group: Option<String>,
+    #[serde(default)]
+    pub note: Option<String>,
+    /// 字段备注（schema 的 key → 人话名字）。
+    ///
+    /// ⚠️ **整体替换**语义，不是逐键合并：这样"删掉一条备注"才表达得出来
+    /// （合并语义下，省略某个键既可能是"不改"也可能是"删"，分不清）。
+    /// 传空对象 = 清空全部备注。
+    #[serde(default)]
+    pub field_labels: Option<std::collections::BTreeMap<String, String>>,
+    /// 用户在编辑里改的**字段控件**（"这个字段该是什么控件、有哪些合法选项"）。
+    ///
+    /// 与备注不同：备注是**展示语义**（读 schema 时合并），控件会改变**执行语义**
+    /// （换成"图片或文件"要走资产上传那条路），所以它写进一份**新 revision**。
+    /// 空数组 = 不改控件（不是"清空"：控件的来源可以是我们/引擎，没有"清空"这回事）。
+    #[serde(default)]
+    pub field_widgets: Option<Vec<crate::v2::application::field_widget::FieldWidgetChange>>,
+}

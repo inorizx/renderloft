@@ -1,0 +1,26 @@
+[package]
+name = "renderloft-desktop"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+
+[dependencies]
+# `tray-icon`：常驻托盘（关窗不停任务）；`image-png`：托盘的 PNG 图标解码。
+tauri = { version = "2.3", features = ["tray-icon", "image-png"] }
+tauri-plugin-notification = "2"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+dirs = "5.0"
+
+[target.'cfg(windows)'.dependencies]
+# 单实例：命名互斥体 + 找到已有窗口并前置（官方插件不在本机的离线缓存里）。
+# `Win32_Security` 是 `CreateMutexW` 的门（它的签名要 `SECURITY_ATTRIBUTES`）。
+windows-sys = { version = "0.60", features = [
+  "Win32_Foundation",
+  "Win32_Security",
+  "Win32_System_Threading",
+  "Win32_UI_WindowsAndMessaging",
+] }
+
+[build-dependencies]
+tauri-build = { version = "2.1", features = [] }

@@ -1,0 +1,108 @@
+// 分层守门：application/ 与 transports/ 的生产代码（顶层 use）不得直接
+// import infrastructure 或 daemon（测试模块内允许）。CI 与 `pnpm verify` 调用。
+import { readdirSync, readFileSync, statSync } from 'node:fs'
+import { join } from 'node:path'
+
+const ROOT = join(import.meta.dirname, '..')
+const DIRS = [
+  join(ROOT, 'src-tauri', 'src', 'v2', 'application'),
+  join(ROOT, 'src-tauri', 'src', 'v2', 'transports'),
+]
+// 顶层 use 位于列 0；测试模块内的 use 带缩进，不计入。
+const PATTERNS = [/^use crate::v2::infrastructure/, /^use crate::v2::daemon::/]
+
+function* walk(dir) {
+  for (const entry of readdirSync(dir)) {
+    const full = join(dir, entry)
+    if (statSync(full).isDirectory()) yield* walk(full)
+    else if (full.endsWith('.rs')) yield full
+  }
+}
+
+const violations = []
+for (const dir of DIRS) {
+  for (const file of walk(dir)) {
+    const lines = readFileSync(file, 'utf8').split('\n')
+    lines.forEach((line, idx) => {
+      if (PATTERNS.some((p) => p.test(line))) {
+        violations.push(
+          `${file.replace(ROOT + '\\', '').replaceAll('\\', '/')}:${idx + 1}: ${line.trim()}`,
+        )
+      }
+    })
+  }
+}
+
+if (violations.length > 0) {
+  console.error(
+    '分层违规：application/ 与 transports/ 生产代码不得直接 import infrastructure 或 daemon（测试模块内允许）',
+  )
+  violations.forEach((v) => console.error('  ' + v))
+  process.exit(1)
+}
+console.log('分层守门通过：application/ 与 transports/ 无越层 import')
+
+// 数据目录名守门：daemon / Rust 客户端 / 桌面外壳 / vite 代理**必须**指向同一个目录名。
+//
+// 为什么需要机械守卫：这四处是**手写字符串**，彼此没有任何编译期联系。不一致的后果很难
+// 看出病因——代理读不到 token，每个请求都以未认证发出，界面看到的是 401「缺少 Bearer
+// 认证令牌」，像是鉴权坏了，实际只是两个字符串不一致。所以：daemon 是这个名字的
+// **所有者**，名单里的其余消费者必须与它一致；下面退役名单里的名字一律不许再当数据目录。
+//
+// `renderloft` 在名单里：它**与安装目录同名**（NSIS 默认装到 `%LOCALAPPDATA%\RenderLoft`，
+// Windows 路径不区分大小写）⇒ 程序文件和用户数据混在一个文件夹。现在数据目录是
+// `renderloft-workspace`，改回去等于把这个坑挖回来。
+const DATA_DIR_OWNER = 'src-tauri/src/v2/daemon.rs'
+const DATA_DIR_CONSUMERS = [
+  'src-tauri/src/v2/clients/client.rs',
+  'desktop/src/main.rs',
+  'vite.config.ts',
+  // ⚠️ 这个脚本也是消费者，而且**曾经漂过**：它把目录名写成 `renderloft`，于是每次运行都在
+  // `readFileSync` 上抛 ENOENT——"全工具真跑"这类脚本一旦跑不起来，就没人再跑它了。
+  // 名单漏一个消费者，守门就等于没守。
+  'scripts/mcp-sweep.mjs',
+]
+const RETIRED_DATA_DIRS = ['renderloft']
+
+// 残留检查按**用法形态**匹配，不按"文件里出现过这个字符串"：
+// `desktop/src/main.rs` 里合法的 `"renderloft"` 是 daemon 的**二进制名**
+// （`resources.join(if cfg!(windows) { "renderloft.exe" } else { "renderloft" })`），
+// 按裸字符串匹配会误报。只有 `.join("x")`（Rust）与 `'x'`（JS/TS）才是"数据目录"的形态。
+const retiredLiteral = (file, retired) =>
+  file.endsWith('.ts') || file.endsWith('.mjs') ? `'${retired}'` : `.join("${retired}")`
+
+const read = (relative) => readFileSync(join(ROOT, relative), 'utf8')
+const ownerNames = [...read(DATA_DIR_OWNER).matchAll(/path\.join\("([a-z0-9-]+)"\)/g)].map(
+  (match) => match[1],
+)
+const dataDirProblems = []
+if (ownerNames.length === 0 || new Set(ownerNames).size !== 1) {
+  dataDirProblems.push(
+    `${DATA_DIR_OWNER}: 应当只有一种 \`path.join("<目录名>")\`，实际 ${JSON.stringify(ownerNames)}`,
+  )
+} else {
+  const name = ownerNames[0]
+  for (const file of DATA_DIR_CONSUMERS) {
+    const source = read(file)
+    if (!source.includes(`'${name}'`) && !source.includes(`"${name}"`)) {
+      dataDirProblems.push(`${file}: 没有引用数据目录名 \`${name}\``)
+    }
+  }
+  for (const file of [DATA_DIR_OWNER, ...DATA_DIR_CONSUMERS]) {
+    const source = read(file)
+    for (const retired of RETIRED_DATA_DIRS) {
+      if (retired !== name && source.includes(retiredLiteral(file, retired))) {
+        dataDirProblems.push(
+          `${file}: 仍残留旧数据目录名 \`${retired}\`（形态 \`${retiredLiteral(file, retired)}\`）`,
+        )
+      }
+    }
+  }
+}
+
+if (dataDirProblems.length > 0) {
+  console.error('数据目录名不一致：daemon / client / 外壳 / vite 代理必须同源')
+  dataDirProblems.forEach((problem) => console.error('  ' + problem))
+  process.exit(1)
+}
+console.log(`数据目录名守门通过：${DATA_DIR_OWNER} 与其余 ${DATA_DIR_CONSUMERS.length} 个消费者一致（${ownerNames[0]}）`)

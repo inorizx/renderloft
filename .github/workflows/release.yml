@@ -1,0 +1,123 @@
+name: Release
+
+# 发布 = 打 tag：`git tag v0.1.0 && git push --tags`。
+#
+# 为什么单独一个 workflow：ci.yml 里那个 windows-installer job 产出的是 **Actions artifact**
+# ——14 天过期、下载还要登录 GitHub 账号，**它不是给用户用的下载渠道**。给用户的是 Release。
+#
+# 第一次真跑前提醒自己：这个仓库至今没有 GitHub remote，所以这份 workflow 一次都没跑过。
+# 想先试一遍就用临时 tag（`git tag v0.1.0-rc1 && git push origin v0.1.0-rc1`），跑完
+# `git push --delete origin v0.1.0-rc1` 删掉；注意下面的守门会要求 tag 与 package.json 一致，
+# 所以 rc tag 要写成对应版本（或临时把守门那步去掉）。
+on:
+  push:
+    tags: ['v*']
+
+# 创建 Release 与上传附件需要写权限（默认 token 是只读的）。
+permissions:
+  contents: write
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 11.20.0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+      - uses: dtolnay/rust-toolchain@stable
+      - run: pnpm install --frozen-lockfile
+
+      # tag 与版本号必须一致。不一致的症状是最难查的那种：release 写着 v0.2.0、
+      # 用户装出来是 0.1.0，而 updater 正是靠版本号判断要不要更新 ⇒ 会静默坏掉。
+      - name: 版本号必须与 tag 一致
+        run: node scripts/version.mjs check --tag "${{ github.ref_name }}"
+
+      # dist/ 要先在（外壳编译期内嵌它，bundle.resources 也要它）。
+      - run: pnpm build
+      # 三个 release 二进制也要先在：tauri-build 的 build script 会校验 resources 里的每个路径。
+      - run: cargo build --release --manifest-path src-tauri/Cargo.toml --bin renderloft --bin renderloft-cli --bin renderloft-mcp
+      - run: pnpm build:windows
+
+      - name: 确认安装包真的产出了
+        shell: pwsh
+        run: |
+          $setup = @(Get-ChildItem desktop/target/release/bundle/nsis/*.exe)
+          if ($setup.Count -eq 0) { throw "没有产出安装包——打包静默失败了" }
+          Write-Output "installer: $($setup[0].Name) ($([math]::Round($setup[0].Length/1MB,2)) MB)"
+
+      # 免安装版：四个 exe + dist/ 打成一个 zip，解压即用（双击 renderloft-desktop.exe 就是完整应用）。
+      # **两个都不能漏**：
+      # ① 必须带 dist/：daemon 是按"可执行文件旁边的 dist"找控制台的，只给 exe 会得到一个
+      #    打不开界面的 daemon（实测过：那样打开是一屏 JSON）；
+      # ② 必须带 renderloft-desktop.exe：少了它就只剩 daemon/CLI/MCP，**没有界面**——
+      #    实测第一版 zip 就是这个毛病（只有三个 exe）。
+      - name: 打免安装包
+        shell: pwsh
+        run: |
+          $version = node scripts/version.mjs
+          $stage = "portable"
+          # ⚠️ 先清掉上一次留下的同名产物与暂存目录：后面两处都是**通配匹配**
+          # （`Get-Item RenderLoft_*_x64-portable.zip`、`*.exe`），本地重跑这套步骤时，
+          # 上一次的包会被当成这一次的包发出去。实测踩过：仓库根目录躺着一个手工打的
+          # zip，发布会把它当新包传上去（而 CI 上因为是干净检出，这个坑不会暴露）。
+          Remove-Item $stage -Recurse -Force -ErrorAction SilentlyContinue
+          Remove-Item "RenderLoft_*_x64-portable.zip" -Force -ErrorAction SilentlyContinue
+          New-Item -ItemType Directory -Path $stage -Force | Out-Null
+          # 三个在 src-tauri/target/release（daemon + CLI + MCP）……
+          foreach ($exe in 'renderloft.exe', 'renderloft-cli.exe', 'renderloft-mcp.exe') {
+            Copy-Item "src-tauri/target/release/$exe" $stage -ErrorAction Stop
+          }
+          # ……外壳在另一个 crate 的产物目录里（desktop/ 是独立 crate，target 不共享）。
+          Copy-Item "desktop/target/release/renderloft-desktop.exe" $stage -ErrorAction Stop
+          Copy-Item dist $stage/dist -Recurse
+          $zip = "RenderLoft_${version}_x64-portable.zip"
+          tar -a -c -f $zip -C $stage .
+          if (-not (Test-Path $zip)) { throw "免安装包没打出来" }
+          Write-Output "$zip ($([math]::Round((Get-Item $zip).Length/1MB,2)) MB)"
+          tar -tf $zip
+
+      - name: 生成 SHA256SUMS.txt
+        shell: pwsh
+        run: |
+          $installers = @(Get-ChildItem desktop/target/release/bundle/nsis/*.exe -ErrorAction SilentlyContinue)
+          $zips = @(Get-Item RenderLoft_*_x64-portable.zip -ErrorAction SilentlyContinue)
+          # 恰好一个才算数：多一个就说明有旧产物混进来（那时**宁可红**，也不要把
+          # 上一次的包发出去——发出去的东西收不回来）。
+          if ($installers.Count -ne 1) { throw "安装包应当恰好一个，实际 $($installers.Count) 个" }
+          if ($zips.Count -ne 1) { throw "免安装包应当恰好一个，实际 $($zips.Count) 个：$($zips.Name -join ', ')" }
+          $files = $installers + $zips
+          $lines = foreach ($f in $files) {
+            "{0}  {1}" -f (Get-FileHash $f.FullName -Algorithm SHA256).Hash.ToLower(), $f.Name
+          }
+          # 显式无 BOM：`Set-Content -Encoding utf8` 在 Windows PowerShell 5.1 上会写 BOM
+          # （实测本机就是 EF BB BF），而 BOM 会污染校验和文件、也可能绕过按内容判空的守卫。
+          [System.IO.File]::WriteAllLines(
+            (Join-Path (Get-Location) 'SHA256SUMS.txt'),
+            $lines,
+            [System.Text.UTF8Encoding]::new($false)
+          )
+          Get-Content SHA256SUMS.txt
+
+      # 用 runner 预装的 gh 发 Release，而不是第三方 action：
+      # 少一个"大版本号要猜对"的依赖（猜错了要等第一次真跑才发现），而且 gh 的输出直接进日志。
+      - name: 发布 Release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $tag = "${{ github.ref_name }}"
+          # ⚠️ PowerShell **不会**替原生命令展开通配符（`gh ... *.exe` 会把字面量 `*.exe` 传过去），
+          # 所以先在 PowerShell 里取全路径，再用数组展开传给 gh。
+          $assets = @(
+            (Get-ChildItem desktop/target/release/bundle/nsis/*.exe).FullName
+            (Get-Item RenderLoft_*_x64-portable.zip).FullName
+            (Resolve-Path SHA256SUMS.txt).Path
+          )
+          $assets | ForEach-Object { Write-Output "asset: $_" }
+          gh release create $tag @assets --title "RenderLoft $tag" --generate-notes
+          gh release view $tag --json url,assets --jq '.url, (.assets[].name)'

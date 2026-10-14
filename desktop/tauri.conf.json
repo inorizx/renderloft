@@ -1,0 +1,39 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "RenderLoft",
+  "version": "0.1.0",
+  "identifier": "com.renderloft.desktop",
+  "build": {
+    "beforeBuildCommand": "pnpm build",
+    "frontendDist": "../dist"
+  },
+  "app": {
+    "windows": [
+      {
+        "label": "main",
+        "title": "RenderLoft",
+        "width": 1200,
+        "height": 800,
+        "resizable": true,
+        "dragDropEnabled": false
+      }
+    ],
+    "security": { "csp": "default-src 'self' http://127.0.0.1:31337; connect-src 'self' http://127.0.0.1:31337; img-src 'self' data: https:; media-src 'self' https:; style-src 'self' 'unsafe-inline'; script-src 'self' 'unsafe-eval'" }
+  },
+  "bundle": {
+    "active": true,
+    "targets": "nsis",
+    "icon": ["../src-tauri/icons/icon.ico"],
+    "resources": {
+      "../src-tauri/target/release/renderloft.exe": "renderloft.exe",
+      "../src-tauri/target/release/renderloft-cli.exe": "renderloft-cli.exe",
+      "../src-tauri/target/release/renderloft-mcp.exe": "renderloft-mcp.exe",
+      "../dist": "dist"
+    },
+    "windows": {
+      "nsis": {
+        "installerHooks": "nsis/hooks.nsh"
+      }
+    }
+  }
+}
