@@ -57,12 +57,14 @@ impl SettingsService {
         self.view().await
     }
 
-    /// 打开下载目录；`reveal` 给了一个**目录内**的文件路径时，顺带把它选中。
+    /// 打开下载目录；`reveal` 给了一个**目录内、且真实存在**的文件路径时，顺带把它选中。
     ///
     /// 选中那个文件是主流做法（浏览器、VS Code 的"在文件夹中显示"都是选中而不是只开目录）。
-    /// Windows 下的写法是 `explorer.exe /select,<路径>`——**逗号后不能有空格**，有空格它就
-    /// 当成两个参数、只开默认位置。路径必须落在下载目录里才认：这个参数来自界面，
-    /// 不该让它变成"打开任意路径"的开关。
+    ///
+    /// ⚠️ Windows 上**不能**拼 `explorer.exe /select,<路径>`。实测（用户复现，2026-10-16）：
+    /// **这个文件夹已经开着一个窗口时**，那条老命令行认不出参数，退回 Explorer 的默认目录
+    /// ——也就是「文档」。改用 Shell API `SHOpenFolderAndSelectItems`：同样的语义，但它复用
+    /// 已有窗口，也不经过命令行解析，所以没有这个失败模式。
     pub async fn open_download_dir(&self, reveal: Option<&str>) -> DomainResult<String> {
         let record = self.settings.load_settings().await?;
         let directory = if record.download_dir.trim().is_empty() {
@@ -71,39 +73,123 @@ impl SettingsService {
             record.download_dir
         };
         std::fs::create_dir_all(&directory).map_err(|_| SafeError::storage("无法创建下载目录"))?;
-        let reveal = reveal
-            .map(str::trim)
-            .filter(|path| !path.is_empty())
-            .filter(|path| {
-                let candidate = std::path::Path::new(path);
-                candidate.starts_with(std::path::Path::new(&directory))
-            });
-        let opened = if cfg!(target_os = "windows") {
-            match reveal {
-                Some(path) => std::process::Command::new("explorer.exe")
-                    .arg(format!("/select,{path}"))
-                    .spawn(),
-                None => std::process::Command::new("explorer.exe")
-                    .arg(&directory)
-                    .spawn(),
-            }
-        } else if cfg!(target_os = "macos") {
-            match reveal {
-                Some(path) => std::process::Command::new("open")
-                    .arg("-R")
-                    .arg(path)
-                    .spawn(),
-                None => std::process::Command::new("open").arg(&directory).spawn(),
-            }
-        } else {
-            // Linux 的文件管理器没有统一的"选中"约定，退回打开目录。
-            std::process::Command::new("xdg-open")
-                .arg(&directory)
-                .spawn()
-        };
-        opened.map_err(|_| SafeError::storage("无法打开下载目录"))?;
+        let target = reveal_target(&directory, reveal);
+        open_in_file_manager(target.as_deref(), std::path::Path::new(&directory))
+            .map_err(|_| SafeError::storage("无法打开下载目录"))?;
         Ok(directory)
     }
+}
+
+/// 界面传来的 `reveal` 值可信吗：必须**在下载目录里**、且**真的存在**。
+///
+/// 两道都要，各有各的理由：
+/// - 「在下载目录里」：这个参数来自界面，不该让它变成"打开任意路径"的开关；
+/// - 「真的存在」：不存在的路径交给文件管理器，它会**自作主张**开到默认目录（Windows 上是
+///   文档），用户看到的就是"点了一下，跳到一个莫名其妙的地方"。宁可不选中，也不要跳错。
+fn reveal_target(directory: &str, reveal: Option<&str>) -> Option<std::path::PathBuf> {
+    let path = std::path::Path::new(reveal?.trim());
+    if path.as_os_str().is_empty() {
+        return None;
+    }
+    if !path.starts_with(std::path::Path::new(directory)) {
+        return None;
+    }
+    if !path.exists() {
+        return None;
+    }
+    Some(path.to_path_buf())
+}
+
+/// 打开文件管理器：给了 `target` 就选中它，否则打开 `directory`。
+#[cfg(target_os = "windows")]
+fn open_in_file_manager(
+    target: Option<&std::path::Path>,
+    directory: &std::path::Path,
+) -> std::io::Result<()> {
+    // 起一个**独立线程**：COM 是按线程初始化的，而这里是 tokio 的工作线程（共享的）。
+    // 在专用线程里初始化、用完让线程自然结束——既不打扰运行时的线程，也不阻塞异步任务。
+    // 调用方 fire-and-forget（Shell 没有"打开成功"的回执），所以这是它唯一能报错的地方。
+    let path = target.unwrap_or(directory).to_path_buf();
+    std::thread::Builder::new()
+        .name("shell-reveal".to_string())
+        .spawn(move || {
+            if let Err(error) = shell_open_and_select(&path) {
+                eprintln!("[renderloft] 打开文件管理器失败：{error}");
+            }
+        })
+        .map(|_| ())
+}
+
+/// `SHOpenFolderAndSelectItems`：打开并选中；传目录就是打开它。
+///
+/// 这几处 `unsafe` 是必要的（Shell 只有 FFI）：`CoInitializeEx` 只初始化**本线程**的 COM、
+/// `ILCreateFromPathW` 分配一个 PIDL 并由 `ILFree` 立刻还回去、`SHOpenFolderAndSelectItems`
+/// 只做"打开 + 选中"这一件事。都只动自己的入参，失败以 HRESULT 返回，不 panic。
+#[cfg(target_os = "windows")]
+fn shell_open_and_select(path: &std::path::Path) -> Result<(), String> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::System::Com::{
+        CoInitializeEx, CoUninitialize, COINIT_APARTMENTTHREADED,
+    };
+    // 注意：C 头文件里的 `ILFree` 宏，在 windows-sys 里暴露为 `SHFree`（同一个 shell32 导出）。
+    use windows_sys::Win32::UI::Shell::{ILCreateFromPathW, SHFree, SHOpenFolderAndSelectItems};
+
+    let wide: Vec<u16> = path
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+    unsafe {
+        // S_OK / S_FALSE 都表示"这个线程现在是初始化好的"；只有它们才配对 CoUninitialize。
+        let initialized = CoInitializeEx(std::ptr::null(), COINIT_APARTMENTTHREADED as u32) >= 0;
+        let pidl = ILCreateFromPathW(wide.as_ptr());
+        if pidl.is_null() {
+            if initialized {
+                CoUninitialize();
+            }
+            return Err(format!("拿不到 PIDL：{}", path.display()));
+        }
+        // cidl = 0 且 apidl = NULL：`pidl` 指向谁，就打开谁所在的目录并选中它。
+        let hr = SHOpenFolderAndSelectItems(pidl, 0, std::ptr::null(), 0);
+        SHFree(pidl as *const core::ffi::c_void);
+        if initialized {
+            CoUninitialize();
+        }
+        if hr < 0 {
+            return Err(format!("SHOpenFolderAndSelectItems 失败：0x{hr:08X}"));
+        }
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn open_in_file_manager(
+    target: Option<&std::path::Path>,
+    directory: &std::path::Path,
+) -> std::io::Result<()> {
+    let mut command = std::process::Command::new("open");
+    match target {
+        // `-R` 就是 macOS 的"在访达中显示"。
+        Some(path) => command.arg("-R").arg(path),
+        None => command.arg(directory),
+    };
+    command.spawn().map(|_| ())
+}
+
+#[cfg(not(any(target_os = "windows", target_os = "macos")))]
+fn open_in_file_manager(
+    target: Option<&std::path::Path>,
+    directory: &std::path::Path,
+) -> std::io::Result<()> {
+    // Linux 的文件管理器没有统一的"选中"约定，退回打开它所在的目录。
+    let wanted = match target {
+        Some(path) => path.parent().unwrap_or(directory),
+        None => directory,
+    };
+    std::process::Command::new("xdg-open")
+        .arg(wanted)
+        .spawn()
+        .map(|_| ())
 }
 
 pub fn mask_secret(value: &str) -> Option<String> {
@@ -354,5 +440,64 @@ mod tests {
         let error = service.account_status(None).await.unwrap_err();
         assert_eq!(error.code, "RUNNINGHUB_CONNECTION_MISSING");
         assert!(service.runninghub_brief().await.unwrap().is_none());
+    }
+
+    /// 造一个临时下载目录，里面放一个真实文件。
+    fn temp_download_dir() -> (std::path::PathBuf, std::path::PathBuf) {
+        let dir = std::env::temp_dir().join(format!("renderloft-reveal-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).expect("建临时目录");
+        let file = dir.join("870.png");
+        std::fs::write(&file, b"x").expect("写临时文件");
+        (dir, file)
+    }
+
+    #[test]
+    fn an_existing_file_inside_the_download_dir_is_revealed() {
+        let (dir, file) = temp_download_dir();
+        let directory = dir.to_string_lossy().to_string();
+        let revealed = reveal_target(&directory, Some(&file.to_string_lossy()));
+        assert_eq!(revealed.as_deref(), Some(file.as_path()));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 负对照：**目录外**的路径不认 —— 这个参数来自界面，不能变成"打开任意路径"的开关。
+    #[test]
+    fn a_path_outside_the_download_dir_is_refused() {
+        let (dir, _) = temp_download_dir();
+        let outside = std::env::temp_dir().join("renderloft-outside.png");
+        std::fs::write(&outside, b"x").expect("写目录外的文件");
+        let directory = dir.to_string_lossy().to_string();
+        assert_eq!(
+            reveal_target(&directory, Some(&outside.to_string_lossy())),
+            None
+        );
+        let _ = std::fs::remove_file(&outside);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 负对照：**不存在的**路径不认。
+    ///
+    /// 这条正是用户那个 bug 的成因：不存在的路径交给文件管理器，它会自作主张开到默认目录
+    /// （Windows 上是「文档」）——用户看到的就是"点了一下，跳到一个莫名其妙的地方"。
+    #[test]
+    fn a_missing_path_is_refused() {
+        let (dir, file) = temp_download_dir();
+        std::fs::remove_file(&file).expect("先删掉它，制造一个不存在的路径");
+        let directory = dir.to_string_lossy().to_string();
+        assert_eq!(
+            reveal_target(&directory, Some(&file.to_string_lossy())),
+            None
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn blank_or_absent_reveal_is_refused() {
+        let (dir, _) = temp_download_dir();
+        let directory = dir.to_string_lossy().to_string();
+        assert_eq!(reveal_target(&directory, None), None);
+        assert_eq!(reveal_target(&directory, Some("")), None);
+        assert_eq!(reveal_target(&directory, Some("   ")), None);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
