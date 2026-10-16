@@ -65,6 +65,12 @@ impl SettingsService {
     /// **这个文件夹已经开着一个窗口时**，那条老命令行认不出参数，退回 Explorer 的默认目录
     /// ——也就是「文档」。改用 Shell API `SHOpenFolderAndSelectItems`：同样的语义，但它复用
     /// 已有窗口，也不经过命令行解析，所以没有这个失败模式。
+    ///
+    /// ⚠️ 还有一层：**这个动作最好由外壳做，而不是 daemon**。daemon 是后台进程，Windows 的
+    /// 前台锁不允许它把新窗口带到前面——用户看到的是"任务栏图标在闪，但窗口没弹出来"（实测）。
+    /// 外壳是前台进程（用户点的就是它），它调用时窗口才会真的到前面来。所以这里先写一张
+    /// "请帮我打开"的请求单交给外壳，等一小会儿看它有没有接走；没接走（浏览器里开发、外壳
+    /// 没在跑）才自己来——那时"窗口在后面"是可接受的，总比什么都不开要好。
     pub async fn open_download_dir(&self, reveal: Option<&str>) -> DomainResult<String> {
         let record = self.settings.load_settings().await?;
         let directory = if record.download_dir.trim().is_empty() {
@@ -74,10 +80,50 @@ impl SettingsService {
         };
         std::fs::create_dir_all(&directory).map_err(|_| SafeError::storage("无法创建下载目录"))?;
         let target = reveal_target(&directory, reveal);
+        if hand_off_to_shell(&directory, target.as_deref()).await {
+            return Ok(directory);
+        }
         open_in_file_manager(target.as_deref(), std::path::Path::new(&directory))
             .map_err(|_| SafeError::storage("无法打开下载目录"))?;
         Ok(directory)
     }
+}
+
+/// 外壳最多用多久来接走那张请求单（超过就自己开）。
+///
+/// 外壳的轮询间隔是 250ms（见 `desktop/src/reveal.rs`），所以 600ms 足够它看到；
+/// 而用户点一下按钮等 0.6 秒是可以接受的——比自己开一个"在后面"的窗口要好。
+const REVEAL_HANDOFF_MS: u64 = 600;
+
+/// 请求单放在工作区目录里，与 `daemon-endpoint.json` 同处——外壳本来就在读那个目录，
+/// 不引入第二套约定。
+fn reveal_request_path() -> Option<std::path::PathBuf> {
+    Some(
+        crate::v2::daemon::v2_data_dir()
+            .ok()?
+            .join("reveal-request.json"),
+    )
+}
+
+/// 把"打开并选中"交给外壳去办。返回 `true` 表示**它接走了**（这次不用自己开）。
+async fn hand_off_to_shell(directory: &str, target: Option<&std::path::Path>) -> bool {
+    let Some(request_path) = reveal_request_path() else {
+        return false;
+    };
+    let payload = serde_json::json!({
+        "directory": directory,
+        "reveal": target.map(|path| path.to_string_lossy().to_string()),
+    });
+    if std::fs::write(&request_path, payload.to_string()).is_err() {
+        return false;
+    }
+    tokio::time::sleep(std::time::Duration::from_millis(REVEAL_HANDOFF_MS)).await;
+    // 外壳"认领"的方式是把它改名搬走，所以文件不在了就说明它接走了。
+    if !request_path.exists() {
+        return true;
+    }
+    let _ = std::fs::remove_file(&request_path);
+    false
 }
 
 /// 界面传来的 `reveal` 值可信吗：必须**在下载目录里**、且**真的存在**。

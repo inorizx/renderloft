@@ -6,6 +6,7 @@
 // 报错和打印看得见；发布版不要窗口。
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod reveal;
 mod single_instance;
 mod status_poller;
 mod tray;
@@ -43,6 +44,9 @@ fn main() {
         return;
     }
     let daemon = Arc::new(Mutex::new(None::<Child>));
+    // 替 daemon 打开下载目录用的：它是前台进程，只有它调 Shell API 窗口才会真的到前面来
+    // （见 `reveal` 模块头）。与托盘无关，所以无条件启动。
+    reveal::spawn();
     // 托盘建成功了吗。**没成功就不能把"关窗"改成"收进托盘"**——那会得到一个关不掉的窗口，
     // 而唯一的出口（托盘菜单）恰恰没建出来。
     let tray_ready = Arc::new(AtomicBool::new(false));
@@ -253,7 +257,7 @@ pub(crate) fn read_endpoint() -> Option<EndpointFile> {
 ///
 /// 只记**生命周期事件**（启动/单实例/托盘/关窗/退出），不记状态轮询——那是每秒都在发生的事，
 /// 写进日志只会把有用的那几行淹掉。
-fn shell_log(line: &str) {
+pub(crate) fn shell_log(line: &str) {
     let Some(dir) = dirs::data_local_dir().map(|dir| dir.join("renderloft-workspace")) else {
         return;
     };
