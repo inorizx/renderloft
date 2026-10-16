@@ -72,8 +72,9 @@
   居中的"AI 帮忙润色单个字段"两边都不需要。
   现有的 profile CRUD 与模板管理继续保留（它们服务的是模板配置，不是生成）。
 - RunningHub 应用市场的站内搜索、作者浏览和完整发现体验。
-- 发布渠道：远端目前只有 Gitee，没有 GitHub remote ⇒ `.github/workflows/` 那套 CI 与 Release
-  要等加了 GitHub remote 才会真跑；在那之前本机 `pnpm build:windows` 是发布路径。
+- 发布渠道：**GitHub 是发布渠道，Gitee 是代码镜像**。CI（`.github/workflows/ci.yml`，push 触发）
+  与 Release（`.github/workflows/release.yml`，`v*` tag 触发）都在 GitHub 上跑；Release 产出
+  NSIS 安装包 + 免安装 zip + `SHA256SUMS.txt`。Gitee 同步代码与 tag，但**不发 Release 附件**。
 
 ## 当前产品优先级
 

@@ -1,11 +1,13 @@
 name: Release
 
-# 发布 = 打 tag：`git tag v0.1.0 && git push --tags`。
+# 发布 = 打 tag：`git tag v0.1.0 && git push origin v0.1.0`。
 #
 # 为什么单独一个 workflow：ci.yml 里那个 windows-installer job 产出的是 **Actions artifact**
 # ——14 天过期、下载还要登录 GitHub 账号，**它不是给用户用的下载渠道**。给用户的是 Release。
 #
-# 第一次真跑前提醒自己：这个仓库至今没有 GitHub remote，所以这份 workflow 一次都没跑过。
+# 打 tag 之前先确认 `main` 上的 CI 是绿的：这个 workflow 只校验 tag 与版本号一致，
+# 不重复跑测试（跑一遍 Windows 打包要十几分钟，重复验证没有收益）。
+#
 # 想先试一遍就用临时 tag（`git tag v0.1.0-rc1 && git push origin v0.1.0-rc1`），跑完
 # `git push --delete origin v0.1.0-rc1` 删掉；注意下面的守门会要求 tag 与 package.json 一致，
 # 所以 rc tag 要写成对应版本（或临时把守门那步去掉）。
