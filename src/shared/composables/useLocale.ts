@@ -145,6 +145,13 @@ const messages = {
     // 成功要报**完整路径**：桌面外壳（WebView2）不弹下载提示，不报用户就以为"点了没反应"。
     'task.downloaded': '已下载 {name} → {path}',
     'task.showInFolder': '在文件夹中显示',
+    // 一个操作（一批）可能有几十上百个产物：逐个下载必须说清"下了几个、失败几个"。
+    // 静默少几张是最坏的收尾——与 CLI 落点冲突策略同一个口径。
+    'task.downloadAll': '下载全部产物',
+    'task.downloadingMany': '正在下载 {count} 个文件…',
+    'task.downloadedMany': '已下载 {count} 个文件 → {path}',
+    'task.downloadPartial': '成功 {done} 个 · 失败 {failed} 个：{message}',
+    'task.downloadNothing': '这一批没有可下载的产物',
 
     // ---- 任务中心（TaskCenter）----
     'common.close': '关闭',
@@ -961,6 +968,13 @@ const messages = {
     'task.downloadFailed': 'Download failed. Please try again later.',
     'task.downloaded': 'Saved {name} → {path}',
     'task.showInFolder': 'Show in folder',
+    // One operation (a batch) can hold dozens of artifacts: say how many were saved and how many
+    // failed — silently saving fewer is the worst ending (same rule as the CLI conflict policy).
+    'task.downloadAll': 'Download all artifacts',
+    'task.downloadingMany': 'Downloading {count} files…',
+    'task.downloadedMany': 'Saved {count} files → {path}',
+    'task.downloadPartial': '{done} saved · {failed} failed: {message}',
+    'task.downloadNothing': 'Nothing to download in this batch',
 
     // ---- Task center (TaskCenter) ----
     'common.close': 'Close',

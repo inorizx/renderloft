@@ -190,9 +190,67 @@ const downloadPreviewResult = async (result: TaskResult, index: number) => {
     previewDownloadingIndex.value = -1
   }
 }
-const downloadOperationMedia = (operation: OperationDetail) => {
-  const first = previewableArtifacts(operation.operationId)[0]
-  if (first) void downloadArtifact(first.artifactId)
+/**
+ * 下载**一个操作产出的全部产物**。
+ *
+ * ⚠️ 这个函数替换掉了一个说谎的版本：它只取 `previewableArtifacts(id)[0]` —— **只下第一张**，
+ * 对其余的只字不提。一批 100 张图，用户点一下就以为拿到了全部。
+ *
+ * 落盘仍由 daemon 做（`v2.saveArtifact`），所以这里只做两件本地的事：逐个调、把结果**汇总报出来**。
+ * 失败必须能被看见——"静默少几张"是最坏的一种收尾。
+ *
+ * 产物按 run 列（按 runId 查的那个端点**不分页**，一次给全），所以这里逐 run 取。
+ */
+const downloadOperationArtifacts = async (operation: OperationDetail) => {
+  const runIds = operation.runs.map((run) => run.runId).filter((runId) => runId > 0)
+  let artifactIds: number[] = []
+  try {
+    const pages = await Promise.all(runIds.map((runId) => v2.listArtifacts(runId)))
+    artifactIds = pages.flatMap((page) => page.items).map((item) => item.artifactId)
+  } catch (error) {
+    appStore.showNotification(
+      'error',
+      t('task.downloadFailedDetail', {
+        message: error instanceof Error ? error.message : t('task.downloadFailed')
+      })
+    )
+    return
+  }
+  if (!artifactIds.length) {
+    appStore.showNotification('info', t('task.downloadNothing'))
+    return
+  }
+  appStore.showNotification('info', t('task.downloadingMany', { count: artifactIds.length }))
+  let done = 0
+  let directory = ''
+  let firstError = ''
+  for (const artifactId of artifactIds) {
+    try {
+      const saved = await v2.saveArtifact(artifactId)
+      done += 1
+      if (!directory) directory = saved.directory
+    } catch (error) {
+      if (!firstError) {
+        firstError = error instanceof Error ? error.message : t('task.downloadFailed')
+      }
+    }
+  }
+  const failed = artifactIds.length - done
+  if (!failed) {
+    appStore.showNotification(
+      'success',
+      t('task.downloadedMany', { count: done, path: directory }),
+      {
+        label: t('task.showInFolder'),
+        run: () => void v2.openDownloadDir().catch(() => undefined)
+      }
+    )
+    return
+  }
+  appStore.showNotification(
+    done > 0 ? 'warning' : 'error',
+    t('task.downloadPartial', { done, failed, message: firstError })
+  )
 }
 /**
  * 下载一个产物。
@@ -1126,10 +1184,9 @@ onBeforeUnmount(() => {
                   </p>
                   <div class="task-actions">
                     <IconButton
-                      :label="t('task.download')"
+                      :label="t('task.downloadAll')"
                       size="sm"
-                      :disabled="!galleryPreview(operation)"
-                      @click="downloadOperationMedia(operation)"
+                      @click="downloadOperationArtifacts(operation)"
                       ><Download class="size-3.5"
                     /></IconButton>
                     <IconButton
@@ -1316,6 +1373,12 @@ onBeforeUnmount(() => {
             </div>
           </div>
           <template #footer>
+            <Button
+              type="button"
+              variant="outline"
+              @click="batchDetail && downloadOperationArtifacts(batchDetail)"
+              >{{ t('task.downloadAll') }}</Button
+            >
             <Button type="button" variant="outline" @click="batchDetail = undefined">{{
               t('common.close')
             }}</Button>
