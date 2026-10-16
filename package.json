@@ -8,6 +8,7 @@
     "dev": "node scripts/dev.mjs",
     "build": "vue-tsc -b && vite build",
     "build:windows": "node scripts/build-windows.mjs",
+    "build:linux": "node scripts/build-linux.mjs",
     "version:check": "node scripts/version.mjs check",
     "version:sync": "node scripts/version.mjs sync",
     "version:bump": "node scripts/version.mjs bump",

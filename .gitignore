@@ -34,7 +34,9 @@ opencode.jsonc
 
 # 本地演练发布流程时产生的中间物（CI 里只出现在 runner 的工作区，不进仓库）
 /portable/
+/portable-linux/
 /RenderLoft_*.zip
+/RenderLoft_*.tar.gz
 /SHA256SUMS.txt
 
 # Local package store (never committed)
