@@ -826,6 +826,48 @@ pub static VERBS: &[Verb] = &[
             ..req("operationId", Kind::Id)
         }],
     },
+    Verb {
+        id: "operation.retry",
+        group: "operation",
+        action: "retry",
+        summary: "重试：用原参数**新建一个任务**（新 id；不带 --run 就重跑全部 run）",
+        mcp_name: Some("renderloft_retry_operation"),
+        mcp_description: Some(
+            "Retry by creating a NEW operation that reuses the source runs' recipe revisions, \
+             inputs and assets. It does NOT resume the old one: the response carries the new \
+             operationId, so watch THAT id from now on and stop polling the old operation (leave it \
+             alone, or renderloft_cancel_operation it if you no longer want it). Every retried run \
+             is submitted again and CHARGES THE USER'S CREDITS AGAIN. Pass `runId` to retry a single \
+             run: use that whenever only some runs of a batch failed — retrying the whole operation \
+             re-submits and re-charges the runs that already succeeded. This is the recovery path \
+             named by a run's `attention.nextActions` when it is stuck in SUBMISSION_UNCERTAIN: the \
+             new operation is independent, and the uncertain one is neither cancelled nor charged \
+             by this call.",
+        ),
+        read_only: false,
+        // 不破坏任何东西：旧的 operation 原样留着（这也是它与 cancel 的区别）。
+        destructive: false,
+        // ⚠️ **不是幂等**：每次调用都会新建一个 operation 并带上**新的** idempotencyKey
+        // （服务端 `RetryOperation` 里带时间戳），所以两次"完全相同"的调用 = 两次提交 = 两次计费。
+        idempotent: false,
+        // 会花用户额度：新 operation 会被调度器提交给平台，每个 run 都是一次计费。
+        spends_credits: true,
+        params: &[
+            Param {
+                help: "Operation id（见 operation list）",
+                mcp: Some("Operation id to retry from (the source, not the new one)."),
+                ..req("operationId", Kind::Id)
+            },
+            Param {
+                help: "只重试这一条 run（批量里失败的那几条）；不给就重跑该任务的全部 run（已成功的会再花一次钱）",
+                mcp: Some(
+                    "Retry only this run. Omit it to re-run every run of the operation — which \
+                     re-charges the ones that already succeeded.",
+                ),
+                ..opt("runId", Kind::Id)
+            },
+        ],
+    },
     // ---------- artifact ----------
     Verb {
         id: "artifact.list",
@@ -1924,6 +1966,11 @@ pub async fn execute(
                 .await
         }
         "operation.cancel" => client.cancel_operation(args.u64("operationId")?).await,
+        "operation.retry" => {
+            client
+                .retry_operation(args.u64("operationId")?, args.opt_u64("runId")?)
+                .await
+        }
         "artifact.list" => {
             client
                 .list_artifacts(args.opt_u64("limit")?, args.opt_u64("after")?)
@@ -2790,6 +2837,10 @@ mod tests {
             ("operation.get", &["operation"]),
             ("operation.wait", &["operation", "interval", "timeout"]),
             ("operation.cancel", &["operation"]),
+            // 后加的：重试此前**只有 HTTP**（界面够得着，CLI/MCP 够不着），而 `attention`
+            // 的 nextActions 早就把 `operation.retry` 写成了"下一步能做什么"——
+            // 名字必须真的够得到。`--run` 是可选的：只重试批量里失败的那几条。
+            ("operation.retry", &["operation", "run"]),
             ("artifact.list", &["limit", "after"]),
             ("artifact.get", &["artifact"]),
             // 后加的：把产物字节下载到本地文件（CLI 专属，不给 AI）。
@@ -3557,10 +3608,77 @@ mod tests {
         // 不该悄悄发生。
         // 14 → 15：加了 `workspace.backup`（迁移/备份）。它是**只读**动作（不改任何状态），
         // 所以给 AI 是对的；恢复没有对应动词（换目录是人的事），密钥也永远不在这份快照里。
+        // 15 → 16：加了 `operation.retry`（重试）。理由是**名字够不到**：`attention` 的
+        // `nextActions` 对"等确认"的 run 明确写了 `operation.retry`，而它此前只有 HTTP 路由
+        // ——界面点得到，Agent 照着 nextActions 去调却够不着（表里没这个名字）。
+        // 它花钱（新 operation 会被提交、每个 run 计费一次），所以表里 `spends_credits: true`。
         assert_eq!(
             VERBS.iter().filter(|verb| verb.mcp_name.is_some()).count(),
-            15
+            16
         );
+    }
+
+    /// **`attention` 说得出，就必须够得到**：`run_attention` 写进 `nextActions` 的每个名字，
+    /// 都必须是动词表里真实存在的 id。
+    ///
+    /// 为什么需要这条：`nextActions` 是给调用方照着做的**指令**（"现在能做什么"）。写一个
+    /// 表里没有的名字，等于把调用方指向一条死路 —— 而它看起来完全正常（就是个字符串），
+    /// 单元测试也全绿。实测正是这样：`operation.retry` 被写进 nextActions 时，
+    /// 它只有 HTTP 路由，CLI / MCP 都够不着（表里没有那一行）。
+    ///
+    /// 负对照：把表里 `operation.retry` 那一行删掉 ⇒ 这条红（而且不是"少一个动词"那种红，
+    /// 是**指名的**红）。
+    #[test]
+    fn every_next_action_named_by_attention_is_a_real_verb() {
+        use crate::v2::domain::ids::{OperationId, RecipeRevisionId, RunId};
+        use crate::v2::domain::operation::{run_attention, Run, RunStatus, TrackingState};
+
+        let statuses = [
+            RunStatus::Queued,
+            RunStatus::Preparing,
+            RunStatus::Submitting,
+            RunStatus::SubmissionUncertain,
+            RunStatus::Accepted,
+            RunStatus::Running,
+            RunStatus::RetryWait,
+            RunStatus::Succeeded,
+            RunStatus::Failed,
+            RunStatus::Cancelled,
+        ];
+        let mut seen = 0usize;
+        for status in statuses {
+            let run = Run {
+                usage: None,
+                id: RunId(1),
+                operation_id: OperationId(1),
+                client_run_id: "run-1".to_string(),
+                recipe_revision_id: RecipeRevisionId(1),
+                connection_revision_id: crate::v2::domain::ids::ConnectionRevisionId(1),
+                sequence: 0,
+                inputs: Default::default(),
+                assets: vec![],
+                status,
+                tracking_state: TrackingState::Inactive,
+                tracking_deadline: None,
+                next_poll_at: None,
+                last_polled_at: None,
+                error: None,
+                created_at: crate::v2::domain::model::Timestamp::now(),
+                updated_at: crate::v2::domain::model::Timestamp::now(),
+            };
+            let Some(attention) = run_attention(&run) else {
+                continue;
+            };
+            seen += 1;
+            for action in &attention.next_actions {
+                assert!(
+                    find_by_id(action).is_some(),
+                    "{status:?} 的 attention 让调用方去做 `{action}`，而动词表里没有这个名字\
+                     —— 那是一条死路（nextActions 是指令，不是备注）"
+                );
+            }
+        }
+        assert!(seen >= 4, "至少要扫到四种「在等什么」的状态，实际 {seen}");
     }
 
     /// 落点冲突：**文件名叫什么我们不管，但"撞上了"必须由动词兜底**。
