@@ -476,10 +476,13 @@ mod tests {
 
     #[test]
     fn legacy_mapping_derives_field_keys_and_keeps_positional_order() {
-        let mapping =
-            MediaMapping::from_provider_config(&provider_config(qwen_mapping())).expect("旧映射应可读");
+        let mapping = MediaMapping::from_provider_config(&provider_config(qwen_mapping()))
+            .expect("旧映射应可读");
         let keys: Vec<&str> = mapping.field_keys().map(String::as_str).collect();
-        assert_eq!(keys, vec!["475::image", "519::image", "520::image", "521::image"]);
+        assert_eq!(
+            keys,
+            vec!["475::image", "519::image", "520::image", "521::image"]
+        );
         assert_eq!(
             mapping.positional().expect("旧映射有位置序"),
             ["475::image", "519::image", "520::image", "521::image"]
@@ -497,8 +500,8 @@ mod tests {
     /// 而不是 schema 字典序里的第二个。
     #[test]
     fn legacy_positional_array_maps_by_asset_slot_order() {
-        let mapping =
-            MediaMapping::from_provider_config(&provider_config(qwen_mapping())).expect("旧映射应可读");
+        let mapping = MediaMapping::from_provider_config(&provider_config(qwen_mapping()))
+            .expect("旧映射应可读");
         let assets = vec![AssetRef::new(AssetId(7), "sum-a")];
         let bound = mapping.bind(&assets).expect("旧数组应可解释");
         assert_eq!(bound.len(), 1);
@@ -583,8 +586,8 @@ mod tests {
 
     #[test]
     fn too_many_positional_assets_is_rejected_instead_of_silently_truncated() {
-        let mapping =
-            MediaMapping::from_provider_config(&provider_config(qwen_mapping())).expect("旧映射应可读");
+        let mapping = MediaMapping::from_provider_config(&provider_config(qwen_mapping()))
+            .expect("旧映射应可读");
         let assets = (0..5)
             .map(|index| AssetRef::new(AssetId(index), "sum"))
             .collect::<Vec<_>>();
@@ -674,9 +677,10 @@ mod tests {
             .expect("旧 assets_json 必须可读");
         assert_eq!(legacy.field_key, None);
         // 新记录带字段键。
-        let keyed: AssetRef =
-            serde_json::from_value(json!({ "asset_id": 3, "checksum": "abc", "field_key": "475::image" }))
-                .expect("新记录应可读");
+        let keyed: AssetRef = serde_json::from_value(
+            json!({ "asset_id": 3, "checksum": "abc", "field_key": "475::image" }),
+        )
+        .expect("新记录应可读");
         assert_eq!(keyed.field_key.as_deref(), Some("475::image"));
         // None 不序列化出去（旧读者拿到的是旧形状）。
         let text = serde_json::to_string(&legacy).expect("应可序列化");

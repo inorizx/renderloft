@@ -979,7 +979,9 @@ pub async fn create_operation(
 /// DTO 的 runs → 领域 `RunRequest`。**两种资产形状在这里分叉**，往下走就只有
 /// 带字段键的 keyed 资产了（旧数组是 `None` 的 field_key，由 `MediaMapping::bind`
 /// 一次性换算）。
-fn runs_from_dto(runs: Vec<RunRequestDto>) -> Result<Vec<DomainRunRequest>, axum::response::Response> {
+fn runs_from_dto(
+    runs: Vec<RunRequestDto>,
+) -> Result<Vec<DomainRunRequest>, axum::response::Response> {
     let mut converted = Vec::with_capacity(runs.len());
     for run in runs {
         let assets = match run.assets {

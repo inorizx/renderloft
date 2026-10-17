@@ -236,7 +236,10 @@ impl CreateOperation {
     ) -> DomainResult<Vec<ResolvedRun>> {
         let mut resolved = Vec::with_capacity(runs.len());
         for (sequence, run_request) in runs.iter().enumerate() {
-            resolved.push(self.resolve_run(actor, run_request, sequence as u32).await?);
+            resolved.push(
+                self.resolve_run(actor, run_request, sequence as u32)
+                    .await?,
+            );
         }
         Ok(resolved)
     }
@@ -1053,7 +1056,10 @@ mod tests {
         };
         let repositories_a = InMemoryRepositories::new();
         let (first_id, second_id) = run(&repositories_a).await;
-        assert_eq!(first_id, second_id, "资产书写顺序不该制造 IDEMPOTENCY_CONFLICT");
+        assert_eq!(
+            first_id, second_id,
+            "资产书写顺序不该制造 IDEMPOTENCY_CONFLICT"
+        );
     }
 
     /// `preflight` 是只读的：过、但没有 Operation / Run 被创建。
