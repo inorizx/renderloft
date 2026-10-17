@@ -164,6 +164,15 @@ renderloft_call             调用：{"verb": "operation.run", "args": {...}}
 
 它背后走的是 `catalog → call(recipe.list) → call(recipe.describe) → call(operation.run)`——**不需要你解释字段是什么意思**，因为备注名已经写在 schema 里了。
 
+**带图的配方（换装、图生图这类）**：媒体字段在 schema 里是 `format: "file"`，提交时把资产放进
+`runs[].assets`，**键 = 字段键**（`475::image` 这样的 `节点::字段`，`recipe describe` 里就有）——
+不是放进 `inputs`，也不是按数组位置排（位置由上游节点顺序决定，**位置不是语义**）。CLI 里一条
+`--asset '475::image=person.png'` 就替你把上传做了。完整的两版写法（CLI / MCP）、批量、回调、
+dry-run 与常见坑，都在 **[`docs/agent-cookbook.md`](docs/agent-cookbook.md)**。
+
+提交前想先验证形状（不花钱）：任何 `operation run` 都支持 `--dry-run` / `dryRun: true`——
+等价于一次不落库、不调上游的预检。
+
 **长任务别在工具调用里等。** MCP 的工具调用是请求/响应：`operation.wait` 等太久会把客户端那条通道占住（实测过一次，后面的调用全部排队超时）。要"提交完就走、跑完通知我"，就在提交时给一个回调地址：
 
 ```powershell
@@ -281,6 +290,9 @@ schtasks /create /tn RenderLoft收图 /sc minute /mo 10 ^
 renderloft-cli recipe list                               # 有哪些应用
 renderloft-cli recipe describe --recipe 1                # 它的字段（含备注名）
 renderloft-cli operation run --recipe-revision 1 --input cat.json
+renderloft-cli operation run --recipe-revision 1 --input inputs.json `
+  --asset '475::image=person.png' --asset '520::image=cloth.png'   # 带图：按字段键传资产（先上传后提交）
+renderloft-cli operation run --recipe-revision 1 --input inputs.json --dry-run   # 只预检，不花钱
 renderloft-cli operation wait --operation 70
 renderloft-cli artifact list
 ```
@@ -300,10 +312,14 @@ renderloft-cli artifact list
 | `daemon` | `status` · `stop`（守护进程本身；**只给 CLI，不给 AI**） |
 | `callback` | `set-secret` · `status` · `clear-secret`（回调签名密钥；**只给 CLI，不给 AI**） |
 | `recipe` | `list` · `describe` · `import` · `remove` · `restore`（后两个只给 CLI，不给 AI） |
-| `operation` | `list` · `run`（`--callback-url` 见上）· `get` · `wait` · `cancel` |
+| `operation` | `list` · `run`（`--input` 文本输入；媒体加可重复的 `--asset '字段键=文件'`（先上传后提交），预检加 `--dry-run`；`--callback-url` 见上）· `get` · `wait` · `cancel` |
 | `asset` | `upload` |
 | `artifact` | `list` · `get` · `download`（下载字节；只给 CLI，不给 AI） |
 > daemon 没在跑也没关系：CLI 会自己把旁边的 `renderloft.exe` 拉起来（**只启动，不拥有**——它不会替你关掉 daemon，也不会改你的环境变量）。冷启动约 **0.6 秒**，之后每次调用约 **70 毫秒**。
+>
+> **媒体资产按「字段键」定位**（`475::image` 这样的 `节点::字段`，`recipe describe` 的 `inputSchema` 里就有）。
+> HTTP 还接受旧的 `asset-N` 位置数组，但那只是给老客户端/老版本兼容的编码——新提交一律用字段键，
+> 让位置决定放哪张图正是「图片错位」的来源。字段键错了会明确报 `ASSET_FIELD_UNKNOWN`，不会静默丢。
 >
 > 想知道它在不在、想关掉它：
 > ```powershell
@@ -318,6 +334,7 @@ renderloft-cli artifact list
 renderloft-cli recipe list                            # 拿 recipeId 与 defaultConnectionId
 renderloft-cli recipe describe --recipe 1             # 拿 currentRevisionId 与字段 schema
 renderloft-cli operation run --recipe-revision 1 --input cat.json --idempotency-key daily-2026-10-09
+renderloft-cli operation run --recipe-revision 1 --input attrs.json --asset '475::image=person.png'   # 带图（先上传后提交）
 renderloft-cli operation wait --operation 70 --interval 5 --timeout 600
 renderloft-cli artifact list                          # 产物（byteSize 0 = 字节还在平台上，不是空文件）
 ```
