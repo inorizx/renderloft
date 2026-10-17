@@ -40,7 +40,7 @@
   混在一个文件夹里，实测过）。
 - 发布链路：版本号收敛为**单一真相来源**（根 `package.json`，其余 5 处由 `scripts/version.mjs` 同步，
   `pnpm verify` 与 CI 都校验一致）；`v*` tag 触发 `.github/workflows/release.yml` 打包并发布
-  GitHub Release（安装包 + 免安装 zip + `SHA256SUMS.txt`），发布前校验 tag 与版本号一致。
+  GitHub Release（安装包 + 免安装 zip + Linux 便携包 tar.gz + `SHA256SUMS.txt`），发布前校验 tag 与版本号一致。
 - 命令行可用性：安装包会把安装目录加进**用户 PATH**（`desktop/nsis/hooks.nsh`，卸载时摘除；
   逻辑有 30 条断言的独立测试 `scripts/test-nsis-path-hook.mjs`）；CLI 失败时信封走 stderr、
   退出码 1，成功走 stdout、退出码 0 —— 所以任务计划里 `if ($LASTEXITCODE -ne 0)` 是有效的。
@@ -78,7 +78,7 @@
 - RunningHub 应用市场的站内搜索、作者浏览和完整发现体验。
 - 发布渠道：**GitHub 是发布渠道，Gitee 是代码镜像**。CI（`.github/workflows/ci.yml`，push 触发）
   与 Release（`.github/workflows/release.yml`，`v*` tag 触发）都在 GitHub 上跑；Release 产出
-  NSIS 安装包 + 免安装 zip + `SHA256SUMS.txt`。Gitee 同步代码与 tag，但**不发 Release 附件**。
+  NSIS 安装包 + 免安装 zip + Linux 便携包 tar.gz + `SHA256SUMS.txt`（Linux 构建失败会拦截发布）。Gitee 同步代码与 tag，但**不发 Release 附件**。
 
 ## 当前产品优先级
 
