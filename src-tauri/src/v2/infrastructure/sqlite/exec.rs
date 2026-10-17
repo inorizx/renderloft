@@ -1465,13 +1465,7 @@ impl OperationRepository for SqliteRepositories {
     ) -> DomainResult<Vec<crate::v2::ports::repositories::OperationSummary>> {
         let connection = self.connection.lock().unwrap_or_else(|e| e.into_inner());
         let mut statement = connection
-            .prepare(
-                "SELECT o.id, o.status, o.created_at,
-                        (SELECT COUNT(*) FROM v2_runs r WHERE r.operation_id = o.id) AS run_count
-                 FROM v2_operations o
-                 WHERE (?1 IS NULL OR o.id < ?1)
-                 ORDER BY o.id DESC LIMIT ?2",
-            )
+            .prepare(&list_operations_sql())
             .map_err(|_| SafeError::storage("无法读取 Operations"))?;
         let rows = statement
             .query_map(params![after.map(|id| id.0 as i64), limit as i64], |row| {
@@ -1480,6 +1474,8 @@ impl OperationRepository for SqliteRepositories {
                     row.get::<_, String>(1)?,
                     row.get::<_, String>(2)?,
                     row.get::<_, i64>(3)?,
+                    row.get::<_, Option<String>>(4)?,
+                    row.get::<_, Option<String>>(5)?,
                 ))
             })
             .map_err(|_| SafeError::storage("无法读取 Operations"))?
@@ -1487,15 +1483,27 @@ impl OperationRepository for SqliteRepositories {
             .map_err(|_| SafeError::storage("无法读取 Operations"))?;
         Ok(rows
             .into_iter()
-            .map(|(id, status, created_at, run_count)| {
-                crate::v2::ports::repositories::OperationSummary {
-                    id: OperationId(id as u64),
-                    status: crate::v2::domain::operation::OperationStatus::parse(&status)
-                        .unwrap_or(crate::v2::domain::operation::OperationStatus::Queued),
-                    created_at: Timestamp(created_at),
-                    run_count: run_count as u64,
-                }
-            })
+            .map(
+                |(id, status, created_at, run_count, attention_status, attention_deadline)| {
+                    // 原因码**不在这里手抄**：SQL 只回原始状态串，翻译一律走 domain
+                    // （`attention_reason`）——于是"摘要里的原因码"与"get 里的原因码"
+                    // 在结构上不可能不一致。
+                    let attention_reason = attention_status
+                        .as_deref()
+                        .and_then(crate::v2::domain::operation::RunStatus::parse)
+                        .and_then(crate::v2::domain::operation::attention_reason)
+                        .map(str::to_string);
+                    crate::v2::ports::repositories::OperationSummary {
+                        id: OperationId(id as u64),
+                        status: crate::v2::domain::operation::OperationStatus::parse(&status)
+                            .unwrap_or(crate::v2::domain::operation::OperationStatus::Queued),
+                        created_at: Timestamp(created_at),
+                        run_count: run_count as u64,
+                        attention_reason,
+                        attention_deadline: attention_deadline.map(Timestamp),
+                    }
+                },
+            )
             .collect())
     }
 
@@ -1689,6 +1697,44 @@ impl OperationRepository for SqliteRepositories {
 
 fn is_terminal_attempt(status: &str) -> bool {
     matches!(status, "SUCCEEDED" | "FAILED" | "UNCERTAIN" | "CANCELLED")
+}
+
+/// `list_operations` 的 SQL：摘要 + **一条**相关子查询取"最阻塞的那条 run"的 attention。
+///
+/// 为什么是一条相关子查询，而不是"每条 operation 再查一次 run"：那是 N+1 —— 一页 50 条
+/// 就是 51 次查询，而这个列表是 Agent 每轮都可能打的主路径。这里一条 SQL 出全部。
+///
+/// ⚠️ **状态集合与严重度排序都从 `domain::operation::ATTENTION_LADDER` 生成**，不在这里手抄：
+/// 抄一份的失效模式是"SQL 里的顺序与 Rust 里的顺序不一致，两边测试各自都绿"，而表现是
+/// 列表里挑中的那条与详情里挑中的那条不是同一条。SQL 里因此**只有状态名与档位**，
+/// 原因码一个都不出现（它由 Rust 侧经 `attention_reason` 翻译，见 `list_operations`）。
+fn list_operations_sql() -> String {
+    let ladder = crate::v2::domain::operation::ATTENTION_LADDER;
+    let statuses = ladder
+        .iter()
+        .map(|(status, _, _)| format!("'{}'", status.as_str()))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let ranks = ladder
+        .iter()
+        .map(|(status, _, severity)| format!("WHEN '{}' THEN {severity}", status.as_str()))
+        .collect::<Vec<_>>()
+        .join(" ");
+    format!(
+        "SELECT o.id, o.status, o.created_at,
+                (SELECT COUNT(*) FROM v2_runs r WHERE r.operation_id = o.id) AS run_count,
+                attention.status, attention.tracking_deadline
+         FROM v2_operations o
+         LEFT JOIN v2_runs attention
+                ON attention.id = (
+                     SELECT candidate.id FROM v2_runs candidate
+                      WHERE candidate.operation_id = o.id
+                        AND candidate.status IN ({statuses})
+                      ORDER BY CASE candidate.status {ranks} END, candidate.id ASC
+                      LIMIT 1)
+         WHERE (?1 IS NULL OR o.id < ?1)
+         ORDER BY o.id DESC LIMIT ?2"
+    )
 }
 
 fn is_terminal_run_status(status: &str) -> bool {

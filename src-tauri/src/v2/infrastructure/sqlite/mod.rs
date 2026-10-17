@@ -1630,6 +1630,144 @@ mod tests {
         assert_eq!(loaded.runs[0].tracking_state, TrackingState::Active);
     }
 
+    /// 摘要列表里的「为什么没在动」：**按严重度取最阻塞的那条 run**，一条相关子查询、不 N+1。
+    ///
+    /// 为什么要有它：调用方（尤其外界 Agent）是**先 list 再 get** 的。只有 `get` 带 attention
+    /// 等于省不了事 —— 它得为列表里每一条各打一次 `get` 才知道该看哪一个，而这次事故的代价
+    /// 正是"没人主动去看"。
+    ///
+    /// 判别点四条：
+    /// 1. QUEUED ＋ SUBMITTING ＋ SUBMISSION_UNCERTAIN 三条 run ⇒ 摘要报**等确认**那档，
+    ///    并带上那条 run 的死线（不是"第一条"，也不是"随便挑一条"）；
+    /// 2. **反向控制**：把等确认那条判终态 ⇒ 摘要必须改口成 SUBMITTING。少了这条，
+    ///    一个"永远返回最严重那档"的实现也能过第 1 条；
+    /// 3. 没有"在等什么"的 operation（run 正常在跑）⇒ 两个字段都是 `None`（不许编一个原因）；
+    /// 4. 与 `operation_attention`（`get` 用的那个判据）**逐字相同** —— 摘要与详情不能各说各话。
+    ///
+    /// 负对照：让 `list_operations` 直接给出 `attention_reason: None`（编译得过的提前返回）
+    /// ⇒ 第 1、2、4 条红。
+    #[tokio::test]
+    async fn operation_summaries_carry_the_most_blocking_attention() {
+        use crate::v2::domain::operation::Transition;
+
+        let repositories = SqliteRepositories::in_memory().unwrap();
+        {
+            let connection = repositories
+                .connection
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            seed_recipe(&connection);
+            seed_connection(&connection);
+        }
+        // 三条 run：排队 / 提交中 / 等确认（id 按插入顺序分配）。
+        let mut new = new_operation(actor());
+        new.runs = ["queued-1", "submitting-1", "uncertain-1"]
+            .into_iter()
+            .map(|client_run_id| NewRun {
+                recipe_revision_id: RecipeRevisionId(1),
+                connection_revision_id: ConnectionRevisionId(1),
+                client_run_id: client_run_id.to_string(),
+                inputs: BTreeMap::from([("prompt".to_string(), json!("a red house"))]),
+                assets: vec![],
+            })
+            .collect();
+        let persisted = repositories.create_operation(new).await.unwrap();
+        let runs = persisted.runs.clone();
+        assert_eq!(runs.len(), 3);
+
+        for transition in [Transition::ToPreparing, Transition::ToSubmitting] {
+            repositories
+                .transition_run(runs[1].id, transition, Vec::new())
+                .await
+                .expect("推到提交中");
+        }
+        for transition in [
+            Transition::ToPreparing,
+            Transition::ToSubmitting,
+            Transition::ToSubmissionUncertain,
+        ] {
+            repositories
+                .transition_run(runs[2].id, transition, Vec::new())
+                .await
+                .expect("推到等确认");
+        }
+
+        let summaries = repositories.list_operations(10, None).await.unwrap();
+        let summary = summaries
+            .iter()
+            .find(|summary| summary.id == persisted.operation.id)
+            .expect("刚建的操作应当在列表里");
+        assert_eq!(
+            summary.attention_reason.as_deref(),
+            Some("SUBMISSION_UNCERTAIN"),
+            "三条 run 里最该被看见的是「等确认」那条（不是排队那条、也不是第一条）"
+        );
+        let deadline = summary
+            .attention_deadline
+            .clone()
+            .expect("等确认的 run 必须带死线——没有死线就等于「等多久都行」");
+        assert!(
+            deadline.millis() > Timestamp::now_millis(),
+            "死线应当在未来：{deadline:?}"
+        );
+
+        // 4) 与 `get` 的 operation 级 attention 逐字相同。
+        let loaded = repositories
+            .find_operation(persisted.operation.id)
+            .await
+            .unwrap()
+            .expect("操作应当存在");
+        let expected = crate::v2::domain::operation::operation_attention(&loaded.runs)
+            .expect("operation 级应当有 attention");
+        assert_eq!(
+            summary.attention_reason.as_deref(),
+            Some(expected.reason.as_str()),
+            "摘要与详情的 attention 必须是同一个判据"
+        );
+        assert_eq!(summary.attention_deadline, expected.deadline);
+
+        // 2) 反向控制：最严重那条退了，摘要要改口。
+        repositories
+            .transition_run(runs[2].id, Transition::ToCancelled, Vec::new())
+            .await
+            .expect("取消等确认那条");
+        let summaries = repositories.list_operations(10, None).await.unwrap();
+        let summary = summaries
+            .iter()
+            .find(|summary| summary.id == persisted.operation.id)
+            .expect("操作仍在列表里");
+        assert_eq!(
+            summary.attention_reason.as_deref(),
+            Some("SUBMITTING"),
+            "等确认那条已经终态，最该被看见的变成「提交中」"
+        );
+
+        // 3) 没有"在等什么"的 operation：两个字段都必须是 None。
+        let mut plain = new_operation(actor());
+        plain.operation.idempotency_key = IdempotencyKey("key-plain".to_string());
+        let plain = repositories.create_operation(plain).await.unwrap();
+        for transition in [
+            Transition::ToPreparing,
+            Transition::ToSubmitting,
+            Transition::ToAccepted,
+        ] {
+            repositories
+                .transition_run(plain.runs[0].id, transition, Vec::new())
+                .await
+                .expect("推到已受理");
+        }
+        let summaries = repositories.list_operations(10, None).await.unwrap();
+        let summary = summaries
+            .iter()
+            .find(|summary| summary.id == plain.operation.id)
+            .expect("操作在列表里");
+        assert_eq!(
+            summary.attention_reason, None,
+            "正常在跑的 run 没有「为什么没在动」——不许编一个"
+        );
+        assert_eq!(summary.attention_deadline, None);
+    }
+
     #[tokio::test]
     async fn recipe_and_connection_revision_lookup() {
         let repositories = SqliteRepositories::in_memory().unwrap();

@@ -1660,6 +1660,139 @@ mod tests {
         assert!(body["data"]["items"][0]["operationId"].as_u64().unwrap() > 0);
     }
 
+    /// 列表摘要也带「为什么没在动」：**只有原因码与死线**，人话与 nextActions 留在 `get`。
+    ///
+    /// 为什么摘要必须带上它：调用方先 list 再 get。只有 get 有，等于逼它为列表里每一条
+    /// 各打一次 get 才知道该看哪一个 —— 而这次事故的代价正是"没人主动去看"。
+    ///
+    /// 判别点四条：
+    /// 1. 一条卡在 `SUBMISSION_UNCERTAIN` 的 run ⇒ 它所在 operation 的列表项里
+    ///    `attention.reason` 就是那档，且 `deadline` 非空（死线是这个状态唯一的出路）；
+    /// 2. 与同一 operation 的 `get`（operation 级 attention）**原因码逐字相同**；
+    /// 3. 没有 attention 的 operation ⇒ `attention` 是 `null`（不是空对象、也不是缺字段：
+    ///    "没有"与"有但空"必须能分辨）；
+    /// 4. 摘要里**不许**出现 `message` / `nextActions`（一页 50 条不该带上 50 份散文）。
+    ///
+    /// 负对照：让 `list_operations` 直接给出 `attention_reason: None` ⇒ 第 1、2 条红。
+    #[tokio::test]
+    async fn operation_list_summaries_carry_attention_without_the_prose() {
+        use crate::v2::domain::operation::Transition;
+        use crate::v2::ports::repositories::OperationRepository;
+
+        let (app, repositories) = test_app();
+        let token = issue_token(&repositories, &["operations:execute", "operations:read"]).await;
+
+        // 两个任务：
+        // * 第一个是**两条 run 的批量** —— 第一条一直排队、第二条被推到"等确认"。
+        //   ⚠️ **故意给两条 run**：这一层跑的是内存替身，而"挑哪一条"是替身与 sqlite
+        //   各写一份的地方；单 run 时"按严重度挑"与"挑第一条"是同一个答案，这条测试就抓不住
+        //   替身挑错了 run（实测：把替身改成"取第一条有 attention 的"，单 run 版照样绿、
+        //   多 run 版红）。sqlite 那侧的排序由 `sqlite::tests` 里那条同形测试钉住。
+        // * 第二个只有一条 run，推到已受理 ⇒ 没有 attention。
+        let bodies = [
+            json!({
+                "idempotencyKey": "attention-key-1",
+                "runs": [
+                    { "clientRunId": "queued-1", "recipeRevisionId": 1,
+                      "inputs": { "prompt": "a cat" } },
+                    { "clientRunId": "uncertain-1", "recipeRevisionId": 1,
+                      "inputs": { "prompt": "a dog" } },
+                ]
+            }),
+            json!({
+                "idempotencyKey": "attention-key-2",
+                "runs": [
+                    { "clientRunId": "fine-1", "recipeRevisionId": 1,
+                      "inputs": { "prompt": "a bird" } },
+                ]
+            }),
+        ];
+        let mut ids = Vec::new();
+        for body in bodies {
+            let (status, created) = post_json(&app, "/api/v1/operations", &token, body).await;
+            assert_eq!(status, StatusCode::OK, "{created}");
+            ids.push(created["data"]["operationId"].as_u64().unwrap());
+        }
+
+        let (_, stuck) = get_json(&app, &format!("/api/v1/operations/{}", ids[0]), &token).await;
+        // 推**第二条** run：第一条一直排队，正是"最严重的那条不是第一条"。
+        let stuck_run = stuck["data"]["runs"][1]["runId"].as_u64().unwrap();
+        for transition in [
+            Transition::ToPreparing,
+            Transition::ToSubmitting,
+            Transition::ToSubmissionUncertain,
+        ] {
+            repositories
+                .transition_run(
+                    crate::v2::domain::ids::RunId(stuck_run),
+                    transition,
+                    Vec::new(),
+                )
+                .await
+                .expect("推到等确认");
+        }
+        let (_, fine) = get_json(&app, &format!("/api/v1/operations/{}", ids[1]), &token).await;
+        let fine_run = fine["data"]["runs"][0]["runId"].as_u64().unwrap();
+        for transition in [
+            Transition::ToPreparing,
+            Transition::ToSubmitting,
+            Transition::ToAccepted,
+        ] {
+            repositories
+                .transition_run(
+                    crate::v2::domain::ids::RunId(fine_run),
+                    transition,
+                    Vec::new(),
+                )
+                .await
+                .expect("推到已受理");
+        }
+
+        let (status, body) = get_json(&app, "/api/v1/operations?limit=10", &token).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let items = body["data"]["items"].as_array().unwrap();
+        let item = |id: u64| {
+            items
+                .iter()
+                .find(|item| item["operationId"].as_u64() == Some(id))
+                .unwrap_or_else(|| panic!("列表里应当有 {id}：{body}"))
+        };
+
+        // 1) 卡住的那个：原因码 + 死线。
+        let summary = item(ids[0]);
+        assert_eq!(
+            summary["attention"]["reason"], "SUBMISSION_UNCERTAIN",
+            "摘要必须报出「等确认」——否则调用方先看到的是 RUNNING: {body}"
+        );
+        assert!(
+            summary["attention"]["deadline"].as_str().is_some(),
+            "等确认必须带死线（它是这个状态唯一的出路）：{body}"
+        );
+        // 4) 精简：人话与下一动作留在 get。
+        assert!(
+            summary["attention"].get("message").is_none()
+                && summary["attention"].get("nextActions").is_none(),
+            "摘要不该带上人话与 nextActions（那是 get 的事）：{body}"
+        );
+        // 2) 与 get 的原因码一致。
+        let (_, detail) = get_json(&app, &format!("/api/v1/operations/{}", ids[0]), &token).await;
+        assert_eq!(
+            summary["attention"]["reason"], detail["data"]["attention"]["reason"],
+            "列表与详情必须是同一个判据：{detail}"
+        );
+        assert_eq!(
+            summary["attention"]["deadline"], detail["data"]["attention"]["deadline"],
+            "死线也要一致：{detail}"
+        );
+
+        // 3) 正常在跑的那个：null（"没有"与"有但空"要能分辨）。
+        assert_eq!(
+            item(ids[1])["attention"],
+            Value::Null,
+            "没有「为什么没在动」就该是 null：{body}"
+        );
+    }
+
     #[tokio::test]
     async fn sse_events_returns_event_stream_content_type() {
         let (app, repositories) = test_app();

@@ -235,6 +235,50 @@ pub struct Run {
     pub updated_at: Timestamp,
 }
 
+/// 「为什么没在动」的**唯一一张阶梯表**：`(状态, 稳定原因码, 严重度)`。
+///
+/// 为什么是一张表而不是几处 `match`：这张表有**三个**消费者，它们必须给出同一个答案——
+/// * `run_attention`：取原因码，再补那句人话与下一动作；
+/// * `operation_attention`：按严重度挑"最该被看见"的那条；
+/// * `sqlite::exec::list_operations`：**摘要列表**里那条相关子查询按同一严重度取最阻塞的 run
+///   （SQL 的 `IN` 列表与 `ORDER BY CASE` **由这张表生成**，见 `list_operations`）。
+///
+/// 抄一份的失效模式是确定的：两边各自都绿，而"列表里挑中的那条"与"详情里挑中的那条"
+/// 不是同一条 —— 调用方在列表里看到"排队中"，点进去却是"等确认"。
+///
+/// 严重度按"它挡住了什么"排：`SUBMISSION_UNCERTAIN` 会占住这条连接唯一的执行位
+/// （后续 run 全排队），而且意味着"可能已经花了钱但不知道结果"，所以排第一。
+/// **同一个原因码的状态必须同严重度**（`Queued` / `Preparing` 都是"排队中"）。
+pub const ATTENTION_LADDER: &[(RunStatus, &str, u8)] = &[
+    (RunStatus::SubmissionUncertain, "SUBMISSION_UNCERTAIN", 0),
+    (RunStatus::RetryWait, "RETRY_BACKOFF", 1),
+    (RunStatus::Submitting, "SUBMITTING", 2),
+    (RunStatus::Queued, "QUEUED", 3),
+    (RunStatus::Preparing, "QUEUED", 3),
+];
+
+/// 这个状态"为什么没在动"的**稳定原因码**；正常在跑的（`Accepted` / `Running`）与三种终态
+/// 返回 `None` —— 它们没有"为什么没在动"可说，给了就是噪音。
+///
+/// 它同时是**摘要**（`OperationSummary::attention_reason`）的取值来源：仓库层只从 SQL 拿回
+/// 一个原始状态串，原因码一律经这里翻译，所以 SQL 里不会出现第二份原因码。
+pub fn attention_reason(status: RunStatus) -> Option<&'static str> {
+    ATTENTION_LADDER
+        .iter()
+        .find(|(candidate, _, _)| *candidate == status)
+        .map(|(_, reason, _)| *reason)
+}
+
+/// 原因码 → 严重度（越小越该被先看见）。按**原因码**而不是状态查：同一个原因码的多个状态
+/// （`Queued` / `Preparing`）必须同权重，否则"两个都算排队中"这件事会随状态表的顺序漂。
+fn severity_of_reason(reason: &str) -> u8 {
+    ATTENTION_LADDER
+        .iter()
+        .find(|(_, candidate, _)| *candidate == reason)
+        .map(|(_, _, severity)| *severity)
+        .unwrap_or(u8::MAX)
+}
+
 /// 这个 run **为什么没在动** —— 每个"在等什么"的非终态都给出机器可读的原因与下一动作。
 ///
 /// 为什么需要它（实测，2026-10-17）：一次提交超时后 run 落 `SubmissionUncertain`，而 operation 级
@@ -247,7 +291,7 @@ pub struct Run {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RunAttention {
-    /// 稳定的机器可读原因码（见 `run_attention` 的分支）。
+    /// 稳定的机器可读原因码（取值只有 `ATTENTION_LADDER` 里那几种）。
     pub reason: String,
     /// 一句人话：发生了什么、在等什么。
     pub message: String,
@@ -265,20 +309,10 @@ pub struct RunAttention {
 ///
 /// 只讲事实：系统会自己做什么、到点会怎样、人能做什么。不推算、不猜。
 pub fn run_attention(run: &Run) -> Option<RunAttention> {
-    let attention = |reason: &str,
-                     message: &str,
-                     deadline_effect: Option<&str>,
-                     next_actions: &[&str]| RunAttention {
-        reason: reason.to_string(),
-        message: message.to_string(),
-        since: run.updated_at.clone(),
-        deadline: run.tracking_deadline.clone(),
-        deadline_effect: deadline_effect.map(str::to_string),
-        next_actions: next_actions.iter().map(|name| name.to_string()).collect(),
-    };
-    match run.status {
-        RunStatus::SubmissionUncertain => Some(attention(
-            "SUBMISSION_UNCERTAIN",
+    // 原因码只从阶梯表来（`attention_reason`），这里只补"人话 / 到点会怎样 / 下一动作"。
+    let reason = attention_reason(run.status)?;
+    let (message, deadline_effect, next_actions): (&str, Option<&str>, &[&str]) = match run.status {
+        RunStatus::SubmissionUncertain => (
             "提交时连接断了或超时——**平台到底收没收到不知道**，所以不重投（重投可能重复扣费）。\
              系统正在对账；到死线仍确认不了就判失败，不会自动重投。",
             Some("判为失败（不会自动重投）"),
@@ -288,49 +322,47 @@ pub fn run_attention(run: &Run) -> Option<RunAttention> {
                 "operation.cancel",
                 "operation.retry",
             ],
-        )),
-        RunStatus::RetryWait => Some(attention(
-            "RETRY_BACKOFF",
+        ),
+        RunStatus::RetryWait => (
             "上一次提交被平台拒了（或可重试地失败了），正在退避等待后自动重试——不需要人做任何事。",
             Some("判为失败"),
             &["operation.get", "operation.wait", "operation.cancel"],
-        )),
-        RunStatus::Submitting => Some(attention(
-            "SUBMITTING",
+        ),
+        RunStatus::Submitting => (
             "正在提交：已落库租约，进程若在这里中断，超过恢复窗口会自动转成「等确认」。",
             Some("超过恢复窗口后转为「等确认」（SUBMISSION_UNCERTAIN）"),
             &["operation.get", "operation.wait"],
-        )),
-        RunStatus::Queued | RunStatus::Preparing => Some(attention(
-            "QUEUED",
+        ),
+        RunStatus::Queued | RunStatus::Preparing => (
             "排队中：这条连接同时只跑一个（与平台账号的实际并发一致），前面还有没结束的 run。",
             None,
             &["operation.get", "operation.wait", "operation.cancel"],
-        )),
-        // 正常在跑、以及三种终态：没有"为什么没在动"可说。
+        ),
+        // 上面 `attention_reason` 已经把这几档筛掉了。仍然逐个写出来（而不是 `_ =>`）：
+        // 将来给 `RunStatus` 加一个新状态时，编译器会在这里逼我们回答"它算不算在等"。
         RunStatus::Accepted
         | RunStatus::Running
         | RunStatus::Succeeded
         | RunStatus::Failed
-        | RunStatus::Cancelled => None,
-    }
+        | RunStatus::Cancelled => return None,
+    };
+    Some(RunAttention {
+        reason: reason.to_string(),
+        message: message.to_string(),
+        since: run.updated_at.clone(),
+        deadline: run.tracking_deadline.clone(),
+        deadline_effect: deadline_effect.map(str::to_string),
+        next_actions: next_actions.iter().map(|name| name.to_string()).collect(),
+    })
 }
 
 /// 一个 operation 里"最该被看见"的那条 attention：不确定 > 退避 > 提交中 > 排队。
 ///
-/// 排序是**按"它挡住了什么"**：`SUBMISSION_UNCERTAIN` 会占住这条连接唯一的执行位（后续 run 全排队），
-/// 而且它意味着"可能已经花了钱但不知道结果"，所以排第一。
+/// 排序是**按"它挡住了什么"**（表见 `ATTENTION_LADDER`）。
 pub fn operation_attention(runs: &[Run]) -> Option<RunAttention> {
-    let severity = |reason: &str| match reason {
-        "SUBMISSION_UNCERTAIN" => 0,
-        "RETRY_BACKOFF" => 1,
-        "SUBMITTING" => 2,
-        "QUEUED" => 3,
-        _ => 4,
-    };
     runs.iter()
         .filter_map(run_attention)
-        .min_by_key(|attention| severity(&attention.reason))
+        .min_by_key(|attention| severity_of_reason(&attention.reason))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -728,6 +760,82 @@ mod tests {
             "SUBMISSION_UNCERTAIN"
         );
         assert!(operation_attention(&[run(1, RunStatus::Running)]).is_none());
+    }
+
+    /// 阶梯表是**原因码与严重度的唯一来源**：`run_attention`、`operation_attention` 与
+    /// `sqlite::exec::list_operations` 的摘要子查询都从它派生。
+    ///
+    /// 判别点四条（少一条都留着一种"两份真相"的写法）：
+    /// 1. 表里每一行的原因码都能被 `attention_reason` 取到（表与查询函数不能各说各话）；
+    /// 2. 同一个原因码只能有一个严重度（`Queued` / `Preparing` 必须同权重）；
+    /// 3. 表**按严重度从高到低**写（顺序本身就是可读的排序契约）；
+    /// 4. 有原因码 ⇔ `run_attention` 有结论；且**只有"在等什么"的状态**才有原因码
+    ///    ——正常在跑的与终态混进来，就是给调用方发噪音。
+    ///
+    /// 负对照：把 `attention_reason` 改成永远 `None` ⇒ 第 1、4 条红；
+    /// 把 `ATTENTION_LADDER` 里 `Preparing` 的严重度改成 9 ⇒ 第 2 条红。
+    #[test]
+    fn the_attention_ladder_is_the_only_source_of_reasons_and_severity() {
+        // 1 + 2
+        for (status, reason, severity) in ATTENTION_LADDER {
+            assert_eq!(
+                attention_reason(*status),
+                Some(*reason),
+                "{status:?} 的原因码必须能从表里查到"
+            );
+            for (other_status, other_reason, other_severity) in ATTENTION_LADDER {
+                if other_reason == reason {
+                    assert_eq!(
+                        other_severity, severity,
+                        "{other_status:?} 与 {status:?} 共用原因码 {reason}，严重度必须一致\
+                         （否则「同一件事」会有两个优先级）"
+                    );
+                }
+            }
+        }
+        // 3
+        let severities = ATTENTION_LADDER
+            .iter()
+            .map(|(_, _, severity)| *severity)
+            .collect::<Vec<_>>();
+        let mut sorted = severities.clone();
+        sorted.sort_unstable();
+        assert_eq!(severities, sorted, "表必须按严重度从高到低写（顺序可读）");
+
+        // 4
+        let all = [
+            RunStatus::Queued,
+            RunStatus::Preparing,
+            RunStatus::Submitting,
+            RunStatus::SubmissionUncertain,
+            RunStatus::Accepted,
+            RunStatus::Running,
+            RunStatus::RetryWait,
+            RunStatus::Succeeded,
+            RunStatus::Failed,
+            RunStatus::Cancelled,
+        ];
+        assert_eq!(
+            all.len(),
+            ATTENTION_LADDER.len() + 5,
+            "新增状态要在这里补一行"
+        );
+        for status in all {
+            assert_eq!(
+                attention_reason(status).is_some(),
+                run_attention(&run(1, status)).is_some(),
+                "{status:?}：原因码与结论必须同时有或同时无"
+            );
+            if matches!(
+                status,
+                RunStatus::Accepted | RunStatus::Running | RunStatus::Succeeded
+            ) {
+                assert!(
+                    attention_reason(status).is_none(),
+                    "{status:?} 正常在跑/已完成，不该有「为什么没在动」"
+                );
+            }
+        }
     }
 
     #[test]
