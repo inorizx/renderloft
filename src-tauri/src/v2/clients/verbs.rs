@@ -77,6 +77,16 @@ pub enum Kind {
     /// 本机文件路径。两个通道都只传路径，**由分发自己读字节**
     /// （MCP 是本机 stdio 进程，读得到；让模型把 base64 塞进 JSON 会把 1MB 图变成 1.4MB token）。
     LocalFile,
+    /// 媒体资产（字段键 → 资产）。
+    ///
+    /// * CLI：可重复的 `--asset '<字段键>=<本机文件路径>'`；分发负责**先上传**再把
+    ///   `{assetId, checksum}` 组装成 keyed 对象（上传本身不计费）。
+    /// * MCP：直接给**已上传**的 keyed 对象 `{ "<字段键>": {assetId, checksum} }`
+    ///   （先 `asset.upload` 拿 assetId）——模型不给文件路径，避免把字节读进上下文。
+    ///
+    /// ⚠️ 位置数组在 MCP 形状里**不接受**：它只是 HTTP 的兼容编码，让模型按位置猜
+    /// 字段正是错位事故的来源（字段键在 inputSchema 里，`recipe.describe` 就能看到）。
+    KeyedAssets,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -628,7 +638,11 @@ pub static VERBS: &[Verb] = &[
              real work takes tens of seconds to minutes — this call returns as soon as the work is \
              queued, not when it finishes. For several inputs, put them in ONE call's `runs` array \
              (up to 100) instead of making many calls: it is cheaper to track and the daemon caps \
-             concurrent operations from autonomous callers. For a long job, pass `callbackUrl`: the \
+             concurrent operations from autonomous callers. For media recipes, pass `assets` keyed \
+             by the recipe's field keys ({fieldKey: {assetId, checksum}}; upload files with \
+             renderloft_upload_asset first) — never positional arrays. `dryRun: true` pre-checks the \
+             whole request (revision, keys, assets) without creating or charging anything. For a long \
+             job, pass `callbackUrl`: the \
              daemon POSTs a terminal snapshot to that URL when the operation finishes, so you can \
              submit and end your turn instead of waiting inside this call — a tool call is \
              request/response, and a long wait occupies the client's request channel (its own \
@@ -661,6 +675,26 @@ pub static VERBS: &[Verb] = &[
                      clearer label in the app.",
                 ),
                 ..opt("inputs", Kind::Json)
+            },
+            Param {
+                cli_flag: Some("asset"),
+                help: "媒体资产（可重复）：'<字段键>=<本机文件路径>'；字段键见 recipe 的 inputSchema（如 475::image）",
+                mcp: Some(
+                    "Media assets, keyed by field: {\"<field key>\": {\"assetId\": .., \"checksum\": \"..\"}}. \
+                     Upload each file with renderloft_upload_asset first and use the RETURNED assetId+checksum here \
+                     (do not put assetIds in `inputs`; schema media fields have format \"file\"). The field key \
+                     (e.g. \"475::image\") is the address — array position is never the meaning.",
+                ),
+                ..opt("assets", Kind::KeyedAssets)
+            },
+            Param {
+                help: "只预检不提交：校验 revision/字段键/资产后报告结论（不建任务、不调度、不花钱）",
+                mcp: Some(
+                    "Validate only (dry run): same checks as a real submission (revision, inputSchema, \
+                     field keys, asset existence + checksum) but creates nothing and charges nothing. \
+                     Use it to pre-flight a shape before spending credits.",
+                ),
+                ..opt("dryRun", Kind::Flag)
             },
             Param {
                 // MCP 独有：批量的形状（CLI 目前没有对应 flag，这一点写在表里而不是靠人比对）。
@@ -884,11 +918,18 @@ pub static VERBS: &[Verb] = &[
         summary: "把本机文件上传成资产",
         mcp_name: Some("renderloft_upload_asset"),
         mcp_description: Some(
-            "Upload a local file as an asset and get its assetId, for apps whose fields \
-             require an image/file input (a schema field with \"format\": \"asset\"). \
+            "Upload a local file as an asset and get its assetId. Use this for recipe media \
+             inputs: the recipe's inputSchema media fields have \"format\": \"file\", and the \
+             uploaded asset belongs in the run's `assets` object keyed by the recipe's field key \
+             — NOT in `inputs` (putting assetId in inputs silently fails) and NOT by array \
+             position. Shape: {\"<field key>\": {\"assetId\": <returned id>, \"checksum\": \
+             \"<returned checksum>\"}} — the field key (e.g. \"475::image\") comes from \
+             renderloft_describe_recipe's inputSchema. Example: renderloft_run_recipe with \
+             assets {\"475::image\": {\"assetId\": 12, \"checksum\": \"..\"}}. \
+             The `renderloft` CLI does this end to end with: renderloft operation run \
+             --recipe-revision N --input inputs.json --asset '475::image=person.png'. \
              Pass an ABSOLUTE path to a file on THIS machine — the MCP server is a local \
-             process, it reads the file itself and uploads the bytes. \
-             Use the returned assetId in run_recipe's inputs.",
+             process, it reads the file itself and uploads the bytes.",
         ),
         read_only: false,
         destructive: false,
@@ -1204,6 +1245,12 @@ fn cli_arg(param: &'static Param) -> Arg {
         Kind::IdList => arg
             .value_name("LIST")
             .value_parser(clap::value_parser!(String)),
+        // 可重复的 `--asset '<字段键>=<本机文件路径>'`：同一字段给两次在解析时报错
+        // （见 `parse_asset_specs`），而不是让后一个悄悄覆盖前一个。
+        Kind::KeyedAssets => arg
+            .value_name("字段键=文件")
+            .action(ArgAction::Append)
+            .value_parser(clap::value_parser!(String)),
         Kind::Json | Kind::JsonArray | Kind::LocalFile => arg
             .value_name("FILE")
             .value_parser(clap::value_parser!(std::path::PathBuf)),
@@ -1270,6 +1317,19 @@ fn mcp_property(param: &Param) -> Value {
         Kind::Flag => json!({ "type": "boolean" }),
         Kind::IdList => json!({ "type": "array", "items": { "type": "integer" } }),
         Kind::Json => json!({ "type": "object" }),
+        Kind::KeyedAssets => json!({
+            "type": "object",
+            // 键是**数据空间的字段键**（recipe 的 inputSchema 给），所以只能
+            // additionalProperties，不能静态列举——这才是"资产按字段键定位"在协议地板上的样子。
+            "additionalProperties": {
+                "type": "object",
+                "required": ["assetId", "checksum"],
+                "properties": {
+                    "assetId": { "type": "integer" },
+                    "checksum": { "type": "string" }
+                }
+            }
+        }),
         Kind::JsonArray => {
             let mut schema = Map::new();
             schema.insert("type".to_string(), json!("array"));
@@ -1332,6 +1392,28 @@ impl Args {
                 Kind::LocalFile => matches
                     .get_one::<std::path::PathBuf>(param.name)
                     .map(|path| json!(path.to_string_lossy())),
+                // 可重复的 `--asset '字段键=文件'`：解析成 [{fieldKey, path}]，
+                // **重名即报错**（同一字段两个文件是歧义，不许悄悄取后一个）。
+                Kind::KeyedAssets => {
+                    let mut specs: Vec<Value> = Vec::new();
+                    let mut seen = std::collections::BTreeSet::new();
+                    if let Some(values) = matches.get_many::<String>(param.name) {
+                        for raw in values {
+                            let (field_key, path) = parse_asset_spec(raw)?;
+                            if !seen.insert(field_key.clone()) {
+                                return Err(argument_error(
+                                    "ASSET_FIELD_DUPLICATED",
+                                    format!(
+                                        "同一个字段键 `{field_key}` 给了多个文件。一个媒体字段一次只能绑一个资产；\
+                                         去掉多余的 --asset（如果确实要换文件，只留想用的那一个）。"
+                                    ),
+                                ));
+                            }
+                            specs.push(json!({ "fieldKey": field_key, "path": path }));
+                        }
+                    }
+                    Some(json!(specs))
+                }
             };
             if let Some(value) = value {
                 values.insert(param.name.to_string(), value);
@@ -1555,6 +1637,35 @@ fn read_json_file(path: &Path) -> Result<Value, ClientError> {
     })
 }
 
+/// 解析一条 `--asset '<字段键>=<本机文件路径>'`。
+///
+/// 三条边界都在这里报清楚（而不是等到上传时才冒出个笼统错误）：
+/// 没有 `=`、字段键为空、文件路径为空。**文件存在与否在分发时才查**——那一步的报错
+/// 带路径（`ASSET_READ_FAILED`），比解析期的"形状不对"更说明问题。
+fn parse_asset_spec(raw: &str) -> Result<(String, String), ClientError> {
+    let Some((field_key, path)) = raw.split_once('=') else {
+        return Err(argument_error(
+            "ASSET_SPEC_INVALID",
+            format!("`--asset {raw}` 缺少 `=`。形状是 '<字段键>=<本机文件路径>'，例如 --asset '475::image=person.png'。"),
+        ));
+    };
+    let field_key = field_key.trim();
+    let path = path.trim();
+    if field_key.is_empty() {
+        return Err(argument_error(
+            "ASSET_SPEC_INVALID",
+            format!("`--asset {raw}` 的字段键是空的。字段键就是 recipe 的 inputSchema 里的键（如 475::image），用 `recipe describe` 能看到。"),
+        ));
+    }
+    if path.is_empty() {
+        return Err(argument_error(
+            "ASSET_SPEC_INVALID",
+            format!("`--asset {raw}` 的文件路径是空的。"),
+        ));
+    }
+    Ok((field_key.to_string(), path.to_string()))
+}
+
 fn coerce_mcp(param: &Param, value: &Value) -> Result<Value, ClientError> {
     let key = param.mcp_name();
     match param.kind {
@@ -1587,6 +1698,76 @@ fn coerce_mcp(param: &Param, value: &Value) -> Result<Value, ClientError> {
             Value::Array(_) => Ok(value.clone()),
             _ => Err(type_error(key, "JSON 数组", value)),
         },
+        // keyed 资产对象：键 = 字段键，值 = {assetId, checksum}。
+        //
+        // ⚠️ 位置数组在这里被**明确拒绝**（不是"顺带不支持"）：数组编码里资产的语义是
+        // 下标，而字段键才是语义。让模型按位置猜正是错位事故的根；错误信息给出替代做法。
+        Kind::KeyedAssets => {
+            let Value::Object(entries) = value else {
+                return Err(argument_error(
+                    "ASSET_SHAPE_INVALID",
+                    format!(
+                        "参数 {key} 必须是**对象**：{{\"<字段键>\": {{\"assetId\": 数字, \"checksum\": \"...\"}}}}，\
+                         例如 {{\"475::image\": {{\"assetId\": 12}}}}。收到：{}。\
+                         （位置数组只是 HTTP 兼容层；字段键在 recipe 的 inputSchema 里，用 recipe.describe 能拿到。）",
+                        brief(value)
+                    ),
+                ));
+            };
+            let mut normalized = serde_json::Map::new();
+            for (field_key, entry) in entries {
+                if field_key.trim().is_empty() {
+                    return Err(argument_error(
+                        "ASSET_FIELD_UNKNOWN",
+                        format!("参数 {key} 里有空字段键。键必须是 recipe inputSchema 里的字段键（如 \"475::image\"）。"),
+                    ));
+                }
+                let Some(entry) = entry.as_object() else {
+                    return Err(argument_error(
+                        "ASSET_SHAPE_INVALID",
+                        format!(
+                            "参数 {key} 的字段 `{field_key}` 的值必须是对象 {{assetId, checksum}}，收到：{}。",
+                            brief(entry)
+                        ),
+                    ));
+                };
+                for entry_key in entry.keys() {
+                    if entry_key != "assetId" && entry_key != "checksum" {
+                        return Err(argument_error(
+                            "ASSET_SHAPE_INVALID",
+                            format!(
+                                "参数 {key} 的字段 `{field_key}` 里有不认识的键 `{entry_key}`。只收 {{assetId, checksum}}——\
+                                 多余字段会让人以为它们起了作用，静默忽略比报错危险。"
+                            ),
+                        ));
+                    }
+                }
+                let asset_id = entry
+                    .get("assetId")
+                    .and_then(coerce_u64)
+                    .ok_or_else(|| {
+                        argument_error(
+                            "ASSET_SHAPE_INVALID",
+                            format!("参数 {key} 的字段 `{field_key}` 缺 assetId（先调 asset.upload 拿）。"),
+                        )
+                    })?;
+                let checksum = entry
+                    .get("checksum")
+                    .and_then(Value::as_str)
+                    .filter(|checksum| !checksum.trim().is_empty())
+                    .ok_or_else(|| {
+                        argument_error(
+                            "ASSET_SHAPE_INVALID",
+                            format!("参数 {key} 的字段 `{field_key}` 缺 checksum（asset.upload 的返回里有）。"),
+                        )
+                    })?;
+                normalized.insert(
+                    field_key.clone(),
+                    json!({ "assetId": asset_id, "checksum": checksum }),
+                );
+            }
+            Ok(Value::Object(normalized))
+        }
     }
 }
 
@@ -1713,6 +1894,16 @@ pub async fn execute(
 /// 批量的价值不只是方便：一个 Operation 带 N 个 Run 是界面「批量运行」的同形，
 /// 也是 daemon 对自主调用方推荐的形状——并发闸按 **Operation** 计数，
 /// 铺开 N 个 Operation 更容易撞上限，而且跟踪起来更碎。
+///
+/// **资产（媒体）走 `assets`**：
+/// - CLI：可重复的 `--asset '字段键=文件'`（解析成 `[{fieldKey, path}]`）——这里先
+///   **上传**再组装 keyed 对象。缺 `--input`/读不到文件/重名都在解析或这里报清楚。
+/// - MCP：直接给**已上传**的 keyed 对象（`asset.upload` 拿 assetId + checksum）。
+/// - 批量 `runs[]` 里每一行也可以带自己的 `assets`（keyed 对象；只收对象，
+///   位置数组只是 HTTP 兼容层，客户端层不给这条路）。
+///
+/// `dryRun=true`：形状与资产全部照常准备（含 CLI 先上传——上传不计费），但**不提交**，
+/// 而是发到只读预检端点拿回同样判据的结论。预检不花钱，但仍要求 execute 权限。
 async fn run_operation(client: &V2Client, args: &Args) -> Result<Value, ClientError> {
     let recipe_revision = args.u64("recipeRevisionId")?;
     let key = args.opt_text("idempotencyKey")?.unwrap_or_else(|| {
@@ -1723,6 +1914,11 @@ async fn run_operation(client: &V2Client, args: &Args) -> Result<Value, ClientEr
         )
     });
     let callback = callback_body(args)?;
+    let dry_run = args.flag("dryRun")?;
+    let single_assets = match args.opt_json("assets")? {
+        Some(value) => Some(prepare_assets(client, &value).await?),
+        None => None,
+    };
     if let Some(runs) = args.opt_json("runs")? {
         let runs = runs.as_array().cloned().unwrap_or_default();
         if runs.is_empty() {
@@ -1736,18 +1932,36 @@ async fn run_operation(client: &V2Client, args: &Args) -> Result<Value, ClientEr
             let inputs = run.get("inputs").cloned().ok_or_else(|| {
                 argument_error("INPUT_REQUIRED", format!("runs[{index}] 缺少 inputs"))
             })?;
-            let mut request = run_request(recipe_revision, inputs);
+            let mut request = run_request(recipe_revision, inputs, None);
             // 调用方给了 clientRunId 就用它（幂等与追踪都靠它），否则按序号生成。
             if let Some(client_run_id) = run.get("clientRunId").and_then(Value::as_str) {
                 if let Some(entry) = request.get_mut(0) {
                     entry["clientRunId"] = json!(client_run_id);
                 }
             }
+            // 批量行自己的资产：**真读真传**（过去 runs[] 里的 assets 被静默丢弃）。
+            if let Some(assets) = run.get("assets") {
+                let Value::Object(_) = assets else {
+                    return Err(argument_error(
+                        "ASSET_SHAPE_INVALID",
+                        format!(
+                            "runs[{index}].assets 必须是 keyed 对象 {{\"<字段键>\": {{\"assetId\", \"checksum\"}}}}，\
+                             收到：{}。位置数组只是 HTTP 兼容层，不许按位置猜字段；字段键见 recipe 的 inputSchema。",
+                            brief(assets)
+                        ),
+                    ));
+                };
+                if let Some(entry) = request.get_mut(0) {
+                    entry["assets"] = assets.clone();
+                }
+            }
             requests.extend(request.as_array().cloned().unwrap_or_default());
         }
-        return client
-            .create_operation(&key, Value::Array(requests), callback)
-            .await;
+        let runs_value = Value::Array(requests);
+        if dry_run {
+            return client.validate_operation(runs_value).await;
+        }
+        return client.create_operation(&key, runs_value, callback).await;
     }
     let inputs = args.json("inputs").map_err(|_| {
         argument_error(
@@ -1755,9 +1969,90 @@ async fn run_operation(client: &V2Client, args: &Args) -> Result<Value, ClientEr
             "缺少 inputs（单次）或 runs（批量），至少给一个".to_string(),
         )
     })?;
-    client
-        .create_operation(&key, run_request(recipe_revision, inputs), callback)
-        .await
+    let request = run_request(recipe_revision, inputs, single_assets);
+    if dry_run {
+        return client.validate_operation(request).await;
+    }
+    client.create_operation(&key, request, callback).await
+}
+
+/// 资产的两种输入形状，在**提交前**统一成 keyed 对象：
+///
+/// - **CLI**（`[{fieldKey, path}]`）：这里**先上传**。上传不计费；文件读不到给
+///   `ASSET_READ_FAILED`（带路径与字段键）——比在上游平台上"图是空的"便宜太多。
+/// - **MCP**（`{字段键: {assetId, checksum}}`）：已上传，直接透传（形状在 `coerce_mcp` 收口）。
+/// - 其他形状（含位置数组）：拒绝。位置数组只是 HTTP 兼容层，客户端层不提供这条路。
+async fn prepare_assets(client: &V2Client, value: &Value) -> Result<Value, ClientError> {
+    match value {
+        Value::Object(_) => Ok(value.clone()),
+        Value::Array(specs) => {
+            let mut keyed = serde_json::Map::new();
+            for spec in specs {
+                let field_key = spec
+                    .get("fieldKey")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .trim()
+                    .to_string();
+                let path = spec
+                    .get("path")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .trim()
+                    .to_string();
+                if field_key.is_empty() || path.is_empty() {
+                    return Err(argument_error(
+                        "ASSET_SPEC_INVALID",
+                        format!("资产项形状不对（要 fieldKey 与 path）：{spec}"),
+                    ));
+                }
+                let bytes = std::fs::read(&path).map_err(|error| ClientError {
+                    status: 0,
+                    code: "ASSET_READ_FAILED".to_string(),
+                    message: format!("无法读取资产文件 {path}（字段键 {field_key}）：{error}"),
+                    retryable: false,
+                    details: Value::Null,
+                })?;
+                let filename = Path::new(&path)
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .unwrap_or("upload.bin")
+                    .replace('\n', "");
+                let mime_type = guess_mime_type(&filename).to_string();
+                let uploaded = client.upload_asset(&filename, &mime_type, bytes).await?;
+                let asset_id = uploaded
+                    .get("assetId")
+                    .and_then(Value::as_u64)
+                    .ok_or_else(|| {
+                        argument_error(
+                            "ASSET_UPLOAD_INVALID",
+                            format!("上传响应里没有 assetId：{uploaded}"),
+                        )
+                    })?;
+                let checksum = uploaded
+                    .get("checksum")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| {
+                        argument_error(
+                            "ASSET_UPLOAD_INVALID",
+                            format!("上传响应里没有 checksum：{uploaded}"),
+                        )
+                    })?;
+                keyed.insert(
+                    field_key,
+                    json!({ "assetId": asset_id, "checksum": checksum }),
+                );
+            }
+            Ok(Value::Object(keyed))
+        }
+        _ => Err(argument_error(
+            "ASSET_SHAPE_INVALID",
+            format!(
+                "assets 必须是 keyed 对象或 --asset 规格数组，收到：{}",
+                brief(value)
+            ),
+        )),
+    }
 }
 
 /// 回调地址 → 请求体里的 `callback` 对象；没给就 `None`（**不要**凭空塞字段：
@@ -2412,6 +2707,10 @@ mod tests {
                 &[
                     "recipe-revision",
                     "input",
+                    // 媒体提交闭环：`--asset '字段键=文件'`（可重复）与只读预检 `--dry-run`。
+                    // 加 flag 是**有意的**契约变更：只加不改，老脚本照跑。
+                    "asset",
+                    "dry-run",
                     "idempotency-key",
                     "callback-url",
                 ],
@@ -2868,6 +3167,11 @@ mod tests {
             Kind::LocalFile => json!(std::env::temp_dir()
                 .join("renderloft-verb-table-missing.bin")
                 .to_string_lossy()),
+            // keyed 资产：给一个形状合法但指向不存在资产的对象——分发要能把它**读出来并
+            // 传下去**（真不真由 daemon 判）。过去这类输入会被静默丢弃，这条就抓那个。
+            Kind::KeyedAssets => {
+                json!({ "475::image": { "assetId": 999_999, "checksum": "nope" } })
+            }
         }
     }
 
@@ -2986,6 +3290,151 @@ mod tests {
         let args = Args::from_cli(verb, verb_matches).expect("解析应当成功");
         assert_eq!(args.json("inputs").expect("inputs")["prompt"], "a cat");
         let _ = std::fs::remove_file(&path);
+    }
+
+    /// CLI 的媒体提交闭环：`--asset '字段键=文件'`（可重复）解析成字段键规格表，
+    /// 三个错误边界（缺 `=` / 重名 / 空路径）各报各的码——不许静默丢掉或取后一个。
+    #[test]
+    fn cli_asset_flags_parse_into_field_key_specs() {
+        let input_path = std::env::temp_dir().join(format!(
+            "renderloft-asset-input-{}.json",
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::write(&input_path, "{}").expect("写临时文件");
+        let run_matches = |assets: &[&str]| {
+            let mut argv = vec![
+                "renderloft",
+                "operation",
+                "run",
+                "--recipe-revision",
+                "7",
+                "--input",
+            ];
+            let input = input_path.to_string_lossy().to_string();
+            argv.push(&input);
+            for asset in assets {
+                argv.push("--asset");
+                argv.push(asset);
+            }
+            cli_command()
+                .try_get_matches_from(argv)
+                .expect("clap 解析应当成功")
+        };
+        let verb = find_by_id("operation.run").expect("verb");
+
+        // 正常：可重复、顺序无关（字段键才是地址）。
+        let matches = run_matches(&["475::image=person.png", "520::image=cloth.png"]);
+        let (_, group) = matches.subcommand().expect("group");
+        let (_, verb_matches) = group.subcommand().expect("action");
+        let args = Args::from_cli(verb, verb_matches).expect("解析应当成功");
+        assert_eq!(
+            args.json("assets").expect("assets"),
+            json!([
+                { "fieldKey": "475::image", "path": "person.png" },
+                { "fieldKey": "520::image", "path": "cloth.png" },
+            ])
+        );
+
+        // 缺 `=`。
+        let matches = run_matches(&["475::image"]);
+        let (_, group) = matches.subcommand().expect("group");
+        let (_, verb_matches) = group.subcommand().expect("action");
+        let error = Args::from_cli(verb, verb_matches)
+            .err()
+            .expect("缺 = 应当报错");
+        assert_eq!(error.code, "ASSET_SPEC_INVALID");
+
+        // 同一字段两个文件：歧义 ⇒ 报错（而不是取后一个）。
+        let matches = run_matches(&["475::image=a.png", "475::image=b.png"]);
+        let (_, group) = matches.subcommand().expect("group");
+        let (_, verb_matches) = group.subcommand().expect("action");
+        let error = Args::from_cli(verb, verb_matches)
+            .err()
+            .expect("重名应当报错");
+        assert_eq!(error.code, "ASSET_FIELD_DUPLICATED");
+        assert!(error.message.contains("475::image"), "{}", error.message);
+
+        // 空路径。
+        let matches = run_matches(&["475::image="]);
+        let (_, group) = matches.subcommand().expect("group");
+        let (_, verb_matches) = group.subcommand().expect("action");
+        let error = Args::from_cli(verb, verb_matches)
+            .err()
+            .expect("空路径应当报错");
+        assert_eq!(error.code, "ASSET_SPEC_INVALID");
+        let _ = std::fs::remove_file(&input_path);
+    }
+
+    /// MCP 的 `assets`：keyed 对象被收下并**规范化**；位置数组、缺字段、多余键都**报错**
+    /// ——静默丢弃正是事故的开端。
+    #[test]
+    fn mcp_assets_must_be_keyed_objects() {
+        let verb = find_by_id("operation.run").expect("verb");
+        let args = Args::from_mcp(
+            verb,
+            &json!({
+                "recipeRevisionId": 7,
+                "inputs": {},
+                "assets": { "475::image": { "assetId": 12, "checksum": "sha1-x" } },
+            }),
+        )
+        .expect("keyed 对象应当合法");
+        assert_eq!(
+            args.json("assets").expect("assets"),
+            json!({ "475::image": { "assetId": 12, "checksum": "sha1-x" } })
+        );
+
+        // 位置数组 ⇒ 明确拒绝，并给出替代做法。
+        let error = Args::from_mcp(
+            verb,
+            &json!({
+                "recipeRevisionId": 7,
+                "inputs": {},
+                "assets": [{ "assetId": 12, "checksum": "sha1-x" }],
+            }),
+        )
+        .err()
+        .expect("位置数组必须被拒");
+        assert_eq!(error.code, "ASSET_SHAPE_INVALID");
+        assert!(
+            error.message.contains("475::image"),
+            "错误要告诉调用方键长什么样：{}",
+            error.message
+        );
+
+        // 缺 checksum。
+        let error = Args::from_mcp(
+            verb,
+            &json!({
+                "recipeRevisionId": 7,
+                "inputs": {},
+                "assets": { "475::image": { "assetId": 12 } },
+            }),
+        )
+        .err()
+        .expect("缺 checksum 必须报错");
+        assert_eq!(error.code, "ASSET_SHAPE_INVALID");
+
+        // 字段里多塞键：报错而不是忽略（忽略会让人以为它起了作用）。
+        let error = Args::from_mcp(
+            verb,
+            &json!({
+                "recipeRevisionId": 7,
+                "inputs": {},
+                "assets": { "475::image": { "assetId": 12, "checksum": "x", "note": "hi" } },
+            }),
+        )
+        .err()
+        .expect("多余键必须报错");
+        assert_eq!(error.code, "ASSET_SHAPE_INVALID");
+
+        // `dryRun` 是布尔，读取路径与其它 flag 一致。
+        let args = Args::from_mcp(
+            verb,
+            &json!({ "recipeRevisionId": 7, "inputs": {}, "dryRun": true }),
+        )
+        .expect("dryRun 应当合法");
+        assert!(args.flag("dryRun").expect("dryRun"));
     }
 
     /// 上传：文件名与 MIME 都从**表 + 派生**来，不再各通道各写一个默认值。

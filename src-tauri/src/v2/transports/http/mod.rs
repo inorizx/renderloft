@@ -1040,6 +1040,119 @@ mod tests {
         assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
     }
 
+    /// MCP 的 dry-run 端到端：**动词层真的把 dryRun 传到了** `/operations/validate`，
+    /// 拿回解析结论，不落库。
+    #[tokio::test]
+    async fn mcp_dry_run_reaches_validate_and_persists_nothing() {
+        use crate::v2::clients::client::V2Client;
+        use crate::v2::clients::verbs::{self, Args};
+
+        let (app, repositories) = test_app();
+        seed_media_recipe(&repositories, true);
+        seed_media_asset(&repositories, 7, "sum-person");
+        let token = issue_token(&repositories, &["operations:execute", "operations:read"]).await;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("绑定端口");
+        let address = listener.local_addr().expect("端口地址");
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        let client = V2Client::new(format!("http://127.0.0.1:{}", address.port()), token)
+            .with_driver("mcp");
+
+        let verb = verbs::find_by_id("operation.run").expect("operation.run");
+        let args = Args::from_mcp(
+            verb,
+            &json!({
+                "recipeRevisionId": 2,
+                "inputs": {},
+                "assets": { "475::image": { "assetId": 7, "checksum": "sum-person" } },
+                "dryRun": true,
+            }),
+        )
+        .expect("参数应当合法");
+        let report = verbs::execute(&client, verb, &args)
+            .await
+            .expect("dry-run 应当成功");
+        assert_eq!(report["dryRun"], true, "{report}");
+        assert_eq!(report["valid"], true, "{report}");
+        assert!(
+            report["runs"][0]["clientRunId"]
+                .as_str()
+                .unwrap_or_default()
+                .starts_with("run-"),
+            "{report}"
+        );
+        assert_eq!(
+            report["runs"][0]["assets"][0]["fieldKey"],
+            "475::image",
+            "{report}"
+        );
+        assert_eq!(report["runs"][0]["assets"][0]["assetId"], 7, "{report}");
+        assert!(
+            crate::v2::ports::repositories::OperationRepository::list_operations(
+                &repositories,
+                10,
+                None
+            )
+            .await
+            .expect("列举")
+            .is_empty(),
+            "dry-run 不许落库"
+        );
+    }
+
+    /// MCP 批量：`runs[]` 里每行的 assets **真的被传下去**（过去被静默丢弃）。
+    #[tokio::test]
+    async fn mcp_batch_run_assets_are_transmitted() {
+        use crate::v2::clients::client::V2Client;
+        use crate::v2::clients::verbs::{self, Args};
+
+        let (app, repositories) = test_app();
+        seed_media_recipe(&repositories, true);
+        seed_media_asset(&repositories, 8, "sum-cloth");
+        let token = issue_token(&repositories, &["operations:execute"]).await;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("绑定端口");
+        let address = listener.local_addr().expect("端口地址");
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        let client = V2Client::new(format!("http://127.0.0.1:{}", address.port()), token)
+            .with_driver("mcp");
+
+        let verb = verbs::find_by_id("operation.run").expect("operation.run");
+        let args = Args::from_mcp(
+            verb,
+            &json!({
+                "recipeRevisionId": 2,
+                "runs": [{
+                    "clientRunId": "look-1",
+                    "inputs": {},
+                    "assets": { "520::image": { "assetId": 8, "checksum": "sum-cloth" } }
+                }],
+            }),
+        )
+        .expect("参数应当合法");
+        verbs::execute(&client, verb, &args)
+            .await
+            .expect("批量提交应当成功");
+        let stored = repositories
+            .find_operation(crate::v2::domain::ids::OperationId(1))
+            .await
+            .expect("查询")
+            .expect("应已落库");
+        assert_eq!(stored.runs[0].client_run_id, "look-1");
+        assert_eq!(
+            stored.runs[0].assets[0].field_key.as_deref(),
+            Some("520::image"),
+            "批量行里的字段键必须落到位：{:?}",
+            stored.runs[0].assets
+        );
+    }
+
     #[tokio::test]
     async fn unknown_api_path_returns_json_404() {
         let (app, repositories) = test_app();
@@ -2690,6 +2803,11 @@ mod tests {
                 // 非空的一条 run：空数组会**在本地就被拒**（RUNS_EMPTY），那样路径没被验证。
                 Kind::JsonArray => json!([{ "inputs": {} }]),
                 Kind::LocalFile => json!(upload_path.to_string_lossy()),
+                // keyed 资产：形状合法、指向不存在的资产——路径要真的打到 daemon
+                // （然后死在资产校验上），而不是在本地就被丢掉。
+                Kind::KeyedAssets => {
+                    json!({ "475::image": { "assetId": 999_999, "checksum": "nope" } })
+                }
             }
         }
         let mut arguments = serde_json::Map::new();

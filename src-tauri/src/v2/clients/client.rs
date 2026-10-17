@@ -390,6 +390,16 @@ impl V2Client {
         self.post("/api/v1/operations", body).await
     }
 
+    /// 只读预检（dry-run）。
+    ///
+    /// 与 `create_operation` 走**同一套**服务端解析（验证 revision/连接/能力/字段键/资产
+    /// 存在与 checksum），但**不落库、不调度、不调用 provider、不花钱**。
+    /// 形状与 create 一致：`runs` 是数组。
+    pub async fn validate_operation(&self, runs: Value) -> Result<Value, ClientError> {
+        self.post("/api/v1/operations/validate", json!({ "runs": runs }))
+            .await
+    }
+
     pub async fn get_operation(&self, operation_id: u64) -> Result<Value, ClientError> {
         self.get(&format!("/api/v1/operations/{operation_id}"))
             .await
@@ -566,12 +576,17 @@ pub fn is_terminal_status(status: &str) -> bool {
     matches!(status, "SUCCEEDED" | "FAILED" | "CANCELLED")
 }
 
-pub fn run_request(recipe_revision_id: u64, inputs: Value) -> Value {
-    json!([{
+pub fn run_request(recipe_revision_id: u64, inputs: Value, assets: Option<Value>) -> Value {
+    let mut run = json!({
         "clientRunId": format!("run-{}", uuid::Uuid::new_v4().simple()),
         "recipeRevisionId": recipe_revision_id,
         "inputs": inputs,
-    }])
+    });
+    // 资产是**可选的**：没给就一个字段都不加（"没给"与"给了空"对服务端不是一回事）。
+    if let Some(assets) = assets {
+        run["assets"] = assets;
+    }
+    json!([run])
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -830,16 +845,25 @@ mod tests {
     }
 
     /// `run_request` 的请求体形状（此前这条测试住在 `cli.rs`，CLI 改成表驱动后挪到这里
-    /// ——它测的本来就是 client 的构造函数）。
+    /// ——它测的本来就是 client 的构造函数）。资产为 `None` 时**一个字段都不加**，
+    /// 给了就原样带上（keyed 对象）。
     #[test]
     fn run_request_uses_supplied_revision() {
-        let request = run_request(7, json!({ "prompt": "a cat" }));
+        let request = run_request(7, json!({ "prompt": "a cat" }), None);
         assert_eq!(request[0]["recipeRevisionId"], 7);
         assert_eq!(request[0]["inputs"]["prompt"], "a cat");
         assert!(request[0]["clientRunId"]
             .as_str()
             .unwrap()
             .starts_with("run-"));
+        assert!(
+            request[0].get("assets").is_none(),
+            "没给资产就不许凭空加字段"
+        );
+
+        let assets = json!({ "475::image": { "assetId": 12, "checksum": "sha1-x" } });
+        let request = run_request(7, json!({ "prompt": "a cat" }), Some(assets.clone()));
+        assert_eq!(request[0]["assets"], assets, "资产必须真的进请求体");
     }
 
     /// 204（无响应体）是**成功**——`POST /api/daemon/shutdown` 就是这样回的。
