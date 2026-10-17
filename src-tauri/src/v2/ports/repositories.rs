@@ -196,6 +196,12 @@ pub trait SettingsRepository: Send + Sync {
     async fn save_settings(&self, record: &SettingsRecord) -> DomainResult<()>;
 }
 
+/// 工作区库文件名。
+///
+/// 它是**工作区契约**的一部分（备份/迁移要按这个名字放库），所以住在端口层：`daemon` 与
+/// `application` 都从这里取，谁都不必去依赖组合根。
+pub const WORKSPACE_DB_FILE: &str = "v2-workspace.db";
+
 /// 工作区**整体**的三件事：库在哪、产物缓存在哪、把库一致地导出一份。
 ///
 /// 为什么值得单独一个端口：迁移/备份要的不是"某张表的数据"，而是整个工作区；而"一致的快照"

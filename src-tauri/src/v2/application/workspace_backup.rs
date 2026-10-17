@@ -12,9 +12,10 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use crate::v2::daemon::V2_DB_FILE;
 use crate::v2::domain::errors::{DomainResult, SafeError};
-use crate::v2::ports::repositories::WorkspaceRepository;
+// 库文件名从端口层取（它是工作区契约的一部分）：application 不该为了一个常量去依赖组合根，
+// 分层守门也会拦。daemon 那边的 V2_DB_FILE 现在只是这个常量的别名。
+use crate::v2::ports::repositories::{WorkspaceRepository, WORKSPACE_DB_FILE};
 
 /// 备份：把工作区导到调用方指定的目录。
 pub struct WorkspaceBackupService {
@@ -82,7 +83,7 @@ impl WorkspaceBackupService {
             .map_err(|error| SafeError::storage(format!("无法创建备份目录：{error}")))?;
 
         // 已有一份快照就**报错**，不覆盖：备份是"再存一份"，不是"改掉上一份"。
-        let snapshot_database = target.join(V2_DB_FILE);
+        let snapshot_database = target.join(WORKSPACE_DB_FILE);
         if snapshot_database.exists() {
             return Err(SafeError::conflict(
                 "BACKUP_TARGET_NOT_EMPTY",
@@ -173,7 +174,7 @@ mod tests {
     /// 真实文件库 + 服务。**不用替身**：这条路径的全部价值就在"真库能不能被一致地导出"。
     fn service(workspace: &Path) -> (WorkspaceBackupService, Arc<SqliteRepositories>) {
         let repositories =
-            Arc::new(SqliteRepositories::open(&workspace.join(V2_DB_FILE)).expect("开库"));
+            Arc::new(SqliteRepositories::open(&workspace.join(WORKSPACE_DB_FILE)).expect("开库"));
         let service =
             WorkspaceBackupService::new(repositories.clone() as Arc<dyn WorkspaceRepository>);
         (service, repositories)
@@ -202,8 +203,8 @@ mod tests {
         assert!(report.database_bytes > 0, "库文件不该是空的：{report:?}");
 
         // 用**全新的连接**打开备份里的库——这才是"备份可用"的证明。
-        let reopened =
-            SqliteRepositories::open(&target.join(V2_DB_FILE)).expect("备份库应当能重新打开");
+        let reopened = SqliteRepositories::open(&target.join(WORKSPACE_DB_FILE))
+            .expect("备份库应当能重新打开");
         assert_eq!(
             reopened.load_settings().await.expect("读设置").download_dir,
             "D:/pics",
@@ -237,14 +238,14 @@ mod tests {
         let workspace = temp_dir("existing");
         let (service, _) = service(&workspace);
         let target = temp_dir("existing-out");
-        std::fs::write(target.join(V2_DB_FILE), b"previous-backup").expect("占位");
+        std::fs::write(target.join(WORKSPACE_DB_FILE), b"previous-backup").expect("占位");
         let error = service
             .backup(&target.to_string_lossy())
             .await
             .expect_err("已有备份必须被拒");
         assert_eq!(error.code, "BACKUP_TARGET_NOT_EMPTY");
         assert_eq!(
-            std::fs::read(target.join(V2_DB_FILE)).expect("旧备份应当原样"),
+            std::fs::read(target.join(WORKSPACE_DB_FILE)).expect("旧备份应当原样"),
             b"previous-backup",
             "不许动已有的那份"
         );
