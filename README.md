@@ -33,7 +33,7 @@
 
 ### Linux（无头版）
 
-Linux 的形态是**无头**：没有桌面壳、也没有托盘——**CLI、网页控制台（daemon 伺服）、MCP 三入口共用同一个 daemon**。装好 Node + pnpm + Rust 后从源码构建：
+Linux 的形态是**无头**：没有桌面壳、也没有托盘——**CLI、网页控制台（daemon 伺服）、MCP 三入口共用同一个 daemon**。发布时会连同 `RenderLoft_<版本>_x64-linux.tar.gz` 一起提供（从下一个版本起）；也可以自行从源码构建（需要 Node + pnpm + Rust）：
 
 ```bash
 pnpm install
