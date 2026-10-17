@@ -5,7 +5,8 @@
 //   ③ 索引体量：`catalog` 无参返回的索引（按需取，不算常驻）
 //
 // 为什么要有它：README 与 `docs/mcp-surface.md` 都拿"常驻多少 token"当论据，而**手抄的数字
-// 会漂**（实测过一次：改了 `instructions` 与标记之后，README 里的 ≈790 立刻不再是真值）。
+// 会漂**（实测过一次：改了 `instructions` 与标记之后，`docs/mcp-surface.md` 里的 ≈790
+// 立刻不再是真值）。
 // 数字要有来源、要能复量，所以量具进仓库，而不是把结论抄进文档。
 //
 // ⚠️ 安全边界：**只读**——`initialize` / `tools/list` / `catalog`，不提交任何任务、不花额度。
