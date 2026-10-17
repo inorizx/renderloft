@@ -47,7 +47,7 @@ fn handle_once() {
         return;
     };
     let target = target_of(&request);
-    if let Err(error) = shell_open_and_select(&target) {
+    if let Err(error) = shell_open_path(&target) {
         crate::shell_log(&format!("打开下载目录失败：{error}"));
     }
 }
@@ -75,10 +75,53 @@ fn request_path() -> Option<PathBuf> {
     )
 }
 
-/// `SHOpenFolderAndSelectItems`：打开并选中；传目录就是打开它。
-///
-/// 与 `src-tauri/src/v2/application/settings.rs` 里那份是同一段逻辑。两个 crate 之间没有共享库
+/// 与 `src-tauri/src/v2/application/settings.rs` 里那两份是同一段逻辑。两个 crate 之间没有共享库
 /// （`desktop` 是独立 crate），所以这是一份**刻意的重复**——改动其一请同步另一份。
+/// 打开路径：**文件**就选中它，**目录**就打开它。
+///
+/// ⚠️ 两种情形必须分开走，这是实测踩出来的（2026-10-16）：`SHOpenFolderAndSelectItems` 拿到的
+/// PIDL 如果是**目录**，它打开的是**父目录**并把这个目录选中——用户看到的是"跳到了上一层、
+/// 高亮了下载文件夹"，而不是"打开下载文件夹"。打开目录要用 `ShellExecuteW("open")`。
+#[cfg(target_os = "windows")]
+fn shell_open_path(path: &Path) -> Result<(), String> {
+    if path.is_dir() {
+        return shell_open_directory(path);
+    }
+    shell_open_and_select(path)
+}
+
+/// 打开一个目录（`ShellExecuteW` 的 "open" 动作，也就是资源管理器里双击一个文件夹的行为）。
+#[cfg(target_os = "windows")]
+fn shell_open_directory(path: &Path) -> Result<(), String> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::UI::Shell::ShellExecuteW;
+    use windows_sys::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
+
+    let wide = |text: &str| -> Vec<u16> { text.encode_utf16().chain(std::iter::once(0)).collect() };
+    let verb = wide("open");
+    let file: Vec<u16> = path
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+    // `ShellExecuteW` 的返回值是个古怪的约定：> 32 才算成功，<= 32 是错误码。
+    let result = unsafe {
+        ShellExecuteW(
+            std::ptr::null_mut(),
+            verb.as_ptr(),
+            file.as_ptr(),
+            std::ptr::null(),
+            std::ptr::null(),
+            SW_SHOWNORMAL,
+        )
+    };
+    if result as isize <= 32 {
+        return Err(format!("ShellExecuteW 失败：{:?}", result as isize));
+    }
+    Ok(())
+}
+
+/// `SHOpenFolderAndSelectItems`：打开文件所在的目录并选中它。
 #[cfg(target_os = "windows")]
 fn shell_open_and_select(path: &Path) -> Result<(), String> {
     use std::os::windows::ffi::OsStrExt;

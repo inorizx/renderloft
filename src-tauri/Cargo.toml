@@ -26,9 +26,11 @@ keyring = { version = "3", features = ["windows-native"] }
 # 三处 Win32 调用，各自都有非用不可的理由：
 # ① `GetStdHandle` + `SetHandleInformation`：拉 daemon 之前必须关掉本进程标准句柄的
 #    "可继承"位，否则子进程会攥住调用方的管道（机制与实测见 `v2/clients/daemon_boot.rs`）。
-# ② `SHOpenFolderAndSelectItems`：打开下载目录并选中文件。**不能**用 `explorer.exe /select,`
+# ② `SHOpenFolderAndSelectItems`：打开下载目录并**选中文件**。**不能**用 `explorer.exe /select,`
 #    那条老命令行——实测（用户复现）：下载文件夹已经开着一个窗口时，它认不出参数，退回
 #    Explorer 的默认目录（文档）。Shell API 没有这个问题，它还会复用已有窗口。
+# ③ `ShellExecuteW`：**打开目录**（不是"在父目录里选中它"）。`SHOpenFolderAndSelectItems`
+#    拿到目录的 PIDL 时打开的是父目录——两种情形必须分开走（实测，见 `application/settings.rs`）。
 # 版本刻意与锁文件里已有的那份对齐（0.60.2），离线也能构建。
 windows-sys = { version = "0.60", features = [
     "Win32_Foundation",
@@ -36,6 +38,7 @@ windows-sys = { version = "0.60", features = [
     "Win32_System_Com",
     "Win32_UI_Shell",
     "Win32_UI_Shell_Common",
+    "Win32_UI_WindowsAndMessaging",
 ] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
