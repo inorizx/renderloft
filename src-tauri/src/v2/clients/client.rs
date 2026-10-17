@@ -438,6 +438,25 @@ impl V2Client {
         .await
     }
 
+    /// 重试：**新建一个 operation**（复用原 run 的配方修订、inputs 与 assets），不是"接着跑旧的"。
+    ///
+    /// 服务端返回的是**新** operationId —— 调用方必须改盯新的那个，旧的原样留着
+    /// （还在不确定态就自己取消它）。
+    ///
+    /// `run_id` 给了就只重试那一条 run（批量里失败的那几条）；不给就重跑该任务的全部 run
+    /// ——**后者会把已经成功的那几条也再提交一次，也就是再花一次钱**。
+    pub async fn retry_operation(
+        &self,
+        operation_id: u64,
+        run_id: Option<u64>,
+    ) -> Result<Value, ClientError> {
+        let path = match run_id {
+            Some(run_id) => format!("/api/v1/operations/{operation_id}/runs/{run_id}/retry"),
+            None => format!("/api/v1/operations/{operation_id}/retry"),
+        };
+        self.post(&path, json!({})).await
+    }
+
     pub async fn operation_events(
         &self,
         operation_id: u64,

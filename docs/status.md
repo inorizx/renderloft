@@ -87,6 +87,14 @@
   一次 `get` 才知道该看哪一个。原因码与严重度（不确定 > 退避 > 提交中 > 排队）**只有一张表**
   （`domain::operation::ATTENTION_LADDER`）：`get` 的挑选与 `list` 摘要那条相关子查询的
   `IN` / `ORDER BY CASE` 都由它生成，不手抄（一条相关子查询，不是 N+1）。
+- **`operation retry` 进 CLI / MCP**：`renderloft-cli operation retry --operation <id> [--run <id>]`
+  / MCP `renderloft_retry_operation`。此前它**只有 HTTP**（界面点得到，CLI / MCP 够不着），
+  而 `attention` 的 `nextActions` 早就把 `operation.retry` 写成"下一步能做什么"——名字够不到就是
+  死路（有守卫钉住"`nextActions` 点到的名字必须是表里真实存在的动词"）。它是**新建一个 operation**
+  （复用原 run 的配方修订、inputs 与 assets；`clientRunId` 带 `-retry-<时间戳>`、新 idempotencyKey），
+  所以**返回的是新 operationId，要改盯新的那个**，且每个重试的 run 都会**再计费一次**；
+  `--run` 只重试一条 —— 批量里只失败了几条时用它，重跑整个任务会把已成功的那几条也再提交一次
+  （也就是再花一次钱）。
 
 ## 当前进行中
 
