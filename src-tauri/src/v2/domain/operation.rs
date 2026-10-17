@@ -235,6 +235,104 @@ pub struct Run {
     pub updated_at: Timestamp,
 }
 
+/// 这个 run **为什么没在动** —— 每个"在等什么"的非终态都给出机器可读的原因与下一动作。
+///
+/// 为什么需要它（实测，2026-10-17）：一次提交超时后 run 落 `SubmissionUncertain`，而 operation 级
+/// 投影（`project_operation_status`）只看"有没有非终态" ⇒ op 显示 `Running`。调用方据此对外报了
+/// "预计 10 分钟出片"，实际它要**等到死线（默认 1 小时）才判失败**。事件流里躺着
+/// `run.submission_uncertain`，但没有任何主动呈现——要发现它得逐层看 run → 读事件 → 翻源码。
+///
+/// 判据沿用仓库的老规矩：**把调用方需要的事实交给调用方**。所以这里给的是
+/// 稳定原因码 + 人话 + 死线 + 到点会怎样 + 现在能做什么，而不是让调用方去猜状态机。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RunAttention {
+    /// 稳定的机器可读原因码（见 `run_attention` 的分支）。
+    pub reason: String,
+    /// 一句人话：发生了什么、在等什么。
+    pub message: String,
+    /// 进入当前状态的时间（近似：run 的最后一次状态更新）。
+    pub since: Timestamp,
+    /// 死线；`None` = 没有死线，只能等外部变化（例如排队等前一个 run 结束）。
+    pub deadline: Option<Timestamp>,
+    /// 到死线时会发生什么。
+    pub deadline_effect: Option<String>,
+    /// 现在能做什么（动词名；"新建一个 operation"这类语义差别写在名字里，不靠猜）。
+    pub next_actions: Vec<String>,
+}
+
+/// 这个 run 现在"为什么没在动"？**正常在跑的（Accepted / Running）与终态返回 `None`**。
+///
+/// 只讲事实：系统会自己做什么、到点会怎样、人能做什么。不推算、不猜。
+pub fn run_attention(run: &Run) -> Option<RunAttention> {
+    let attention = |reason: &str,
+                     message: &str,
+                     deadline_effect: Option<&str>,
+                     next_actions: &[&str]| RunAttention {
+        reason: reason.to_string(),
+        message: message.to_string(),
+        since: run.updated_at.clone(),
+        deadline: run.tracking_deadline.clone(),
+        deadline_effect: deadline_effect.map(str::to_string),
+        next_actions: next_actions.iter().map(|name| name.to_string()).collect(),
+    };
+    match run.status {
+        RunStatus::SubmissionUncertain => Some(attention(
+            "SUBMISSION_UNCERTAIN",
+            "提交时连接断了或超时——**平台到底收没收到不知道**，所以不重投（重投可能重复扣费）。\
+             系统正在对账；到死线仍确认不了就判失败，不会自动重投。",
+            Some("判为失败（不会自动重投）"),
+            &[
+                "operation.get",
+                "operation.wait",
+                "operation.cancel",
+                "operation.retry",
+            ],
+        )),
+        RunStatus::RetryWait => Some(attention(
+            "RETRY_BACKOFF",
+            "上一次提交被平台拒了（或可重试地失败了），正在退避等待后自动重试——不需要人做任何事。",
+            Some("判为失败"),
+            &["operation.get", "operation.wait", "operation.cancel"],
+        )),
+        RunStatus::Submitting => Some(attention(
+            "SUBMITTING",
+            "正在提交：已落库租约，进程若在这里中断，超过恢复窗口会自动转成「等确认」。",
+            Some("超过恢复窗口后转为「等确认」（SUBMISSION_UNCERTAIN）"),
+            &["operation.get", "operation.wait"],
+        )),
+        RunStatus::Queued | RunStatus::Preparing => Some(attention(
+            "QUEUED",
+            "排队中：这条连接同时只跑一个（与平台账号的实际并发一致），前面还有没结束的 run。",
+            None,
+            &["operation.get", "operation.wait", "operation.cancel"],
+        )),
+        // 正常在跑、以及三种终态：没有"为什么没在动"可说。
+        RunStatus::Accepted
+        | RunStatus::Running
+        | RunStatus::Succeeded
+        | RunStatus::Failed
+        | RunStatus::Cancelled => None,
+    }
+}
+
+/// 一个 operation 里"最该被看见"的那条 attention：不确定 > 退避 > 提交中 > 排队。
+///
+/// 排序是**按"它挡住了什么"**：`SUBMISSION_UNCERTAIN` 会占住这条连接唯一的执行位（后续 run 全排队），
+/// 而且它意味着"可能已经花了钱但不知道结果"，所以排第一。
+pub fn operation_attention(runs: &[Run]) -> Option<RunAttention> {
+    let severity = |reason: &str| match reason {
+        "SUBMISSION_UNCERTAIN" => 0,
+        "RETRY_BACKOFF" => 1,
+        "SUBMITTING" => 2,
+        "QUEUED" => 3,
+        _ => 4,
+    };
+    runs.iter()
+        .filter_map(run_attention)
+        .min_by_key(|attention| severity(&attention.reason))
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RunAttempt {
     pub id: AttemptId,
@@ -570,6 +668,66 @@ mod tests {
     fn operation_status_projection_partial() {
         let runs = vec![run(1, RunStatus::Succeeded), run(2, RunStatus::Failed)];
         assert_eq!(project_operation_status(&runs), OperationStatus::Partial);
+    }
+
+    /// 「为什么没在动」：每个"在等什么"的非终态都要给出原因 + 死线 + 下一动作；
+    /// 正常在跑的（Accepted / Running）与终态**不给**——给了就是噪音。
+    ///
+    /// 负对照：把 `run_attention` 里 `SubmissionUncertain` 那条分支改成 `None` ⇒ 第一条断言红。
+    #[test]
+    fn attention_explains_waiting_states_and_stays_quiet_while_running() {
+        for (status, reason) in [
+            (RunStatus::SubmissionUncertain, "SUBMISSION_UNCERTAIN"),
+            (RunStatus::RetryWait, "RETRY_BACKOFF"),
+            (RunStatus::Submitting, "SUBMITTING"),
+            (RunStatus::Queued, "QUEUED"),
+        ] {
+            let attention = run_attention(&run(1, status))
+                .unwrap_or_else(|| panic!("{status:?} 应当给出「为什么没在动」"));
+            assert_eq!(attention.reason, reason, "{status:?}");
+            assert!(!attention.message.is_empty(), "{status:?} 要给一句人话");
+            assert!(
+                !attention.next_actions.is_empty(),
+                "{status:?} 要说下一步能做什么"
+            );
+        }
+        // 不确定态必须说清"到点会怎样"——否则调用方只能猜（这正是那次 40 分钟误报的成因）。
+        let uncertain = run_attention(&run(1, RunStatus::SubmissionUncertain)).expect("uncertain");
+        assert!(uncertain.deadline_effect.is_some(), "要说清到死线会怎样");
+        assert!(
+            uncertain
+                .next_actions
+                .iter()
+                .any(|name| name == "operation.retry"),
+            "恢复路径要在下一动作里点名"
+        );
+        for status in [
+            RunStatus::Accepted,
+            RunStatus::Running,
+            RunStatus::Succeeded,
+            RunStatus::Failed,
+            RunStatus::Cancelled,
+        ] {
+            assert!(
+                run_attention(&run(1, status)).is_none(),
+                "{status:?} 不该有 attention"
+            );
+        }
+    }
+
+    /// operation 级取"最该被看见"的那条：不确定 > 退避 > 提交中 > 排队。
+    #[test]
+    fn operation_attention_surfaces_the_most_blocking_run() {
+        let runs = vec![
+            run(1, RunStatus::Queued),
+            run(2, RunStatus::SubmissionUncertain),
+            run(3, RunStatus::RetryWait),
+        ];
+        assert_eq!(
+            operation_attention(&runs).expect("应当有").reason,
+            "SUBMISSION_UNCERTAIN"
+        );
+        assert!(operation_attention(&[run(1, RunStatus::Running)]).is_none());
     }
 
     #[test]

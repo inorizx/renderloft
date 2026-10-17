@@ -1071,6 +1071,9 @@ pub async fn get_operation(
             "createdAt": operation.created_at.0,
             "updatedAt": operation.updated_at.0,
             "recipeName": recipe_name,
+            // operation 级：挑"最该被看见"的那条（不确定 > 退避 > 提交中 > 排队）。
+            // 调用方不该为了知道"这次在等什么"去遍历 runs —— 那正是这次事故里缺的那一步。
+            "attention": crate::v2::domain::operation::operation_attention(&persisted.runs),
             "runs": persisted.runs.iter().map(run_response).collect::<Vec<_>>(),
         })))
         .unwrap(),
@@ -1122,6 +1125,9 @@ fn run_response(run: &crate::v2::domain::operation::Run) -> Value {
         "connectionRevisionId": run.connection_revision_id.0,
         "status": run.status.as_str(),
         "trackingState": run.tracking_state.as_str(),
+        // 「它为什么没在动」：非终态里"在等什么"的那些给出原因 + 死线 + 下一动作
+        // （见 `domain::operation::run_attention`）。正常在跑的与终态是 null。
+        "attention": crate::v2::domain::operation::run_attention(run),
         // 平台报的用量（`null` = 平台没说，不是 0）。
         "usage": run.usage,
         "error": run.error,
