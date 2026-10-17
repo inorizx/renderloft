@@ -1,6 +1,6 @@
 [package]
 name = "renderloft"
-version = "0.1.0"
+version = "0.1.1"
 description = "RenderLoft local daemon for RunningHub AI applications"
 license = "MIT"
 edition = "2021"
