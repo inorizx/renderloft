@@ -919,6 +919,28 @@ mod tests {
         assert_eq!(stored[0].asset_id, AssetId(7));
     }
 
+    /// 旧 revision（asset-N 映射）也收 **keyed** 资产：字段键直接解析，不经过任何位置换算
+    /// ——这是 CLI / MCP 对老 revision 的迁移路径（用户场景的 qwen 映射 + {520::image}）。
+    #[tokio::test]
+    async fn keyed_assets_work_on_legacy_mappings_too() {
+        let repositories = InMemoryRepositories::new();
+        let revision = seed_media_environment(&repositories, false);
+        seed_asset(&repositories, 8, "sum-cloth");
+        let use_case = use_case(repositories.clone());
+        let persisted = use_case
+            .execute(media_request(
+                revision,
+                "look-1",
+                vec![AssetRef::new(AssetId(8), "sum-cloth").with_field_key("520::image")],
+            ))
+            .await
+            .expect("keyed 资产对旧映射也应有效");
+        let stored = &persisted.runs[0].assets;
+        assert_eq!(stored.len(), 1);
+        assert_eq!(stored[0].field_key.as_deref(), Some("520::image"));
+        assert_eq!(stored[0].asset_id, AssetId(8));
+    }
+
     /// 新 revision（keyed 映射）收到位置数组 ⇒ POSITIONAL_ASSETS_UNSUPPORTED（不许猜）。
     #[tokio::test]
     async fn keyed_revision_rejects_positional_array() {
