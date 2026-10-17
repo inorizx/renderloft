@@ -377,10 +377,8 @@ const messages = {
     'runner.uploadTooLarge': '文件不能超过 100 MB',
     'runner.revisionExpired': '应用版本已失效，请返回应用库后重试。',
     'runner.rowTag': '第 {n} 行的',
-    'runner.rowTagParen': '（第 {n} 行）',
     'runner.invalidNumbers': '请修正{row}数值字段：{fields}',
     'runner.missingRequired': '请先填写{row}必填项：{fields}',
-    'runner.fileOrderRequired': '请按文件字段顺序上传素材{row}，不能跳过前面的文件字段。',
     'runner.submitted': '任务 #{id} 已提交，进度请在右侧「实时任务」查看。',
     /*
      * 运行页那行"字段名可以改"的提示：只在**看得出还没整理过**的时候显示
@@ -1188,11 +1186,8 @@ const messages = {
     'runner.revisionExpired':
       'This app version is no longer valid. Return to Library and try again.',
     'runner.rowTag': ' in row {n}',
-    'runner.rowTagParen': ' (row {n})',
     'runner.invalidNumbers': 'Fix invalid number fields{row}: {fields}',
     'runner.missingRequired': 'Fill in required fields{row}: {fields}',
-    'runner.fileOrderRequired':
-      'Upload files in field order{row}; earlier file fields cannot be skipped.',
     'runner.submitted': 'Task #{id} submitted. Track progress in "Live tasks" on the right.',
     'runner.fieldNamingHint':
       'These names come from the platform; rename them to match what they do.',
