@@ -93,8 +93,10 @@ cargo clippy --offline --manifest-path src-tauri/Cargo.toml --all-targets -- -D 
   新增/改动词后跑 `every_verb_hits_a_real_route_with_the_right_method`
   （它把真实 router 起在真 socket 上，用不存在的 id 跑一遍整张动词表）。
   ⚠️ **加/改路由必须同步 `transports/http/handlers.rs::openapi()` 里那张声明表**：
-  它手工维护、**无机械守卫**（axum Router 无法自省），实测曾漏报 16/44 条路径
-  （含 `/api/v1/settings`），使对外发布的 `openapi.json` 少报 1/3 的 API。
+  它手工维护（axum Router 无法自省），但**现在有机械守卫**——
+  `transports::http::tests::openapi_table_matches_registered_routes` 会扫源码逐条核对。
+  这道守卫是后来补的：此前实测曾漏报 16/44 条路径（含 `/api/v1/settings`），
+  使对外发布的 `openapi.json` 少报 1/3 的 API。
 - **错误**：稳定 `code` 是机器契约，`message` 可演进；`retryable` 由 Rust 核心
   决定；错误信封 `{ contractVersion, ok, error: { kind, code, message,
   retryable, details } }`。

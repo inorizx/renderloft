@@ -320,6 +320,9 @@ renderloft-cli artifact list
 > **媒体资产按「字段键」定位**（`475::image` 这样的 `节点::字段`，`recipe describe` 的 `inputSchema` 里就有）。
 > HTTP 还接受旧的 `asset-N` 位置数组，但那只是给老客户端/老版本兼容的编码——新提交一律用字段键，
 > 让位置决定放哪张图正是「图片错位」的来源。字段键错了会明确报 `ASSET_FIELD_UNKNOWN`，不会静默丢。
+> 位置数组**多给槽位会被拒**（`ASSET_COUNT_EXCEEDED`），不再静默丢掉多余的。
+> 顶层 `assets` 与 `runs` **不能同时给**（`ASSETS_NOT_ALLOWED_WITH_RUNS`）：那是两种写法，
+> 批量每一行的资产要写在该行自己的 `runs[i].assets` 里——歧义不猜，宁可报错也不静默丢一份。
 >
 > 想知道它在不在、想关掉它：
 > ```powershell
