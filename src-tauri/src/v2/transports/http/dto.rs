@@ -97,6 +97,16 @@ pub struct CreateOperationRequestDto {
     pub callback: Option<CallbackDto>,
 }
 
+/// `POST /api/v1/operations/validate` 的请求体：**只有 runs**。
+///
+/// 刻意不带 `idempotencyKey` / `metadata` / `callback`：预检不落库，没有要幂等的东西；
+/// 多发一个它不用的字段应当被 `deny_unknown_fields` 拒绝，而不是被静默忽略。
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ValidateOperationRequestDto {
+    pub runs: Vec<RunRequestDto>,
+}
+
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct RunRequestDto {
@@ -107,7 +117,24 @@ pub struct RunRequestDto {
     #[serde(default)]
     pub inputs: BTreeMap<String, Value>,
     #[serde(default)]
-    pub assets: Vec<AssetRefDto>,
+    pub assets: Option<RunAssetsDto>,
+}
+
+/// 一个 run 的资产引用。**两种形状**（`untagged`：按内容自己认，不靠一个判别字段）：
+///
+/// * `Keyed`（推荐/规范形状）：`{ "<字段键>": { assetId, checksum } }`——字段键来自该
+///   revision 的 inputSchema（`format: "file"` 的那些键，如 `"475::image"`）；
+/// * `Positional`（**仅兼容**）：`[ { assetId, checksum } ]`——旧的位置编码，只对仍带
+///   旧 `asset-N` 映射的 revision 有效。对新的 keyed revision 收到数组会报
+///   `POSITIONAL_ASSETS_UNSUPPORTED`（在 `MediaMapping::bind` 里），不许猜。
+///
+/// ⚠️ 位置不是语义、也从来不是：数组下标与"第几个图槽"的对应关系随上游节点顺序、
+/// schema 键序、调用方顺序各自漂移——这正是错位事故的根因。
+#[derive(Debug, Clone, Deserialize)]
+#[serde(untagged)]
+pub enum RunAssetsDto {
+    Keyed(BTreeMap<String, AssetRefDto>),
+    Positional(Vec<AssetRefDto>),
 }
 
 #[derive(Debug, Clone, Deserialize)]

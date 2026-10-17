@@ -13,6 +13,7 @@ use crate::v2::application::recipe_import::RecipeImportService;
 use crate::v2::application::reconcile::ReconcileService;
 use crate::v2::application::scheduler::SchedulerService;
 use crate::v2::application::settings::{RunningHubStatusService, SettingsService};
+use crate::v2::application::validate_operation::ValidateOperation;
 use crate::v2::domain::actor::{ActorKind, Scope};
 use crate::v2::domain::errors::{DomainResult, SafeError};
 use crate::v2::domain::model::SecretBinding;
@@ -199,10 +200,13 @@ impl V2Runtime {
                 recipes: Box::new(recipes.clone()),
                 connections: Box::new(connections.clone()),
                 operations: Box::new(operations.clone()),
+                assets: Box::new(assets.clone()),
             },
             Box::new(ScopeAuthorizationPolicy),
             Box::new(BasicSchemaValidator),
         ));
+        // 只读预检：与 create 共用同一套解析（一份判据，两个入口）。
+        let validate_operation = Arc::new(ValidateOperation::new(create_operation.clone()));
         let cancel_operation = Arc::new(CancelOperation {
             repositories: operations.clone(),
             connections: connections.clone(),
@@ -262,6 +266,7 @@ impl V2Runtime {
             artifacts,
             artifacts_repo,
             create_operation,
+            validate_operation,
             cancel_operation,
             drivers,
             settings,
