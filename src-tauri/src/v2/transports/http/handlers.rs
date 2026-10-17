@@ -37,10 +37,10 @@ use crate::v2::ports::repositories::ActorTokenRecord;
 use crate::v2::ports::safety::SafeHttpClient;
 
 use super::dto::{
-    AssetRefDto, CallbackDto, CreateConnectionRequestDto, CreateOperationRequestDto,
-    CreateRecipeRequestDto, Envelope, EventResponseDto, IssueTokenRequestDto, OperationResponseDto,
-    Page, PaginationQuery, RunRequestDto, SecretBindingEntryDto, TokenIssuedDto, TokenSummaryDto,
-    UpdateConnectionRequestDto, UpdateRecipeRequestDto,
+    CallbackDto, CreateConnectionRequestDto, CreateOperationRequestDto, CreateRecipeRequestDto,
+    Envelope, EventResponseDto, IssueTokenRequestDto, OperationResponseDto, Page, PaginationQuery,
+    RunAssetsDto, RunRequestDto, SecretBindingEntryDto, TokenIssuedDto, TokenSummaryDto,
+    UpdateConnectionRequestDto, UpdateRecipeRequestDto, ValidateOperationRequestDto,
 };
 use super::error;
 // 使用与 axum::Json 同名的包装提取器：请求体解析失败时返回统一信封而非纯文本。
@@ -111,6 +111,7 @@ pub const ROUTES: &[(&str, &str)] = &[
     ("/api/v1/recipes/{recipe_id}/restore", "post"),
     ("/api/v1/operations", "get"),
     ("/api/v1/operations", "post"),
+    ("/api/v1/operations/validate", "post"),
     ("/api/v1/operations/{operation_id}", "get"),
     ("/api/v1/operations/{operation_id}", "delete"),
     ("/api/v1/operations/{operation_id}/cancel", "post"),
@@ -217,15 +218,35 @@ pub async fn openapi() -> HttpResult {
                         "connectionId": { "type": "integer", "format": "int64" },
                         "inputs": { "type": "object" },
                         "assets": {
-                            "type": "array",
-                            "items": {
-                                "type": "object",
-                                "required": ["assetId", "checksum"],
-                                "properties": {
-                                    "assetId": { "type": "integer", "format": "int64" },
-                                    "checksum": { "type": "string" }
+                            "description": "这个 run 的资产。推荐形状是对象：键 = 字段键（inputSchema 里 format 为 file 的键，如 \"475::image\"）。旧的数组形状只对仍使用 asset-N 映射的 revision 有效；新 revision 收到数组会报 POSITIONAL_ASSETS_UNSUPPORTED。",
+                            "oneOf": [
+                                {
+                                    "type": "object",
+                                    "additionalProperties": { "$ref": "#/components/schemas/AssetRef" }
+                                },
+                                {
+                                    "type": "array",
+                                    "items": { "$ref": "#/components/schemas/AssetRef" }
                                 }
-                            }
+                            ]
+                        }
+                    }
+                },
+                "AssetRef": {
+                    "type": "object",
+                    "required": ["assetId", "checksum"],
+                    "properties": {
+                        "assetId": { "type": "integer", "format": "int64" },
+                        "checksum": { "type": "string" }
+                    }
+                },
+                "ValidateOperation": {
+                    "type": "object",
+                    "required": ["runs"],
+                    "properties": {
+                        "runs": {
+                            "type": "array",
+                            "items": { "$ref": "#/components/schemas/RunRequest" }
                         }
                     }
                 }
@@ -929,21 +950,7 @@ pub async fn create_operation(
     Json(body): Json<CreateOperationRequestDto>,
 ) -> HttpResult {
     require_scope(&actor, Scope::OperationsExecute)?;
-    let runs: Vec<DomainRunRequest> = body
-        .runs
-        .into_iter()
-        .map(|run: RunRequestDto| DomainRunRequest {
-            client_run_id: run.client_run_id,
-            recipe_revision_id: RecipeRevisionId(run.recipe_revision_id),
-            connection_id: run.connection_id.map(ConnectionId),
-            inputs: run.inputs,
-            assets: run
-                .assets
-                .into_iter()
-                .map(|asset: AssetRefDto| AssetRef::new(AssetId(asset.asset_id), asset.checksum))
-                .collect(),
-        })
-        .collect();
+    let runs = runs_from_dto(body.runs)?;
     let request = DomainCreateOperationRequest {
         actor,
         // 调用方可以自报身份（如 MCP）。**白名单**：认不出来的一律按 `http`，
@@ -967,6 +974,59 @@ pub async fn create_operation(
         events_url: format!("/api/v1/operations/{}/events", persisted.operation.id.0),
     };
     Ok(Json(serde_json::to_value(Envelope::new(response)).unwrap()))
+}
+
+/// DTO 的 runs → 领域 `RunRequest`。**两种资产形状在这里分叉**，往下走就只有
+/// 带字段键的 keyed 资产了（旧数组是 `None` 的 field_key，由 `MediaMapping::bind`
+/// 一次性换算）。
+fn runs_from_dto(runs: Vec<RunRequestDto>) -> Result<Vec<DomainRunRequest>, axum::response::Response> {
+    let mut converted = Vec::with_capacity(runs.len());
+    for run in runs {
+        let assets = match run.assets {
+            None => Vec::new(),
+            Some(RunAssetsDto::Keyed(entries)) => entries
+                .into_iter()
+                .map(|(field_key, asset)| {
+                    AssetRef::new(AssetId(asset.asset_id), asset.checksum).with_field_key(field_key)
+                })
+                .collect(),
+            Some(RunAssetsDto::Positional(entries)) => entries
+                .into_iter()
+                .map(|asset| AssetRef::new(AssetId(asset.asset_id), asset.checksum))
+                .collect(),
+        };
+        converted.push(DomainRunRequest {
+            client_run_id: run.client_run_id,
+            recipe_revision_id: RecipeRevisionId(run.recipe_revision_id),
+            connection_id: run.connection_id.map(ConnectionId),
+            inputs: run.inputs,
+            assets,
+        });
+    }
+    Ok(converted)
+}
+
+/// `POST /api/v1/operations/validate` —— **只读预检**（dry-run）。
+///
+/// 与 `create_operation` 走**同一套解析**（同一个 `preflight`），但：
+/// * 不落 Operation / Run / event，不调度，不碰 provider；
+/// * 不收 `idempotencyKey`（它没有要幂等的东西）；
+/// * 成功时回 `{ dryRun: true, valid: true, runs: [...] }` 供调用方在花钱前对形状。
+pub async fn validate_operation(
+    State(state): State<Arc<V2HttpState>>,
+    Extension(actor): Extension<ActorRef>,
+    Json(body): Json<ValidateOperationRequestDto>,
+) -> HttpResult {
+    // 与 create 同一道闸：预检的真实用途是"提交前对形状"，能提交的人才能预检。
+    // （用例内部 `preflight` 还会再查一次策略——判据只有一份，这里只是传输层的早退。）
+    require_scope(&actor, Scope::OperationsExecute)?;
+    let runs = runs_from_dto(body.runs)?;
+    let resolved = state
+        .validate_operation
+        .execute(&actor, runs)
+        .await
+        .map_err(domain_error)?;
+    Ok(Json(serde_json::to_value(Envelope::new(resolved)).unwrap()))
 }
 
 pub async fn get_operation(

@@ -666,6 +666,7 @@ mod tests {
                 recipes: Box::new(repositories.clone()),
                 connections: Box::new(repositories.clone()),
                 operations: Box::new(repositories.clone()),
+                assets: Box::new(repositories.clone()),
             },
             Box::new(crate::v2::infrastructure::fakes::PermitAllAuthorizationPolicy),
             Box::new(BasicSchemaValidator),

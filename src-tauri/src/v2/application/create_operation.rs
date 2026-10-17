@@ -6,13 +6,13 @@ use crate::v2::domain::callback::CallbackSubscription;
 use crate::v2::domain::errors::{DomainResult, SafeError};
 use crate::v2::domain::hash::canonical_json;
 use crate::v2::domain::ids::{ConnectionId, IdempotencyKey, OperationId, RecipeRevisionId};
-use crate::v2::domain::media::AssetRef;
+use crate::v2::domain::media::{AssetRef, MediaMapping};
 use crate::v2::domain::model::Timestamp;
 use crate::v2::domain::operation::{Operation, OperationStatus};
 use crate::v2::ports::policy::AuthorizationPolicy;
 use crate::v2::ports::repositories::{
-    ConnectionRepository, NewOperation, NewRun, OperationRepository, PersistedOperation,
-    RecipeRepository,
+    AssetRepository, ConnectionRepository, NewOperation, NewRun, OperationRepository,
+    PersistedOperation, RecipeRepository,
 };
 use crate::v2::ports::schema::SchemaValidator;
 
@@ -71,6 +71,12 @@ pub struct Repositories {
     pub recipes: Box<dyn RecipeRepository>,
     pub connections: Box<dyn ConnectionRepository>,
     pub operations: Box<dyn OperationRepository>,
+    /// 资产仓库：**提交前**校验每个资产引用真实存在且 checksum 一致。
+    ///
+    /// ⚠️ 为什么在这一层做：scheduler 读到不存在的资产时 `read_bytes` 拿到的是空字节，
+    /// 于是**空文件被静默提交给上游**（花钱的那一步）。拼错的 assetId 是免费的（一轮），
+    /// 但它不该一路走到计费。
+    pub assets: Box<dyn AssetRepository>,
 }
 
 pub struct CreateOperation {
@@ -96,30 +102,7 @@ impl CreateOperation {
         &self,
         request: CreateOperationRequest,
     ) -> DomainResult<PersistedOperation> {
-        if !request.actor.has_scope(Scope::OperationsExecute) {
-            return Err(SafeError::validation(
-                "SCOPE_REQUIRED",
-                "缺少 operations:execute 权限",
-            ));
-        }
-        let decision = self
-            .authorization
-            .require_scope(&request.actor, Scope::OperationsExecute)
-            .await?;
-        if !decision.allowed {
-            return Err(SafeError::validation(
-                "SCOPE_REQUIRED",
-                decision
-                    .reason
-                    .unwrap_or_else(|| "缺少 operations:execute 权限".to_string()),
-            ));
-        }
-        if request.runs.is_empty() {
-            return Err(SafeError::validation(
-                "RUNS_REQUIRED",
-                "Operation 至少需要一个 Run",
-            ));
-        }
+        self.authorize(&request.actor).await?;
         // ⚠️ **花钱的闸门放在这里**——副作用真正发生的地方，而不是某个客户端的包装层。
         //
         // 为什么必须有：MCP 那条路是**自动批准**的——一个跑偏的模型能在一条对话里无限提交
@@ -129,6 +112,8 @@ impl CreateOperation {
         // * 人点的（`gui` / `http`）：人看得见自己在花什么，闸门只会碍事。
         //   界面的批量运行是**一个 Operation 带 N 个 Run**，所以按 Operation 计数不会误伤批量。
         // * `cli`：脚本自己决定要跑多少——批量脚本是文档化的正常用法。
+        //
+        // 注意：**预检（`preflight`）不走这道闸**——它是只读的，不花钱。
         if is_unguarded_autonomous(&request.origin) {
             let active = self
                 .repositories
@@ -145,35 +130,8 @@ impl CreateOperation {
                 ));
             }
         }
-        if request.runs.len() > MAX_RUNS_PER_OPERATION {
-            return Err(SafeError::validation(
-                "RUN_LIMIT_EXCEEDED",
-                format!("单个 Operation 最多 {MAX_RUNS_PER_OPERATION} 个 Run"),
-            ));
-        }
-        let mut seen_run_ids = std::collections::HashSet::new();
-        for run in &request.runs {
-            if run.client_run_id.trim().is_empty() {
-                return Err(SafeError::validation(
-                    "CLIENT_RUN_ID_REQUIRED",
-                    "每个 Run 必须包含 clientRunId",
-                ));
-            }
-            if !seen_run_ids.insert(run.client_run_id.clone()) {
-                return Err(SafeError::validation(
-                    "DUPLICATE_CLIENT_RUN_ID",
-                    format!("clientRunId 重复：{}", run.client_run_id),
-                ));
-            }
-        }
-
-        let mut resolved_runs = Vec::with_capacity(request.runs.len());
-        for (sequence, run_request) in request.runs.iter().enumerate() {
-            resolved_runs.push(
-                self.resolve_run(&request.actor, run_request, sequence as u32)
-                    .await?,
-            );
-        }
+        validate_run_shape(&request.runs)?;
+        let resolved_runs = self.resolve_runs(&request.actor, &request.runs).await?;
 
         let request_hash = Self::canonical_hash(&request, &resolved_runs);
         let existing = self
@@ -227,6 +185,60 @@ impl CreateOperation {
                 runs: new_runs,
             })
             .await
+    }
+
+    /// 顶点级授权（`operations:execute`）。`execute` 与 `preflight` 共用同一套判据：
+    /// 预检看到的形状与真实提交必须**完全一致**，否则"预检过了、提交被拒"就开始了。
+    async fn authorize(&self, actor: &ActorRef) -> DomainResult<()> {
+        if !actor.has_scope(Scope::OperationsExecute) {
+            return Err(SafeError::validation(
+                "SCOPE_REQUIRED",
+                "缺少 operations:execute 权限",
+            ));
+        }
+        let decision = self
+            .authorization
+            .require_scope(actor, Scope::OperationsExecute)
+            .await?;
+        if !decision.allowed {
+            return Err(SafeError::validation(
+                "SCOPE_REQUIRED",
+                decision
+                    .reason
+                    .unwrap_or_else(|| "缺少 operations:execute 权限".to_string()),
+            ));
+        }
+        Ok(())
+    }
+
+    /// **只读预检**（`POST /api/v1/operations/validate`、`operation run --dry-run`）：
+    /// 把每个 run 解析成"真实提交时会被持久化的形状"——revision / 连接 / inputs 过
+    /// schema / 资产按字段键落位且逐个校验存在与 checksum。
+    ///
+    /// 三条边界（承诺给调用方的东西）：
+    /// * **不落库**：不写 Operation / Run / event；
+    /// * **不调度**：一行都不碰 provider，不花任何额度；
+    /// * **不设花钱闸**：自主调用方超并发上限时预检照样能过——它本来就不用花钱。
+    pub async fn preflight(
+        &self,
+        actor: &ActorRef,
+        runs: &[RunRequest],
+    ) -> DomainResult<Vec<ResolvedRun>> {
+        self.authorize(actor).await?;
+        validate_run_shape(runs)?;
+        self.resolve_runs(actor, runs).await
+    }
+
+    async fn resolve_runs(
+        &self,
+        actor: &ActorRef,
+        runs: &[RunRequest],
+    ) -> DomainResult<Vec<ResolvedRun>> {
+        let mut resolved = Vec::with_capacity(runs.len());
+        for (sequence, run_request) in runs.iter().enumerate() {
+            resolved.push(self.resolve_run(actor, run_request, sequence as u32).await?);
+        }
+        Ok(resolved)
     }
 
     async fn resolve_run(
@@ -304,12 +316,55 @@ impl CreateOperation {
             ));
         }
 
+        // ---- 资产：两种形状统一成 keyed，并逐个校验存在与 checksum ----
+        //
+        // ⚠️ 这是"资产的真实身份是字段键"落地的一步：写库/哈希之前，每个资产都带上
+        // `field_key`。位置数组（旧形状）只在这一刻按下标解释一次，之后全链路只认字段键。
+        let mapping = MediaMapping::from_provider_config(&revision.binding.provider_config)?;
+        let bindings = mapping.bind(&request.assets)?;
+        let mut assets = Vec::with_capacity(bindings.len());
+        for binding in &bindings {
+            let asset_id = binding.asset.asset_id;
+            let stored = self
+                .repositories
+                .assets
+                .find_asset(asset_id)
+                .await?
+                .ok_or_else(|| {
+                    SafeError::not_found(
+                        "ASSET_NOT_FOUND",
+                        format!(
+                            "资产 #{} 不存在（字段键 `{}`）。先用 asset.upload / `--asset` 上传，\
+                             再把返回的 assetId 放进 assets。",
+                            asset_id.0, binding.field_key
+                        ),
+                    )
+                })?;
+            if stored.checksum != binding.asset.checksum {
+                return Err(SafeError::validation(
+                    "ASSET_CHECKSUM_MISMATCH",
+                    format!(
+                        "资产 #{} 的 checksum 与请求里的不一致（请求 {} / 库里 {}，字段键 `{}`）。\
+                         别手抄 checksum：用 asset.upload / 资产列表返回的那个值。",
+                        asset_id.0, binding.asset.checksum, stored.checksum, binding.field_key
+                    ),
+                ));
+            }
+            assets.push(
+                AssetRef::new(asset_id, binding.asset.checksum.clone())
+                    .with_field_key(binding.field_key.clone()),
+            );
+        }
+        // 排序：字段键是身份，顺序不是。固定顺序让幂等哈希对"同样一组资产、不同书写顺序"
+        // 稳定（否则同一次提交会因键序不同被判成 IDEMPOTENCY_CONFLICT）。
+        assets.sort_by(|a, b| a.field_key.cmp(&b.field_key));
+
         Ok(ResolvedRun {
             recipe_revision_id: revision.id,
             connection_revision_id: connection_revision.id,
             client_run_id: request.client_run_id.clone(),
             inputs: request.inputs.clone(),
-            assets: request.assets.clone(),
+            assets,
             sequence,
         })
     }
@@ -327,6 +382,8 @@ impl CreateOperation {
                     "assets": run.assets.iter().map(|asset| json!({
                         "assetId": asset.asset_id.0,
                         "checksum": asset.checksum,
+                        // 字段键进哈希：同一组资产绑到不同字段是**两个不同的请求**。
+                        "fieldKey": asset.field_key,
                     })).collect::<Vec<_>>(),
                 })
             })
@@ -345,14 +402,47 @@ impl CreateOperation {
     }
 }
 
+/// run 形状的共享校验（`execute` 与 `preflight` 各走一次，判据只写在这里）。
+fn validate_run_shape(runs: &[RunRequest]) -> DomainResult<()> {
+    if runs.is_empty() {
+        return Err(SafeError::validation(
+            "RUNS_REQUIRED",
+            "Operation 至少需要一个 Run",
+        ));
+    }
+    if runs.len() > MAX_RUNS_PER_OPERATION {
+        return Err(SafeError::validation(
+            "RUN_LIMIT_EXCEEDED",
+            format!("单个 Operation 最多 {MAX_RUNS_PER_OPERATION} 个 Run"),
+        ));
+    }
+    let mut seen_run_ids = std::collections::HashSet::new();
+    for run in runs {
+        if run.client_run_id.trim().is_empty() {
+            return Err(SafeError::validation(
+                "CLIENT_RUN_ID_REQUIRED",
+                "每个 Run 必须包含 clientRunId",
+            ));
+        }
+        if !seen_run_ids.insert(run.client_run_id.clone()) {
+            return Err(SafeError::validation(
+                "DUPLICATE_CLIENT_RUN_ID",
+                format!("clientRunId 重复：{}", run.client_run_id),
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// 解析后的一个 run：写库/哈希/预检报告都用这一份形状（资产已统一为 keyed）。
 #[derive(Debug, Clone)]
-struct ResolvedRun {
-    recipe_revision_id: RecipeRevisionId,
-    connection_revision_id: crate::v2::domain::ids::ConnectionRevisionId,
-    client_run_id: String,
-    inputs: BTreeMap<String, Value>,
-    assets: Vec<AssetRef>,
-    sequence: u32,
+pub struct ResolvedRun {
+    pub recipe_revision_id: RecipeRevisionId,
+    pub connection_revision_id: crate::v2::domain::ids::ConnectionRevisionId,
+    pub client_run_id: String,
+    pub inputs: BTreeMap<String, Value>,
+    pub assets: Vec<AssetRef>,
+    pub sequence: u32,
 }
 
 #[cfg(test)]
@@ -360,7 +450,7 @@ mod tests {
     use super::*;
     use crate::v2::domain::actor::{ActorKind, Scope};
     use crate::v2::domain::ids::{
-        ClientId, ConnectionId, ConnectionRevisionId, RecipeId, RecipeRevisionId,
+        AssetId, ClientId, ConnectionId, ConnectionRevisionId, RecipeId, RecipeRevisionId,
     };
     use crate::v2::domain::model::{
         Connection, ConnectionOverride, ConnectionRevision, LifecycleFeatures, Recipe,
@@ -450,7 +540,8 @@ mod tests {
             Repositories {
                 recipes: Box::new(repositories.clone()),
                 connections: Box::new(repositories.clone()),
-                operations: Box::new(repositories),
+                operations: Box::new(repositories.clone()),
+                assets: Box::new(repositories),
             },
             Box::new(PermitAllAuthorizationPolicy),
             Box::new(BasicSchemaValidator),
@@ -669,5 +760,342 @@ mod tests {
             .await
             .expect_err("重复 clientRunId 应报错");
         assert_eq!(error.code, "DUPLICATE_CLIENT_RUN_ID");
+    }
+
+    // ---------- 媒体资产：字段键是身份，位置只是旧编码 ----------
+
+    /// 用户场景的 4 槽换装配方：上游节点顺序 475(图1)、519(图4)、520(图2)、521(图3)。
+    /// `keyed_shape` 选 revision 的映射形状：false = 旧 asset-N（历史 revision），
+    /// true = 新字段键（新导入/新追加的 revision）。
+    fn seed_media_environment(
+        repositories: &InMemoryRepositories,
+        keyed_shape: bool,
+    ) -> RecipeRevisionId {
+        seed_environment(repositories);
+        let mapping = if keyed_shape {
+            json!({
+                "475::image": { "node": "475", "field": "image" },
+                "519::image": { "node": "519", "field": "image" },
+                "520::image": { "node": "520", "field": "image" },
+                "521::image": { "node": "521", "field": "image" }
+            })
+        } else {
+            json!({
+                "asset-0": { "node": "475", "field": "image" },
+                "asset-1": { "node": "519", "field": "image" },
+                "asset-2": { "node": "520", "field": "image" },
+                "asset-3": { "node": "521", "field": "image" }
+            })
+        };
+        let revision = RecipeRevision {
+            id: RecipeRevisionId(2),
+            recipe_id: RecipeId(1),
+            revision: 2,
+            input_schema: json!({
+                "type": "object",
+                "required": [],
+                "properties": {
+                    "475::image": { "type": "string", "format": "file" },
+                    "519::image": { "type": "string", "format": "file" },
+                    "520::image": { "type": "string", "format": "file" },
+                    "521::image": { "type": "string", "format": "file" },
+                    "prompt": { "type": "string" }
+                }
+            }),
+            output_schema: json!({ "type": "object" }),
+            binding: RecipeBinding {
+                driver_key: "openai-images".to_string(),
+                provider_config: BTreeMap::from([("mediaMapping".to_string(), mapping)]),
+                default_connection_id: ConnectionId(1),
+                allowed_connection_ids: vec![ConnectionId(1)],
+                connection_override: ConnectionOverride::Denied,
+            },
+            defaults: BTreeMap::new(),
+            source: RecipeSource::Embedded,
+            created_at: Timestamp::now(),
+        };
+        let recipe = Recipe {
+            id: RecipeId(1),
+            name: "Image Recipe".to_string(),
+            description: "media recipe".to_string(),
+            labels: vec![],
+            capability: "text-to-image".to_string(),
+            current_revision_id: RecipeRevisionId(2),
+            visibility: RecipeVisibility::Private,
+            created_at: Timestamp::now(),
+            updated_at: Timestamp::now(),
+            favorite: false,
+            group: None,
+            note: None,
+            last_opened_at: None,
+            field_labels: Default::default(),
+            removed_at: None,
+        };
+        repositories.seed_recipe(recipe, vec![revision]);
+        RecipeRevisionId(2)
+    }
+
+    fn seed_asset(repositories: &InMemoryRepositories, id: u64, checksum: &str) {
+        use crate::v2::domain::media::{MediaKind, MediaObject, MediaObjectId};
+        repositories.seed_asset(
+            AssetId(id),
+            MediaObject {
+                id: MediaObjectId::Asset(AssetId(id)),
+                kind: MediaKind::Asset,
+                filename: format!("asset-{id}.png"),
+                mime_type: "image/png".to_string(),
+                byte_size: 3,
+                checksum: checksum.to_string(),
+                storage_key: None,
+                provider_refs: vec![],
+            },
+            vec![1, 2, 3],
+        );
+    }
+
+    fn media_request(
+        revision: RecipeRevisionId,
+        client_run_id: &str,
+        assets: Vec<AssetRef>,
+    ) -> CreateOperationRequest {
+        let mut request = request(actor(vec![Scope::OperationsExecute]));
+        request.idempotency_key = IdempotencyKey(format!("key-{client_run_id}"));
+        request.runs[0].client_run_id = client_run_id.to_string();
+        request.runs[0].recipe_revision_id = revision;
+        request.runs[0].inputs = BTreeMap::new();
+        request.runs[0].assets = assets;
+        request
+    }
+
+    /// 回归（用户场景）：keyed 提交 {475::image, 520::image} 只落这两个槽位，
+    /// 519 与 521 一个都不碰——位置不再是语义。
+    #[tokio::test]
+    async fn keyed_assets_resolve_to_exactly_those_slots() {
+        let repositories = InMemoryRepositories::new();
+        let revision = seed_media_environment(&repositories, true);
+        seed_asset(&repositories, 7, "sum-person");
+        seed_asset(&repositories, 8, "sum-cloth");
+        let use_case = use_case(repositories.clone());
+        let persisted = use_case
+            .execute(media_request(
+                revision,
+                "look-1",
+                vec![
+                    AssetRef::new(AssetId(7), "sum-person").with_field_key("475::image"),
+                    AssetRef::new(AssetId(8), "sum-cloth").with_field_key("520::image"),
+                ],
+            ))
+            .await
+            .expect("keyed 资产应被接受");
+        let stored = &persisted.runs[0].assets;
+        assert_eq!(stored.len(), 2, "只落两个槽位：{stored:?}");
+        let keys: Vec<&str> = stored
+            .iter()
+            .map(|asset| asset.field_key.as_deref().unwrap_or_default())
+            .collect();
+        assert_eq!(keys, vec!["475::image", "520::image"]);
+        assert_eq!(stored[0].asset_id, AssetId(7));
+        assert_eq!(stored[1].asset_id, AssetId(8));
+    }
+
+    /// 旧 revision（asset-N 映射）+ 旧位置数组：第一个元素落**上游声明的第一个槽位**（475）。
+    #[tokio::test]
+    async fn legacy_positional_array_still_lands_on_the_first_slot() {
+        let repositories = InMemoryRepositories::new();
+        let revision = seed_media_environment(&repositories, false);
+        seed_asset(&repositories, 7, "sum-person");
+        let use_case = use_case(repositories.clone());
+        let persisted = use_case
+            .execute(media_request(
+                revision,
+                "look-1",
+                vec![AssetRef::new(AssetId(7), "sum-person")],
+            ))
+            .await
+            .expect("旧位置数组应被解释");
+        let stored = &persisted.runs[0].assets;
+        assert_eq!(stored.len(), 1);
+        assert_eq!(stored[0].field_key.as_deref(), Some("475::image"));
+        assert_eq!(stored[0].asset_id, AssetId(7));
+    }
+
+    /// 新 revision（keyed 映射）收到位置数组 ⇒ POSITIONAL_ASSETS_UNSUPPORTED（不许猜）。
+    #[tokio::test]
+    async fn keyed_revision_rejects_positional_array() {
+        let repositories = InMemoryRepositories::new();
+        let revision = seed_media_environment(&repositories, true);
+        seed_asset(&repositories, 7, "sum-person");
+        let use_case = use_case(repositories.clone());
+        let error = use_case
+            .execute(media_request(
+                revision,
+                "look-1",
+                vec![AssetRef::new(AssetId(7), "sum-person")],
+            ))
+            .await
+            .expect_err("keyed revision 必须拒绝位置数组");
+        assert_eq!(error.code, "POSITIONAL_ASSETS_UNSUPPORTED");
+    }
+
+    #[tokio::test]
+    async fn unknown_field_key_is_rejected_at_create() {
+        let repositories = InMemoryRepositories::new();
+        let revision = seed_media_environment(&repositories, true);
+        seed_asset(&repositories, 7, "sum-person");
+        let use_case = use_case(repositories.clone());
+        let error = use_case
+            .execute(media_request(
+                revision,
+                "look-1",
+                vec![AssetRef::new(AssetId(7), "sum-person").with_field_key("999::image")],
+            ))
+            .await
+            .expect_err("未知字段键必须报错");
+        assert_eq!(error.code, "ASSET_FIELD_UNKNOWN");
+    }
+
+    /// 资产不存在：**提交前**就被拒（否则 scheduler 会读到空字节，把空文件静默发上去）。
+    #[tokio::test]
+    async fn missing_asset_is_rejected_before_anything_is_stored() {
+        let repositories = InMemoryRepositories::new();
+        let revision = seed_media_environment(&repositories, true);
+        let use_case = use_case(repositories.clone());
+        let error = use_case
+            .execute(media_request(
+                revision,
+                "look-1",
+                vec![AssetRef::new(AssetId(4242), "sum").with_field_key("475::image")],
+            ))
+            .await
+            .expect_err("不存在的资产必须报错");
+        assert_eq!(error.code, "ASSET_NOT_FOUND");
+        assert!(
+            repositories
+                .find_operation(crate::v2::domain::ids::OperationId(1))
+                .await
+                .expect("查询应成功")
+                .is_none(),
+            "被拒的提交不许留下任何 Operation"
+        );
+    }
+
+    #[tokio::test]
+    async fn checksum_mismatch_is_rejected() {
+        let repositories = InMemoryRepositories::new();
+        let revision = seed_media_environment(&repositories, true);
+        seed_asset(&repositories, 7, "sum-person");
+        let use_case = use_case(repositories.clone());
+        let error = use_case
+            .execute(media_request(
+                revision,
+                "look-1",
+                vec![AssetRef::new(AssetId(7), "wrong-checksum").with_field_key("475::image")],
+            ))
+            .await
+            .expect_err("checksum 不一致必须报错");
+        assert_eq!(error.code, "ASSET_CHECKSUM_MISMATCH");
+    }
+
+    /// 幂等哈希对"同样一组 keyed 资产、不同书写顺序"稳定：排序发生在哈希之前。
+    #[tokio::test]
+    async fn keyed_asset_order_does_not_change_the_idempotency_hash() {
+        let run = |repositories: &InMemoryRepositories| {
+            let revision = seed_media_environment(repositories, true);
+            seed_asset(repositories, 7, "sum-person");
+            seed_asset(repositories, 8, "sum-cloth");
+            let use_case = use_case(repositories.clone());
+            let revision_copy = revision;
+            async move {
+                let mut request_a = media_request(
+                    revision_copy,
+                    "look-1",
+                    vec![
+                        AssetRef::new(AssetId(7), "sum-person").with_field_key("475::image"),
+                        AssetRef::new(AssetId(8), "sum-cloth").with_field_key("520::image"),
+                    ],
+                );
+                request_a.idempotency_key = IdempotencyKey("same-key".to_string());
+                let first = use_case.execute(request_a).await.expect("第一次应成功");
+                let mut request_b = media_request(
+                    revision_copy,
+                    "look-1",
+                    vec![
+                        AssetRef::new(AssetId(8), "sum-cloth").with_field_key("520::image"),
+                        AssetRef::new(AssetId(7), "sum-person").with_field_key("475::image"),
+                    ],
+                );
+                request_b.idempotency_key = IdempotencyKey("same-key".to_string());
+                let second = use_case.execute(request_b).await.expect("同键同请求应重放");
+                (first.operation.id, second.operation.id)
+            }
+        };
+        let repositories_a = InMemoryRepositories::new();
+        let (first_id, second_id) = run(&repositories_a).await;
+        assert_eq!(first_id, second_id, "资产书写顺序不该制造 IDEMPOTENCY_CONFLICT");
+    }
+
+    /// `preflight` 是只读的：过、但没有 Operation / Run 被创建。
+    #[tokio::test]
+    async fn preflight_validates_without_persisting_anything() {
+        let repositories = InMemoryRepositories::new();
+        let revision = seed_media_environment(&repositories, true);
+        seed_asset(&repositories, 7, "sum-person");
+        let use_case = use_case(repositories.clone());
+        let request = media_request(
+            revision,
+            "look-1",
+            vec![AssetRef::new(AssetId(7), "sum-person").with_field_key("475::image")],
+        );
+        let resolved = use_case
+            .preflight(&request.actor, &request.runs)
+            .await
+            .expect("预检应通过");
+        assert_eq!(resolved.len(), 1);
+        assert_eq!(
+            resolved[0].assets[0].field_key.as_deref(),
+            Some("475::image")
+        );
+        assert!(
+            repositories
+                .find_operation(crate::v2::domain::ids::OperationId(1))
+                .await
+                .expect("查询应成功")
+                .is_none(),
+            "预检不许落库"
+        );
+        assert!(
+            crate::v2::ports::repositories::OperationRepository::list_operations(
+                &repositories,
+                10,
+                None
+            )
+            .await
+            .expect("列举应成功")
+            .is_empty(),
+            "预检不许落库"
+        );
+    }
+
+    /// 预检与提交对同一形状给出**同样的判据**（错误码一致）。
+    #[tokio::test]
+    async fn preflight_reports_the_same_codes_as_create() {
+        let repositories = InMemoryRepositories::new();
+        let revision = seed_media_environment(&repositories, true);
+        let use_case = use_case(repositories.clone());
+        let request = media_request(
+            revision,
+            "look-1",
+            vec![AssetRef::new(AssetId(4242), "sum").with_field_key("475::image")],
+        );
+        let preflight_error = use_case
+            .preflight(&request.actor, &request.runs)
+            .await
+            .expect_err("预检必须报资产不存在");
+        assert_eq!(preflight_error.code, "ASSET_NOT_FOUND");
+        let create_error = use_case
+            .execute(request)
+            .await
+            .expect_err("提交也必须报同一个错");
+        assert_eq!(create_error.code, "ASSET_NOT_FOUND");
     }
 }

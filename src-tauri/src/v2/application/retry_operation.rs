@@ -230,6 +230,7 @@ mod tests {
                 recipes: Box::new(repos.clone()),
                 connections: Box::new(repos.clone()),
                 operations: Box::new(operations.clone()),
+                assets: Box::new(repos.clone()),
             },
             Box::new(PermitAllAuthorizationPolicy),
             Box::new(BasicSchemaValidator),

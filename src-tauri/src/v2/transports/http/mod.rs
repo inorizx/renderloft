@@ -18,6 +18,7 @@ use crate::v2::application::cancel_operation::CancelOperation;
 use crate::v2::application::create_operation::CreateOperation;
 use crate::v2::application::recipe_import::RecipeImportService;
 use crate::v2::application::settings::{RunningHubStatusService, SettingsService};
+use crate::v2::application::validate_operation::ValidateOperation;
 use crate::v2::domain::actor::ActorRef;
 use crate::v2::ports::provider::DriverRegistry;
 use crate::v2::ports::repositories::{
@@ -39,6 +40,8 @@ pub struct V2HttpState {
     pub artifacts: Arc<dyn ArtifactStore>,
     pub artifacts_repo: Arc<dyn ArtifactRepository>,
     pub create_operation: Arc<CreateOperation>,
+    /// 只读预检（dry-run）：与 create 共用解析，不落库、不调度、不花钱。
+    pub validate_operation: Arc<ValidateOperation>,
     pub cancel_operation: Arc<CancelOperation>,
     pub drivers: Arc<DriverRegistry>,
     pub settings: Arc<SettingsService>,
@@ -61,6 +64,7 @@ impl V2HttpState {
         artifacts: Arc<dyn ArtifactStore>,
         artifacts_repo: Arc<dyn ArtifactRepository>,
         create_operation: Arc<CreateOperation>,
+        validate_operation: Arc<ValidateOperation>,
         cancel_operation: Arc<CancelOperation>,
         drivers: Arc<DriverRegistry>,
         settings: Arc<SettingsService>,
@@ -79,6 +83,7 @@ impl V2HttpState {
             artifacts,
             artifacts_repo,
             create_operation,
+            validate_operation,
             cancel_operation,
             drivers,
             settings,
@@ -140,6 +145,13 @@ pub fn build_router(state: Arc<V2HttpState>) -> Router {
         .route(
             "/api/v1/operations",
             get(handlers::list_operations).post(handlers::create_operation),
+        )
+        .route(
+            // 静态段 `validate` 与动态段 `/operations/{operation_id}` 同层：axum（matchit）
+            // 保证静态路径优先，`validate` 不会被当成一个 operation_id。
+            // 这条路由是**只读预检**：不落库、不调度、不花额度。
+            "/api/v1/operations/validate",
+            post(handlers::validate_operation),
         )
         .route(
             "/api/v1/operations/{operation_id}",
@@ -491,10 +503,12 @@ mod tests {
                 recipes: Box::new(repositories.clone()),
                 connections: Box::new(repositories.clone()),
                 operations: Box::new(repositories.clone()),
+                assets: Box::new(repositories.clone()),
             },
             Box::new(PermitAllAuthorizationPolicy),
             Box::new(BasicSchemaValidator),
         ));
+        let validate = std::sync::Arc::new(ValidateOperation::new(create.clone()));
         let cancel = std::sync::Arc::new(CancelOperation {
             repositories: std::sync::Arc::new(repositories.clone()),
             connections: std::sync::Arc::new(repositories.clone()),
@@ -530,6 +544,7 @@ mod tests {
             std::sync::Arc::new(repositories.clone()),
             std::sync::Arc::new(repositories.clone()),
             create,
+            validate,
             cancel,
             std::sync::Arc::new(drivers),
             settings,
@@ -768,6 +783,261 @@ mod tests {
         let (status, body) = post_json(&app, "/api/v1/operations", &token, changed).await;
         assert_eq!(status, StatusCode::CONFLICT);
         assert_eq!(body["error"]["code"], "IDEMPOTENCY_CONFLICT");
+    }
+
+    /// 媒体配方（用户场景的 4 槽换装）：把 recipe 1 换成带媒体槽位的 revision 2。
+    /// `keyed` 选映射形状：true = 新字段键，false = 旧 asset-N（历史 revision）。
+    fn seed_media_recipe(repositories: &InMemoryRepositories, keyed: bool) {
+        let mapping = if keyed {
+            json!({
+                "475::image": { "node": "475", "field": "image" },
+                "519::image": { "node": "519", "field": "image" },
+                "520::image": { "node": "520", "field": "image" },
+                "521::image": { "node": "521", "field": "image" }
+            })
+        } else {
+            json!({
+                "asset-0": { "node": "475", "field": "image" },
+                "asset-1": { "node": "519", "field": "image" },
+                "asset-2": { "node": "520", "field": "image" },
+                "asset-3": { "node": "521", "field": "image" }
+            })
+        };
+        let recipe = Recipe {
+            id: RecipeId(1),
+            name: "Image Recipe".to_string(),
+            description: "media recipe".to_string(),
+            labels: vec![],
+            capability: "text-to-image".to_string(),
+            current_revision_id: RecipeRevisionId(2),
+            visibility: RecipeVisibility::Private,
+            created_at: crate::v2::domain::model::Timestamp::now(),
+            updated_at: crate::v2::domain::model::Timestamp::now(),
+            favorite: false,
+            group: None,
+            note: None,
+            last_opened_at: None,
+            field_labels: Default::default(),
+            removed_at: None,
+        };
+        let revision = RecipeRevision {
+            id: RecipeRevisionId(2),
+            recipe_id: RecipeId(1),
+            revision: 2,
+            input_schema: json!({
+                "type": "object",
+                "required": [],
+                "properties": {
+                    "475::image": { "type": "string", "format": "file" },
+                    "519::image": { "type": "string", "format": "file" },
+                    "520::image": { "type": "string", "format": "file" },
+                    "521::image": { "type": "string", "format": "file" },
+                    "prompt": { "type": "string" }
+                }
+            }),
+            output_schema: json!({ "type": "object" }),
+            binding: RecipeBinding {
+                driver_key: driver_key("openai", "openai-images"),
+                provider_config: BTreeMap::from([("mediaMapping".to_string(), mapping)]),
+                default_connection_id: ConnectionId(1),
+                allowed_connection_ids: vec![ConnectionId(1)],
+                connection_override: ConnectionOverride::Denied,
+            },
+            defaults: Default::default(),
+            source: RecipeSource::Embedded,
+            created_at: crate::v2::domain::model::Timestamp::now(),
+        };
+        repositories.seed_recipe(recipe, vec![revision]);
+    }
+
+    fn seed_media_asset(repositories: &InMemoryRepositories, id: u64, checksum: &str) {
+        use crate::v2::domain::ids::AssetId;
+        repositories.seed_asset(
+            AssetId(id),
+            MediaObject {
+                id: MediaObjectId::Asset(AssetId(id)),
+                kind: MediaKind::Asset,
+                filename: format!("asset-{id}.png"),
+                mime_type: "image/png".to_string(),
+                byte_size: 3,
+                checksum: checksum.to_string(),
+                storage_key: None,
+                provider_refs: vec![],
+            },
+            vec![1, 2, 3],
+        );
+    }
+
+    /// 回归（用户场景）：HTTP keyed 形状只落这两个槽位；旧数组在 keyed revision 上被明确拒绝。
+    #[tokio::test]
+    async fn keyed_assets_over_http_land_on_exactly_those_slots() {
+        let (app, repositories) = test_app();
+        seed_media_recipe(&repositories, true);
+        seed_media_asset(&repositories, 7, "sum-person");
+        seed_media_asset(&repositories, 8, "sum-cloth");
+        let token = issue_token(&repositories, &["operations:execute", "operations:read"]).await;
+        let (status, body) = post_json(
+            &app,
+            "/api/v1/operations",
+            &token,
+            json!({
+                "idempotencyKey": "media-key-1",
+                "runs": [{
+                    "clientRunId": "look-1",
+                    "recipeRevisionId": 2,
+                    "inputs": {},
+                    "assets": {
+                        "475::image": { "assetId": 7, "checksum": "sum-person" },
+                        "520::image": { "assetId": 8, "checksum": "sum-cloth" }
+                    }
+                }]
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let stored = repositories
+            .find_operation(crate::v2::domain::ids::OperationId(1))
+            .await
+            .expect("查询应成功")
+            .expect("应已落库");
+        assert_eq!(stored.runs[0].assets.len(), 2);
+        let keys: Vec<&str> = stored.runs[0]
+            .assets
+            .iter()
+            .map(|asset| asset.field_key.as_deref().unwrap_or_default())
+            .collect();
+        assert_eq!(keys, vec!["475::image", "520::image"]);
+
+        // keyed revision 收到位置数组 ⇒ 400 POSITIONAL_ASSETS_UNSUPPORTED。
+        let (status, body) = post_json(
+            &app,
+            "/api/v1/operations",
+            &token,
+            json!({
+                "idempotencyKey": "media-key-2",
+                "runs": [{
+                    "clientRunId": "look-2",
+                    "recipeRevisionId": 2,
+                    "inputs": {},
+                    "assets": [{ "assetId": 7, "checksum": "sum-person" }]
+                }]
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert_eq!(body["error"]["code"], "POSITIONAL_ASSETS_UNSUPPORTED");
+    }
+
+    /// 旧 revision + 旧位置数组仍然可用（兼容），且第一个元素落第一个槽位（475）。
+    #[tokio::test]
+    async fn legacy_positional_array_over_http_still_works() {
+        let (app, repositories) = test_app();
+        seed_media_recipe(&repositories, false);
+        seed_media_asset(&repositories, 7, "sum-person");
+        let token = issue_token(&repositories, &["operations:execute"]).await;
+        let (status, body) = post_json(
+            &app,
+            "/api/v1/operations",
+            &token,
+            json!({
+                "idempotencyKey": "legacy-key-1",
+                "runs": [{
+                    "clientRunId": "look-1",
+                    "recipeRevisionId": 2,
+                    "inputs": {},
+                    "assets": [{ "assetId": 7, "checksum": "sum-person" }]
+                }]
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let stored = repositories
+            .find_operation(crate::v2::domain::ids::OperationId(1))
+            .await
+            .expect("查询应成功")
+            .expect("应已落库");
+        assert_eq!(
+            stored.runs[0].assets[0].field_key.as_deref(),
+            Some("475::image")
+        );
+    }
+
+    /// `POST /operations/validate`：报出解析结果（字段键→assetId），**不落库**。
+    #[tokio::test]
+    async fn validate_endpoint_is_read_only_and_reports_resolved_assets() {
+        let (app, repositories) = test_app();
+        seed_media_recipe(&repositories, true);
+        seed_media_asset(&repositories, 7, "sum-person");
+        let token = issue_token(&repositories, &["operations:execute", "operations:read"]).await;
+        let (status, body) = post_json(
+            &app,
+            "/api/v1/operations/validate",
+            &token,
+            json!({
+                "runs": [{
+                    "clientRunId": "look-1",
+                    "recipeRevisionId": 2,
+                    "inputs": {},
+                    "assets": { "475::image": { "assetId": 7, "checksum": "sum-person" } }
+                }]
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["data"]["dryRun"], true);
+        assert_eq!(body["data"]["valid"], true);
+        assert_eq!(body["data"]["runs"][0]["clientRunId"], "look-1");
+        assert_eq!(body["data"]["runs"][0]["recipeRevisionId"], 2);
+        assert_eq!(
+            body["data"]["runs"][0]["assets"][0]["fieldKey"],
+            "475::image"
+        );
+        assert_eq!(body["data"]["runs"][0]["assets"][0]["assetId"], 7);
+        // 不落库：列表为空。
+        let (status, listed) = get_json(&app, "/api/v1/operations", &token).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(listed["data"]["items"].as_array().unwrap().len(), 0, "{listed}");
+    }
+
+    /// 预检失败时给与提交**同码**的错误（这里：未知字段键）。
+    #[tokio::test]
+    async fn validate_endpoint_reports_stable_codes() {
+        let (app, repositories) = test_app();
+        seed_media_recipe(&repositories, true);
+        seed_media_asset(&repositories, 7, "sum-person");
+        let token = issue_token(&repositories, &["operations:execute"]).await;
+        let (status, body) = post_json(
+            &app,
+            "/api/v1/operations/validate",
+            &token,
+            json!({
+                "runs": [{
+                    "clientRunId": "look-1",
+                    "recipeRevisionId": 2,
+                    "inputs": {},
+                    "assets": { "999::image": { "assetId": 7, "checksum": "sum-person" } }
+                }]
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert_eq!(body["error"]["code"], "ASSET_FIELD_UNKNOWN");
+    }
+
+    /// 预检与提交同一道闸：只有读权限的 token 不能预检。
+    #[tokio::test]
+    async fn validate_endpoint_requires_execute_scope() {
+        let (app, repositories) = test_app();
+        seed_media_recipe(&repositories, true);
+        let token = issue_token(&repositories, &["operations:read"]).await;
+        let (status, body) = post_json(
+            &app,
+            "/api/v1/operations/validate",
+            &token,
+            json!({ "runs": [{ "clientRunId": "x", "recipeRevisionId": 2, "inputs": {} }] }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
     }
 
     #[tokio::test]
@@ -1239,10 +1509,12 @@ mod tests {
                 recipes: Box::new(repositories.clone()),
                 connections: Box::new(repositories.clone()),
                 operations: Box::new(repositories.clone()),
+                assets: Box::new(repositories.clone()),
             },
             Box::new(PermitAllAuthorizationPolicy),
             Box::new(BasicSchemaValidator),
         ));
+        let validate = std::sync::Arc::new(ValidateOperation::new(create.clone()));
         let cancel = std::sync::Arc::new(CancelOperation {
             repositories: std::sync::Arc::new(repositories.clone()),
             connections: std::sync::Arc::new(repositories.clone()),
@@ -1278,6 +1550,7 @@ mod tests {
             std::sync::Arc::new(repositories.clone()),
             std::sync::Arc::new(repositories.clone()),
             create,
+            validate,
             cancel,
             std::sync::Arc::new(drivers),
             settings,
