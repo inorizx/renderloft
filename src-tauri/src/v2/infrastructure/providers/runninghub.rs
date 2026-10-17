@@ -8,6 +8,7 @@ use crate::v2::domain::errors::{DomainResult, SafeError};
 use crate::v2::domain::execution::{
     CancelOutcome, ConnectionCheck, ProviderDescriptor, SubmitOutcome, TaskSnapshot,
 };
+use crate::v2::domain::media::MediaMapping;
 use crate::v2::domain::model::{is_api_key_slot, ConnectionRevision, LifecycleFeatures};
 use crate::v2::ports::provider::{
     CancelRequest, PrepareRequest, PreparedExecution, ProviderDriver, ReconcileRequest,
@@ -56,7 +57,7 @@ pub fn descriptor() -> &'static ProviderDescriptor {
                 },
                 "mediaMapping": {
                     "type": "object",
-                    "description": "Asset to workflow node field mapping: { asset-N: { node, field } }"
+                    "description": "Media field to workflow node field mapping, keyed by field key: { \"<nodeId>::<fieldName>\": { node, field } }. Legacy revisions may still carry positional slot names (asset-N -> {node, field}); those are read as a compatibility encoding and converted to field keys."
                 },
                 "instanceType": { "type": "string" }
             }
@@ -514,32 +515,32 @@ impl ProviderDriver for RunningHubDriver {
             payload.insert("instanceType".to_string(), json!(instance_type));
         }
         let mut node_info_list = Vec::new();
-        // media 资产：先上传，再把 fileName 填入 mediaMapping 对应的节点字段
+        // media 资产：先上传，再把 fileName 填进映射指向的节点字段。
+        //
+        // ⚠️ 这里**只认字段键**（`MediaMapping::bind`）：旧位置数组也在这一个入口被换算成
+        // 字段键，别处不许再出现 `asset-{index}` 这种"位置即语义"的写法——实测的错位事故
+        // 就是它：上游节点顺序、schema 键序、调用方顺序三者谁都不是资产的身份。
         if !request.assets.is_empty() {
-            if let Some(media_mapping) = config.get("mediaMapping").and_then(Value::as_object) {
-                for (index, asset) in request.assets.iter().enumerate() {
-                    let Some(entry) = media_mapping.get(&format!("asset-{index}")) else {
-                        break;
-                    };
-                    let Some(node_id) = entry.get("node").and_then(Value::as_str) else {
-                        continue;
-                    };
-                    let Some(field) = entry.get("field").and_then(Value::as_str) else {
-                        continue;
-                    };
-                    let file_name = self
-                        .upload_asset(
-                            &request.connection_revision,
-                            asset.bytes.clone(),
-                            "input.png",
-                        )
-                        .await?;
-                    node_info_list.push(json!({
-                        "nodeId": node_id,
-                        "fieldName": field,
-                        "fieldValue": file_name,
-                    }));
-                }
+            let mapping = MediaMapping::from_provider_config(config)?;
+            let refs = request
+                .assets
+                .iter()
+                .map(|resolved| resolved.asset_ref.clone())
+                .collect::<Vec<_>>();
+            let bindings = mapping.bind(&refs)?;
+            for (index, binding) in bindings.iter().enumerate() {
+                let file_name = self
+                    .upload_asset(
+                        &request.connection_revision,
+                        request.assets[index].bytes.clone(),
+                        "input.png",
+                    )
+                    .await?;
+                node_info_list.push(json!({
+                    "nodeId": binding.slot.node,
+                    "fieldName": binding.slot.field,
+                    "fieldValue": file_name,
+                }));
             }
         }
         let mut workflow_override = custom_workflow;
@@ -1651,8 +1652,9 @@ mod tests {
         assert_eq!(workflow["6"]["inputs"]["text"], "hello");
     }
 
+    /// 旧 revision（asset-N 映射）+ 旧位置数组：按 asset-N 数字序解释，兼容路径。
     #[tokio::test]
-    async fn prepare_uploads_assets_via_media_mapping() {
+    async fn prepare_uploads_assets_via_legacy_positional_mapping() {
         let (base, _state) = mock_server().await;
         let driver = RunningHubDriver::new(Box::new(NoSecrets));
         let prepared = driver
@@ -1691,5 +1693,120 @@ mod tests {
                 && entry["fieldName"] == "image"
                 && entry["fieldValue"] == "openapi/abc.png"
         }));
+    }
+
+    /// 回归（用户场景）：4 槽换装配方只传 475::image + 520::image 时，
+    /// nodeInfoList **恰好**只有 475 与 520 两条——数组位置不再决定语义，
+    /// 而且 519（schema 字典序里的第二个）绝不会被顶上。
+    #[tokio::test]
+    async fn prepare_binds_keyed_assets_to_exactly_those_slots() {
+        let (base, _state) = mock_server().await;
+        let driver = RunningHubDriver::new(Box::new(NoSecrets));
+        let qwen_mapping = json!({
+            "asset-0": { "node": "475", "field": "image" },
+            "asset-1": { "node": "519", "field": "image" },
+            "asset-2": { "node": "520", "field": "image" },
+            "asset-3": { "node": "521", "field": "image" }
+        });
+        let prepare = |assets: Vec<crate::v2::ports::provider::ResolvedAsset>| {
+            let driver = &driver;
+            let mapping = qwen_mapping.clone();
+            let base = base.clone();
+            async move {
+                driver
+                    .prepare(PrepareRequest {
+                        connection_revision: connection(base),
+                        recipe_binding: RecipeBinding {
+                            driver_key: "runninghub".to_string(),
+                            provider_config: BTreeMap::from([
+                                ("workflowId".to_string(), json!("1904136902449209346")),
+                                ("mediaMapping".to_string(), mapping),
+                            ]),
+                            default_connection_id: ConnectionId(1),
+                            allowed_connection_ids: vec![ConnectionId(1)],
+                            connection_override: crate::v2::domain::model::ConnectionOverride::Denied,
+                        },
+                        inputs: BTreeMap::new(),
+                        assets,
+                        request_fingerprint: "fp-4".to_string(),
+                    })
+                    .await
+                    .expect("prepare 应成功")
+            }
+        };
+        let asset = |id: u64, key: &str| crate::v2::ports::provider::ResolvedAsset {
+            asset_ref: crate::v2::domain::media::AssetRef::new(
+                crate::v2::domain::ids::AssetId(id),
+                "abc",
+            )
+            .with_field_key(key),
+            bytes: vec![1, 2, 3],
+        };
+        let prepared = prepare(vec![asset(1, "475::image"), asset(2, "520::image")]).await;
+        let node_list = prepared.provider_request["nodeInfoList"]
+            .as_array()
+            .expect("应生成 nodeInfoList");
+        let pairs: Vec<(&str, &str)> = node_list
+            .iter()
+            .map(|entry| {
+                (
+                    entry["nodeId"].as_str().unwrap_or_default(),
+                    entry["fieldName"].as_str().unwrap_or_default(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            pairs,
+            vec![("475", "image"), ("520", "image")],
+            "只传两个槽位时 nodeInfoList 必须恰好两条：{node_list:?}"
+        );
+
+        // 顺序不决定语义：倒过来传，落的槽位集合不变。
+        let reversed = prepare(vec![asset(2, "520::image"), asset(1, "475::image")]).await;
+        let mut reversed_nodes = reversed.provider_request["nodeInfoList"]
+            .as_array()
+            .expect("应生成 nodeInfoList")
+            .iter()
+            .map(|entry| entry["nodeId"].as_str().unwrap_or_default().to_string())
+            .collect::<Vec<_>>();
+        reversed_nodes.sort();
+        assert_eq!(reversed_nodes, vec!["475".to_string(), "520".to_string()]);
+    }
+
+    /// 未知字段键必须报错（不再有"静默丢掉"这一种结局）。
+    #[tokio::test]
+    async fn prepare_rejects_unknown_field_keys() {
+        let (base, _state) = mock_server().await;
+        let driver = RunningHubDriver::new(Box::new(NoSecrets));
+        let error = driver
+            .prepare(PrepareRequest {
+                connection_revision: connection(base),
+                recipe_binding: RecipeBinding {
+                    driver_key: "runninghub".to_string(),
+                    provider_config: BTreeMap::from([
+                        ("workflowId".to_string(), json!("1904136902449209346")),
+                        (
+                            "mediaMapping".to_string(),
+                            json!({ "475::image": { "node": "475", "field": "image" } }),
+                        ),
+                    ]),
+                    default_connection_id: ConnectionId(1),
+                    allowed_connection_ids: vec![ConnectionId(1)],
+                    connection_override: crate::v2::domain::model::ConnectionOverride::Denied,
+                },
+                inputs: BTreeMap::new(),
+                assets: vec![crate::v2::ports::provider::ResolvedAsset {
+                    asset_ref: crate::v2::domain::media::AssetRef::new(
+                        crate::v2::domain::ids::AssetId(1),
+                        "abc",
+                    )
+                    .with_field_key("519::image"),
+                    bytes: vec![1, 2, 3],
+                }],
+                request_fingerprint: "fp-5".to_string(),
+            })
+            .await
+            .expect_err("未知字段键必须报错");
+        assert_eq!(error.code, "ASSET_FIELD_UNKNOWN");
     }
 }

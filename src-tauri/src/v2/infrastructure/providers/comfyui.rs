@@ -542,43 +542,77 @@ impl ComfyUiDriver {
         })
     }
 
-    /// 把上传的资产以 ComfyUI LoadImage 的引用形式写入 workflow。
-    fn apply_uploads(
+    /// 把上传好的资产按**字段键**写进 workflow 对应节点的输入。
+    ///
+    /// ⚠️ 不再扫图找 `LoadImage` / `asset://N`：资产的身份是字段键（`MediaMapping::bind`），
+    /// 写入点是映射表里写明的 (node, field)。旧的位置数组在这个入口之前就已经被换算成
+    /// 字段键——"按位置猜"正是错位事故的来源。
+    fn apply_media_uploads(
         workflow: &mut Value,
-        assets: &[crate::v2::ports::provider::ResolvedAsset],
+        bindings: &[crate::v2::domain::media::BoundAsset<'_>],
         uploads: &[String],
-    ) {
-        let object = workflow.as_object_mut();
-        let Some(object) = object else {
-            return;
+    ) -> DomainResult<()> {
+        for (binding, upload) in bindings.iter().zip(uploads.iter()) {
+            let node = workflow.get_mut(&binding.slot.node).ok_or_else(|| {
+                SafeError::validation(
+                    "MEDIA_MAPPING_INVALID",
+                    format!(
+                        "媒体映射指向的节点 `{}` 在这份 workflow 里不存在（字段键 `{}`）。\
+                         这通常是 revision 与 workflow 漂移了：按平台上最新的图重新导入这个工作流。",
+                        binding.slot.node, binding.field_key
+                    ),
+                )
+            })?;
+            let inputs = node
+                .get_mut("inputs")
+                .and_then(Value::as_object_mut)
+                .ok_or_else(|| {
+                    SafeError::validation(
+                        "MEDIA_MAPPING_INVALID",
+                        format!(
+                            "媒体映射指向的节点 `{}` 没有 inputs 对象（字段键 `{}`）。",
+                            binding.slot.node, binding.field_key
+                        ),
+                    )
+                })?;
+            inputs.insert(binding.slot.field.clone(), json!(upload));
+        }
+        Ok(())
+    }
+
+    /// **兼容分支**：workflow 里用 `asset://N` 占位的历史写法（我们自己的导入不产生它，
+    /// 但手写/历史配方可能有）。`N` 是请求里第 N 个资产（位置只是这里的旧编码）。请求里
+    /// 没有第 N 个资产时**报错**，不把 `asset://N` 这种垃圾值静默发给引擎。
+    fn replace_asset_scheme_refs(workflow: &mut Value, uploads: &[String]) -> DomainResult<()> {
+        let Some(object) = workflow.as_object_mut() else {
+            return Ok(());
         };
-        for node in object.values_mut() {
-            let class = node
-                .get("class_type")
-                .and_then(Value::as_str)
-                .unwrap_or_default();
-            if class != "LoadImage" {
-                continue;
-            }
+        for (node_id, node) in object.iter_mut() {
             let Some(inputs) = node.get_mut("inputs").and_then(Value::as_object_mut) else {
                 continue;
             };
-            if inputs.contains_key("image") {
-                if let Some(index) = inputs
-                    .get("image")
-                    .and_then(Value::as_str)
-                    .and_then(|value| value.strip_prefix("asset://"))
-                    .and_then(|value| value.parse::<usize>().ok())
-                {
-                    if let Some(upload) = uploads.get(index) {
-                        inputs.insert("image".to_string(), json!(upload));
-                    }
-                } else if let Some(upload) = uploads.first() {
-                    inputs.insert("image".to_string(), json!(upload));
-                }
+            for (field, value) in inputs.iter_mut() {
+                let index = value
+                    .as_str()
+                    .and_then(|text| text.strip_prefix("asset://"))
+                    .and_then(|index| index.parse::<usize>().ok());
+                let Some(index) = index else {
+                    continue;
+                };
+                let Some(upload) = uploads.get(index) else {
+                    return Err(SafeError::validation(
+                        "ASSET_FIELD_UNKNOWN",
+                        format!(
+                            "workflow 的节点 `{node_id}` 输入 `{field}` 引用了 `asset://{index}`，\
+                             但请求只带了 {} 个资产。补上这个资产再提交。",
+                            uploads.len()
+                        ),
+                    ));
+                };
+                *value = json!(upload);
             }
         }
-        let _ = assets;
+        Ok(())
     }
 }
 
@@ -754,11 +788,23 @@ impl ProviderDriver for ComfyUiDriver {
         let key = self.api_key(&request.connection_revision).await?;
         let mut workflow = self.workflow(&request)?;
         if !request.assets.is_empty() {
-            let mut uploads = Vec::with_capacity(request.assets.len());
-            for asset in &request.assets {
-                uploads.push(self.upload_asset(&base, asset, key.clone()).await?);
+            // 资产按**字段键**绑定（旧位置数组也在这一处被换算成字段键，见 `MediaMapping::bind`）。
+            let mapping = crate::v2::domain::media::MediaMapping::from_provider_config(
+                &request.recipe_binding.provider_config,
+            )?;
+            let refs = request
+                .assets
+                .iter()
+                .map(|resolved| resolved.asset_ref.clone())
+                .collect::<Vec<_>>();
+            let bindings = mapping.bind(&refs)?;
+            let mut uploads = Vec::with_capacity(bindings.len());
+            for (index, _binding) in bindings.iter().enumerate() {
+                uploads.push(self.upload_asset(&base, &request.assets[index], key.clone()).await?);
             }
-            Self::apply_uploads(&mut workflow, &request.assets, &uploads);
+            Self::apply_media_uploads(&mut workflow, &bindings, &uploads)?;
+            // 兼容：图里以 `asset://N` 占位的历史写法（见函数注释）。
+            Self::replace_asset_scheme_refs(&mut workflow, &uploads)?;
         }
         let request_id = format!(
             "{}-{:x}",
@@ -1134,6 +1180,10 @@ mod tests {
             .unwrap()
     }
 
+    async fn upload_handler() -> Response {
+        axum::Json(json!({ "name": "uploaded.png", "subfolder": "" })).into_response()
+    }
+
     async fn mock_server() -> (String, MockState) {
         let state = MockState::default();
         let app = Router::new()
@@ -1142,7 +1192,8 @@ mod tests {
                 "/history/{prompt_id}",
                 get(history_handler).with_state(state.clone()),
             )
-            .route("/view", get(view_handler).with_state(state.clone()));
+            .route("/view", get(view_handler).with_state(state.clone()))
+            .route("/upload/image", post(upload_handler));
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
             .expect("绑定 mock 服务应成功");
@@ -1301,19 +1352,122 @@ mod tests {
         assert_eq!(error.code, "PROVIDER_URL_INSECURE");
     }
 
+    /// 回归：媒体资产按**字段键**写进映射写明的 (node, field)——不再扫图猜 LoadImage。
+    #[tokio::test]
+    async fn prepare_writes_keyed_asset_into_the_mapped_node_input() {
+        let (base, state) = mock_server().await;
+        let driver = ComfyUiDriver::new(Box::new(NoSecrets));
+        let mut request = request(
+            connection(base),
+            json!({
+                "6": { "class_type": "CLIPTextEncode", "inputs": { "text": "placeholder" } },
+                "17": { "class_type": "LoadImage", "inputs": { "image": "placeholder.png" } }
+            }),
+        );
+        request.recipe_binding.provider_config.insert(
+            "mediaMapping".to_string(),
+            json!({ "17::image": { "node": "17", "field": "image" } }),
+        );
+        request.assets = vec![ResolvedAsset {
+            asset_ref: AssetRef::new(AssetId(1), "abc").with_field_key("17::image"),
+            bytes: vec![1, 2, 3],
+        }];
+        let prepared = driver.prepare(request).await.expect("prepare 应成功");
+        let workflow = &prepared.provider_request["prompt"];
+        assert_eq!(workflow["17"]["inputs"]["image"], "uploaded.png");
+        let _ = state;
+    }
+
+    /// 字段键不在映射里 ⇒ 明确报错（不再有"静默丢掉"这一种结局）。
+    #[tokio::test]
+    async fn prepare_rejects_unknown_field_keys() {
+        let (base, _state) = mock_server().await;
+        let driver = ComfyUiDriver::new(Box::new(NoSecrets));
+        let mut request = request(connection(base), workflow_fixture());
+        request.recipe_binding.provider_config.insert(
+            "mediaMapping".to_string(),
+            json!({ "17::image": { "node": "17", "field": "image" } }),
+        );
+        request.assets = vec![ResolvedAsset {
+            asset_ref: AssetRef::new(AssetId(1), "abc").with_field_key("19::image"),
+            bytes: vec![1, 2, 3],
+        }];
+        let error = driver.prepare(request).await.expect_err("未知键必须报错");
+        assert_eq!(error.code, "ASSET_FIELD_UNKNOWN");
+    }
+
+    /// 映射指向的节点/字段在图里不存在 ⇒ `MEDIA_MAPPING_INVALID`（revision 与图漂移）。
+    #[tokio::test]
+    async fn prepare_rejects_mapping_that_points_at_a_missing_node() {
+        let (base, _state) = mock_server().await;
+        let driver = ComfyUiDriver::new(Box::new(NoSecrets));
+        let mut request = request(connection(base), workflow_fixture());
+        request.recipe_binding.provider_config.insert(
+            "mediaMapping".to_string(),
+            json!({ "99::image": { "node": "99", "field": "image" } }),
+        );
+        request.assets = vec![ResolvedAsset {
+            asset_ref: AssetRef::new(AssetId(1), "abc").with_field_key("99::image"),
+            bytes: vec![1, 2, 3],
+        }];
+        let error = driver.prepare(request).await.expect_err("缺节点必须报错");
+        assert_eq!(error.code, "MEDIA_MAPPING_INVALID");
+    }
+
+    /// 兼容分支：`asset://N` 占位仍被替换；但没有第 N 个资产时明确报错，
+    /// 不把 `asset://N` 静默发给引擎。
     #[test]
-    fn asset_upload_reference_maps_into_workflow() {
+    fn asset_scheme_placeholders_are_replaced_or_reported() {
         let mut workflow = json!({
             "5": {
                 "class_type": "LoadImage",
                 "inputs": { "image": "asset://0" }
             }
         });
-        let asset = ResolvedAsset {
-            asset_ref: AssetRef::new(AssetId(1), "abc"),
-            bytes: vec![1, 2, 3],
-        };
-        ComfyUiDriver::apply_uploads(&mut workflow, &[asset], &["uploaded.png".to_string()]);
+        ComfyUiDriver::replace_asset_scheme_refs(&mut workflow, &["uploaded.png".to_string()])
+            .expect("有对应资产时应替换");
         assert_eq!(workflow["5"]["inputs"]["image"], "uploaded.png");
+
+        let mut workflow = json!({
+            "5": {
+                "class_type": "LoadImage",
+                "inputs": { "image": "asset://2" }
+            }
+        });
+        let error = ComfyUiDriver::replace_asset_scheme_refs(&mut workflow, &["uploaded.png".to_string()])
+            .expect_err("没有对应资产必须报错");
+        assert_eq!(error.code, "ASSET_FIELD_UNKNOWN");
+        assert_eq!(workflow["5"]["inputs"]["image"], "asset://2", "报错时不改图");
+    }
+
+    /// `apply_media_uploads` 直接对着 (node, field) 写；节点缺失是明确错误。
+    #[test]
+    fn apply_media_uploads_writes_by_slot_and_reports_missing_nodes() {
+        let asset_ref = AssetRef::new(AssetId(1), "abc").with_field_key("17::image");
+        let binding = crate::v2::domain::media::BoundAsset {
+            asset: &asset_ref,
+            field_key: "17::image".to_string(),
+            slot: crate::v2::domain::media::MediaSlot {
+                node: "17".to_string(),
+                field: "image".to_string(),
+            },
+        };
+        let mut workflow = json!({ "17": { "inputs": { "image": "old.png" } } });
+        ComfyUiDriver::apply_media_uploads(
+            &mut workflow,
+            std::slice::from_ref(&binding),
+            &["uploaded.png".to_string()],
+        )
+        .expect("写入应成功");
+        assert_eq!(workflow["17"]["inputs"]["image"], "uploaded.png");
+
+        let mut missing = json!({ "6": { "inputs": {} } });
+        let error = ComfyUiDriver::apply_media_uploads(
+            &mut missing,
+            std::slice::from_ref(&binding),
+            &["uploaded.png".to_string()],
+        )
+        .expect_err("缺节点必须报错");
+        assert_eq!(error.code, "MEDIA_MAPPING_INVALID");
     }
 }
