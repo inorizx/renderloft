@@ -43,7 +43,7 @@ pnpm smoke:linux   # （可选）从解压包全链路自检：CLI → daemon �
 
 用法与下文「用命令行（可选）」一节相同，只是没有 `.exe` 后缀：解压目录里直接 `./renderloft-cli`；控制台在 `http://127.0.0.1:31337/`；MCP 客户端指向解压目录里的 `renderloft-mcp`；`./renderloft-cli daemon stop` 收工。**便携包不碰系统目录、不写 PATH。**
 
-> 已知点：Linux 的密钥存进系统密钥环（Secret Service，经 D-Bus）——桌面发行版自带；纯服务器 / 容器环境里没有它时，保存平台连接密钥需要先备好 keyring 服务（如 gnome-keyring）。
+> 已知点：Linux 的密钥存进系统密钥环（Secret Service，经 D-Bus）——桌面发行版自带；纯服务器 / 容器环境里没有它时，保存平台连接密钥需要先备好 keyring 服务（如 gnome-keyring）。便携包不打包系统库：运行需要系统提供 `libdbus-1` 与 `libssl`（常见发行版都自带，极简容器里需补装 `libdbus-1-3` / `libssl3`）。
 
 ## 三步开始
 
