@@ -335,3 +335,30 @@ renderloft-cli artifact list                          # 产物（byteSize 0 = �
 > `connection set-key` · `daemon status` · `daemon stop` · `callback set-secret` · `callback status` ·
 > `callback clear-secret` · `recipe remove` · `recipe restore` · `artifact download`。
 > 它们碰的是「谁能跑什么」这条授权边界本身，或者往磁盘任意路径写文件——而 AI 正受这条边界约束。
+
+## 12. 迁移到另一台机器
+
+**第一步永远是备份**，而且**不要自己拷工作区目录**：
+
+```bash
+renderloft-cli workspace backup --to /path/on/this/machine/backup
+# → {"path": "...", "databaseBytes": 1155072, "artifactCount": 2, "artifactBytes": 542177}
+```
+
+**为什么不能自己拷**：工作区的 SQLite 跑在 WAL 模式下，库文件和 `-wal` / `-shm` 是活的，
+直接拷可能漏掉最近的事务、甚至拷出一个打不开的库——而且**不会报错**。`workspace backup`
+用 SQLite 官方的 `VACUUM INTO` 导一份一致的库，再把 `artifacts/` 整份拷过去。
+（目标目录里已经有一份备份时它会**报错**，不覆盖；换一个目录。）
+
+**换机器**：
+
+1. 在新机器上装好 RenderLoft；
+2. `renderloft-cli daemon stop`（在**新**机器上）；
+3. 把备份里的 `v2-workspace.db` 与 `artifacts/` 放进新机器的工作区目录——`daemon status` 回的
+   `workspace` 字段就是那个目录；旧的那份先挪走，别混着放；
+4. 跑任意一条命令（例如 `renderloft-cli recipe list`），CLI 会把 daemon 拉起来；
+5. **自检**：`recipe list` / `operation list` 的数量与源机器一致，才算迁移成功。
+
+> ⚠️ **必须交回给人的一步**：平台 API Key **不在这份快照里**（它们在系统凭据库，设计上不落库）。
+> 所以迁移的最后一步是**人在界面的「连接」页重新填一次**。在人来填之前**不要报告"迁移完成"**
+> ——之后的任务会因为缺少凭据而失败，而那看起来像是你的迁移做错了。

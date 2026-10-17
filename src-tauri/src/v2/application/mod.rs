@@ -13,3 +13,4 @@ pub mod retry_operation;
 pub mod scheduler;
 pub mod settings;
 pub mod validate_operation;
+pub mod workspace_backup;

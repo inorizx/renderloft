@@ -207,6 +207,15 @@ impl V2Client {
         self.delete(&format!("/api/v1/recipes/{recipe_id}")).await
     }
 
+    /// 生成一份**一致的**工作区快照（迁移 / 备份）。`to` 是备份目录。
+    ///
+    /// ⚠️ 恢复**没有**对应的方法：`daemon stop` → 用备份替换工作区目录 → 再跑任意一条命令把
+    /// daemon 拉起来。密钥永远不在这份快照里（它们在系统凭据库），换机器必须**由人重填**。
+    pub async fn backup_workspace(&self, to: &str) -> Result<Value, ClientError> {
+        self.post("/api/v1/workspace/backup", json!({ "to": to }))
+            .await
+    }
+
     /// 从「已移除」里恢复一个应用（不在墓碑里的会拿到 404 `RECIPE_NOT_IN_TRASH`）。
     pub async fn restore_recipe(&self, recipe_id: u64) -> Result<Value, ClientError> {
         self.post(&format!("/api/v1/recipes/{recipe_id}/restore"), json!({}))

@@ -194,6 +194,8 @@ impl V2Runtime {
         let callback_deliveries: Arc<
             dyn crate::v2::ports::repositories::CallbackDeliveryRepository,
         > = concrete.clone() as Arc<dyn crate::v2::ports::repositories::CallbackDeliveryRepository>;
+        let workspace: Arc<dyn crate::v2::ports::repositories::WorkspaceRepository> =
+            concrete.clone() as Arc<dyn crate::v2::ports::repositories::WorkspaceRepository>;
 
         let create_operation = Arc::new(CreateOperation::new(
             Repositories {
@@ -255,6 +257,11 @@ impl V2Runtime {
             drivers.clone(),
         ));
 
+        // 迁移/备份：把工作区一致地导出一份（库走 `VACUUM INTO`，产物缓存整份拷）。
+        let workspace_backup = Arc::new(
+            crate::v2::application::workspace_backup::WorkspaceBackupService::new(workspace),
+        );
+
         let state = Arc::new(V2HttpState::new(
             token_service,
             secrets.clone(),
@@ -273,6 +280,7 @@ impl V2Runtime {
             status,
             import_service,
             Arc::new(crate::v2::infrastructure::providers::safety::ReqwestSafeHttpClient),
+            workspace_backup,
         ));
 
         let bootstrap_token = ensure_bootstrap_token(data_dir, &state).await?;

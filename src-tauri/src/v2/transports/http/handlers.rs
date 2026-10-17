@@ -148,6 +148,7 @@ pub const ROUTES: &[(&str, &str)] = &[
     ("/api/v1/diagnostics", "get"),
     ("/api/v1/runninghub/account", "get"),
     ("/api/v1/runninghub/queue", "get"),
+    ("/api/v1/workspace/backup", "post"),
     ("/api/v1/openapi.json", "get"),
 ];
 
@@ -1510,6 +1511,27 @@ pub async fn get_asset_bytes(
                 "无法生成 Asset 响应",
             ))
         })
+}
+
+/// 生成一份**一致的**工作区快照（迁移 / 备份）。逻辑见 `application/workspace_backup.rs`。
+///
+/// **恢复没有对应的端点**：`daemon stop` → 用备份替换工作区目录 → 任意一条 CLI 命令会把 daemon
+/// 拉起来。这里只负责"导出一份干净的"；密钥永远不在这份快照里（它们在系统凭据库）。
+pub async fn backup_workspace(
+    State(state): State<Arc<V2HttpState>>,
+    Extension(actor): Extension<ActorRef>,
+    Json(body): Json<Value>,
+) -> HttpResult {
+    require_scope(&actor, Scope::SettingsManage)?;
+    let target = body.get("to").and_then(Value::as_str).unwrap_or_default();
+    let report = state
+        .workspace_backup
+        .backup(target)
+        .await
+        .map_err(domain_error)?;
+    Ok(Json(
+        serde_json::to_value(Envelope::new(serde_json::to_value(report).unwrap())).unwrap(),
+    ))
 }
 
 // ---------- artifacts ----------
