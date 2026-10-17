@@ -1526,10 +1526,7 @@ fn build_comfyui_schema_with(
         }
         if is_media {
             // 键 = **字段键**（见 `build_input_schema` 的同款说明）。
-            media_mapping.insert(
-                key.clone(),
-                json!({ "node": node_id, "field": field_name }),
-            );
+            media_mapping.insert(key.clone(), json!({ "node": node_id, "field": field_name }));
         } else {
             field_mapping.insert(key.clone(), json!({ "node": node_id, "field": field_name }));
         }

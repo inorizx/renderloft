@@ -1742,15 +1742,14 @@ fn coerce_mcp(param: &Param, value: &Value) -> Result<Value, ClientError> {
                         ));
                     }
                 }
-                let asset_id = entry
-                    .get("assetId")
-                    .and_then(coerce_u64)
-                    .ok_or_else(|| {
-                        argument_error(
-                            "ASSET_SHAPE_INVALID",
-                            format!("参数 {key} 的字段 `{field_key}` 缺 assetId（先调 asset.upload 拿）。"),
-                        )
-                    })?;
+                let asset_id = entry.get("assetId").and_then(coerce_u64).ok_or_else(|| {
+                    argument_error(
+                        "ASSET_SHAPE_INVALID",
+                        format!(
+                            "参数 {key} 的字段 `{field_key}` 缺 assetId（先调 asset.upload 拿）。"
+                        ),
+                    )
+                })?;
                 let checksum = entry
                     .get("checksum")
                     .and_then(Value::as_str)
@@ -2020,15 +2019,16 @@ async fn prepare_assets(client: &V2Client, value: &Value) -> Result<Value, Clien
                     .replace('\n', "");
                 let mime_type = guess_mime_type(&filename).to_string();
                 let uploaded = client.upload_asset(&filename, &mime_type, bytes).await?;
-                let asset_id = uploaded
-                    .get("assetId")
-                    .and_then(Value::as_u64)
-                    .ok_or_else(|| {
-                        argument_error(
-                            "ASSET_UPLOAD_INVALID",
-                            format!("上传响应里没有 assetId：{uploaded}"),
-                        )
-                    })?;
+                let asset_id =
+                    uploaded
+                        .get("assetId")
+                        .and_then(Value::as_u64)
+                        .ok_or_else(|| {
+                            argument_error(
+                                "ASSET_UPLOAD_INVALID",
+                                format!("上传响应里没有 assetId：{uploaded}"),
+                            )
+                        })?;
                 let checksum = uploaded
                     .get("checksum")
                     .and_then(Value::as_str)

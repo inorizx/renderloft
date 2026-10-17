@@ -800,7 +800,10 @@ impl ProviderDriver for ComfyUiDriver {
             let bindings = mapping.bind(&refs)?;
             let mut uploads = Vec::with_capacity(bindings.len());
             for (index, _binding) in bindings.iter().enumerate() {
-                uploads.push(self.upload_asset(&base, &request.assets[index], key.clone()).await?);
+                uploads.push(
+                    self.upload_asset(&base, &request.assets[index], key.clone())
+                        .await?,
+                );
             }
             Self::apply_media_uploads(&mut workflow, &bindings, &uploads)?;
             // 兼容：图里以 `asset://N` 占位的历史写法（见函数注释）。
@@ -1434,10 +1437,14 @@ mod tests {
                 "inputs": { "image": "asset://2" }
             }
         });
-        let error = ComfyUiDriver::replace_asset_scheme_refs(&mut workflow, &["uploaded.png".to_string()])
-            .expect_err("没有对应资产必须报错");
+        let error =
+            ComfyUiDriver::replace_asset_scheme_refs(&mut workflow, &["uploaded.png".to_string()])
+                .expect_err("没有对应资产必须报错");
         assert_eq!(error.code, "ASSET_FIELD_UNKNOWN");
-        assert_eq!(workflow["5"]["inputs"]["image"], "asset://2", "报错时不改图");
+        assert_eq!(
+            workflow["5"]["inputs"]["image"], "asset://2",
+            "报错时不改图"
+        );
     }
 
     /// `apply_media_uploads` 直接对着 (node, field) 写；节点缺失是明确错误。

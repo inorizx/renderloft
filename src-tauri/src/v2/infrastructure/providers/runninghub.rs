@@ -1724,7 +1724,8 @@ mod tests {
                             ]),
                             default_connection_id: ConnectionId(1),
                             allowed_connection_ids: vec![ConnectionId(1)],
-                            connection_override: crate::v2::domain::model::ConnectionOverride::Denied,
+                            connection_override:
+                                crate::v2::domain::model::ConnectionOverride::Denied,
                         },
                         inputs: BTreeMap::new(),
                         assets,

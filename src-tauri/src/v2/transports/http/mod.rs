@@ -996,7 +996,11 @@ mod tests {
         // 不落库：列表为空。
         let (status, listed) = get_json(&app, "/api/v1/operations", &token).await;
         assert_eq!(status, StatusCode::OK);
-        assert_eq!(listed["data"]["items"].as_array().unwrap().len(), 0, "{listed}");
+        assert_eq!(
+            listed["data"]["items"].as_array().unwrap().len(),
+            0,
+            "{listed}"
+        );
     }
 
     /// 预检失败时给与提交**同码**的错误（这里：未知字段键）。
@@ -1058,8 +1062,8 @@ mod tests {
         tokio::spawn(async move {
             let _ = axum::serve(listener, app).await;
         });
-        let client = V2Client::new(format!("http://127.0.0.1:{}", address.port()), token)
-            .with_driver("mcp");
+        let client =
+            V2Client::new(format!("http://127.0.0.1:{}", address.port()), token).with_driver("mcp");
 
         let verb = verbs::find_by_id("operation.run").expect("operation.run");
         let args = Args::from_mcp(
@@ -1085,8 +1089,7 @@ mod tests {
             "{report}"
         );
         assert_eq!(
-            report["runs"][0]["assets"][0]["fieldKey"],
-            "475::image",
+            report["runs"][0]["assets"][0]["fieldKey"], "475::image",
             "{report}"
         );
         assert_eq!(report["runs"][0]["assets"][0]["assetId"], 7, "{report}");
@@ -1120,8 +1123,8 @@ mod tests {
         tokio::spawn(async move {
             let _ = axum::serve(listener, app).await;
         });
-        let client = V2Client::new(format!("http://127.0.0.1:{}", address.port()), token)
-            .with_driver("mcp");
+        let client =
+            V2Client::new(format!("http://127.0.0.1:{}", address.port()), token).with_driver("mcp");
 
         let verb = verbs::find_by_id("operation.run").expect("operation.run");
         let args = Args::from_mcp(
