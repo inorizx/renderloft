@@ -31,6 +31,20 @@
 
 **升级**：下载新版本、覆盖安装即可。**工作区（应用库、任务历史、产物）与 API Key 都在安装目录之外**——分别是 `%LOCALAPPDATA%\renderloft-workspace` 与 Windows 凭据库——所以覆盖安装不会丢数据。安装包目前**没有代码签名**，升级后首次运行仍可能看到 SmartScreen 的「未知发布者」，点「仍要运行」即可。
 
+### Linux（无头版）
+
+Linux 的形态是**无头**：没有桌面壳、也没有托盘——**CLI、网页控制台（daemon 伺服）、MCP 三入口共用同一个 daemon**。装好 Node + pnpm + Rust 后从源码构建：
+
+```bash
+pnpm install
+pnpm build:linux   # → RenderLoft_<版本>_x64-linux.tar.gz（三件套 + dist/，解压即用）
+pnpm smoke:linux   # （可选）从解压包全链路自检：CLI → daemon → 控制台 → MCP
+```
+
+用法与下文「用命令行（可选）」一节相同，只是没有 `.exe` 后缀：解压目录里直接 `./renderloft-cli`；控制台在 `http://127.0.0.1:31337/`；MCP 客户端指向解压目录里的 `renderloft-mcp`；`./renderloft-cli daemon stop` 收工。**便携包不碰系统目录、不写 PATH。**
+
+> 已知点：Linux 的密钥存进系统密钥环（Secret Service，经 D-Bus）——桌面发行版自带；纯服务器 / 容器环境里没有它时，保存平台连接密钥需要先备好 keyring 服务（如 gnome-keyring）。
+
 ## 三步开始
 
 ### 1️⃣ 连上你的平台
@@ -141,7 +155,7 @@ renderloft_call             调用：{"verb": "operation.run", "args": {...}}
 }
 ```
 
-> 自己编译的话路径是 `<仓库路径>\src-tauri\target\release\renderloft-mcp.exe`；用免安装 zip 的话就是解压目录里的那个。
+> 自己编译的话路径是 `<仓库路径>\src-tauri\target\release\renderloft-mcp.exe`；用免安装 zip 的话就是解压目录里的那个；**Linux 便携包里是解压目录里的 `renderloft-mcp`**（无 `.exe` 后缀）。
 > `renderloft-mcp.exe` 是 **stdio 服务**：由 MCP 客户端按需拉起，不用常驻。它连的 daemon 如果没在跑，**它会自己把旁边的 `renderloft.exe` 拉起来**（CLI 也一样）——所以不必先打开界面。
 
 然后就能直接说：
@@ -352,6 +366,7 @@ pnpm dev            # daemon(127.0.0.1:31337) + 控制台(http://127.0.0.1:5174)
 pnpm build          # 前端类型检查 + 构建
 pnpm verify         # 完整门禁：lint · 格式 · 分层 · 配色契约 · 版本号 · 前端构建 · clippy · Rust 测试
 pnpm build:windows  # 打 Windows 安装包（NSIS）
+pnpm build:linux    # 打 Linux 无头便携包（tar.gz：三件套 + dist/）
 ```
 
 分层约束由 `scripts/check-layers.mjs` 守门：daemon 是唯一业务宿主，只有调度器能向平台提交，写端点必须是应用用例。

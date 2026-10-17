@@ -59,6 +59,10 @@
 - 后台循环的日志改为"写失败就算了"：此前 stdout/stderr 一旦断开（管道关闭、日志文件被删等），
   循环每轮的日志写入会 panic 并把该循环静默带走——症状是任务提交成功却永远停在 `ACCEPTED`，
   看起来像平台卡住。启动期日志仍保持"写不出去就大声失败"。
+- Linux 无头交付：CLI / 网页控制台 / MCP 三入口共用同一个 daemon；`pnpm build:linux` 产出
+  `RenderLoft_<版本>_x64-linux.tar.gz`（三件套 + `dist/`，解压即用），CI 的 `linux-portable`
+  job 从**解压出来的包**做全链路冒烟（CLI → daemon → 控制台 → MCP），防打包静默烂掉。
+  Linux 不做桌面壳；密钥走系统密钥环（Secret Service）。
 
 ## 当前进行中
 
