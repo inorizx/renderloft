@@ -618,28 +618,6 @@ const rowEffectiveValues = (row: BatchRow) => {
   return merged
 }
 
-/** 某一行最终的文件槽位：「单独填写」的文件字段只认行内文件，其余回退统一文件。 */
-const rowEffectiveFiles = (row: BatchRow) => {
-  const merged: Record<string, { assetId: number; checksum: string; filename: string }> = {}
-  for (const field of fields.value) {
-    if (field.format !== 'file') continue
-    merged[field.key] = variableKeys.value.includes(field.key)
-      ? row.files[field.key]
-      : fileRefs.value[field.key]
-  }
-  return merged
-}
-
-/** RunningHub 的 mediaMapping 使用 asset-0、asset-1…按字段顺序定位文件，
- * 不允许跳过前面的文件字段后只上传后面的文件。 */
-const validateFileOrder = (rowFiles: Record<string, unknown>) => {
-  const fileFields = fields.value.filter((field) => field.format === 'file')
-  const firstMissing = fileFields.findIndex((field) => !rowFiles[field.key])
-  return !(
-    firstMissing >= 0 && fileFields.slice(firstMissing + 1).some((field) => rowFiles[field.key])
-  )
-}
-
 /**
  * 「单独填写」的字段里，哪些行是空的。
  *
@@ -686,8 +664,6 @@ const run = async () => {
     for (const [index, row] of rows.entries()) {
       const effective = rowEffectiveValues(row)
       const rowTag = batchMode.value === 'batch' ? t('runner.rowTag', { n: index + 1 }) : ''
-      const rowTagParen =
-        batchMode.value === 'batch' ? t('runner.rowTagParen', { n: index + 1 }) : ''
       const invalidNumbers = fields.value
         .filter((field) => isInvalidNumber(field, effective[field.key]))
         .map((field) => field.description || field.key)
@@ -711,10 +687,6 @@ const run = async () => {
           })
         )
       }
-      const effectiveFiles = rowEffectiveFiles(row)
-      if (!validateFileOrder(effectiveFiles)) {
-        throw new Error(t('runner.fileOrderRequired', { row: rowTagParen }))
-      }
     }
 
     // 硬校验都过了，再确认一次"空的单独填写项"：这类格子没有统一值兜底，
@@ -732,19 +704,21 @@ const run = async () => {
     // 每行显式生成 clientRunId：行↔run 映射用它对齐，不依赖返回数组顺序。
     const submitToken = Date.now().toString(36)
     const clientRunIds = rows.map((row) => `row-${row.id}-${submitToken}`)
-    const runsPayload = rows.map((row, index) => ({
-      clientRunId: clientRunIds[index],
-      inputs: normalizeInputs(rowEffectiveValues(row)),
-      assets: fileFields
-        .filter((field) => {
-          const ref = row.files[field.key] ?? fileRefs.value[field.key]
-          return !!ref
-        })
-        .map((field) => {
-          const { assetId, checksum } = row.files[field.key] ?? fileRefs.value[field.key]
-          return { assetId, checksum }
-        })
-    }))
+    const runsPayload = rows.map((row, index) => {
+      // 资产按**字段键**定位（field.key，如 "475::image"）：位置数组的语义由上游节点
+      // 顺序决定，把它当语义正是图片错位的来源。没选文件的字段直接不进对象（跳过中间
+      // 槽位是合法的——不必从第一个文件字段开始连续填）。
+      const assets: Record<string, { assetId: number; checksum: string }> = {}
+      for (const field of fileFields) {
+        const ref = row.files[field.key] ?? fileRefs.value[field.key]
+        if (ref) assets[field.key] = { assetId: ref.assetId, checksum: ref.checksum }
+      }
+      return {
+        clientRunId: clientRunIds[index],
+        inputs: normalizeInputs(rowEffectiveValues(row)),
+        assets
+      }
+    })
     const result = await workspace.runRecipes({
       recipeRevisionId: revisionId,
       runs: runsPayload

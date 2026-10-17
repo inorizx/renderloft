@@ -399,7 +399,13 @@ export const useV2WorkspaceStore = defineStore('v2-workspace', () => {
     runs: Array<{
       inputs: Record<string, unknown>
       clientRunId?: string
-      assets?: Array<{ assetId: number; checksum: string }>
+      /**
+       * 媒体资产：**键 = 字段键**（recipe inputSchema 的 key，如 "475::image"）。
+       *
+       * 位置数组（`asset-N` 下标）只是 HTTP 的兼容编码——资产的语义是"写进哪个
+       * 节点字段"，由键决定；数组位置既可能漂移又会被上游顺序左右。
+       */
+      assets?: Record<string, { assetId: number; checksum: string }>
     }>
     idempotencyKey?: string
   }) => {
@@ -411,7 +417,7 @@ export const useV2WorkspaceStore = defineStore('v2-workspace', () => {
         clientRunId: run.clientRunId ?? `${operationKey}-run-${index + 1}`,
         recipeRevisionId: input.recipeRevisionId,
         inputs: run.inputs,
-        ...(run.assets?.length ? { assets: run.assets } : {})
+        ...(run.assets && Object.keys(run.assets).length ? { assets: run.assets } : {})
       }))
     )
     activeOperationId.value = result.operationId
@@ -428,7 +434,8 @@ export const useV2WorkspaceStore = defineStore('v2-workspace', () => {
     inputs: Record<string, unknown>
     idempotencyKey?: string
     clientRunId?: string
-    assets?: Array<{ assetId: number; checksum: string }>
+    /** 键 = 字段键（见 `runRecipes` 的同款说明）。 */
+    assets?: Record<string, { assetId: number; checksum: string }>
   }) =>
     runRecipes({
       recipeRevisionId: input.recipeRevisionId,

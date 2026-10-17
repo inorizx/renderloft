@@ -300,7 +300,11 @@ export const v2 = {
       recipeRevisionId: number
       connectionId?: number
       inputs: Record<string, unknown>
-      assets?: Array<{ assetId: number; checksum: string }>
+      /**
+       * 媒体资产：**键 = 字段键**（如 "475::image"）。服务端也收位置数组，
+       * 但那只为旧 revision 的兼容保留——新代码一律用字段键。
+       */
+      assets?: Record<string, { assetId: number; checksum: string }>
     }>
   ): Promise<CreateOperationResult> {
     return this.post('/api/v1/operations', { idempotencyKey, runs })
