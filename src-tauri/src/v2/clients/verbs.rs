@@ -606,8 +606,12 @@ pub static VERBS: &[Verb] = &[
         mcp_description: Some(
             "List recent operations (tasks), newest first: id, status, run count and creation time. \
              Use this when an operation id has been lost — renderloft_run_recipe already returns one, \
-             so you rarely need it. This carries summaries only: for the inputs a task was submitted \
-             with, call renderloft_get_operation. To page further back, pass `after` a previous \
+             so you rarely need it. Each item also carries `attention` when one of its runs is \
+             waiting for something: `{reason, deadline}` says why it is not moving and when it will \
+             be given up on (null = nothing is stuck). Read it before telling the user how long a \
+             task will take — `status: RUNNING` alone does NOT mean work is progressing. This \
+             carries summaries only: for the inputs a task was submitted with, call \
+             renderloft_get_operation. To page further back, pass `after` a previous \
              `nextCursor`.",
         ),
         read_only: true,

@@ -67,6 +67,18 @@ pub struct OperationSummary {
     pub status: crate::v2::domain::operation::OperationStatus,
     pub created_at: Timestamp,
     pub run_count: u64,
+    /// 这个 operation 里**最阻塞**的那条 run 的「为什么没在动」原因码
+    /// （严重度与取值见 `domain::operation::ATTENTION_LADDER`）；没有就是 `None`。
+    ///
+    /// 为什么摘要里也要有：调用方（尤其外界 Agent）是**先 list 再 get** 的。只有 `get` 带
+    /// `attention` 等于省不了事 —— 它得为列表里每一条各打一次 `get` 才知道该看哪一个，
+    /// 而这次事故的代价正是"没人主动去看"。
+    ///
+    /// 为什么只给原因码与死线，不给那句人话与 nextActions：摘要要精简（一页 50 条不该带上
+    /// 50 份散文）。要读"到点会怎样、现在能做什么"，按 id 调 `get`。
+    pub attention_reason: Option<String>,
+    /// 上一条 run 的**死线**（到点会判失败）；与 `attention_reason` 同时有或同时无。
+    pub attention_deadline: Option<Timestamp>,
 }
 
 #[derive(Debug, Clone)]

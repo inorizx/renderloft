@@ -1105,6 +1105,22 @@ pub async fn list_operations(
                         "status": summary.status.as_str(),
                         "runCount": summary.run_count,
                         "createdAt": summary.created_at.0,
+                        // 「为什么没在动」的摘要版：只有原因码与死线，**没有**那句人话与
+                        // nextActions（一页 50 条不该带上 50 份散文）。要读全的按 id 调
+                        // `operation get` —— 那里的 `attention` 是同一个判据的完整形态。
+                        //
+                        // 为什么摘要必须带上它：调用方先 list 再 get。只有 get 有，等于
+                        // 逼它为每一条各打一次 get 才知道该看哪一个，而这次事故的代价
+                        // 正是"没人主动去看"（见 domain::operation::run_attention）。
+                        "attention": summary.attention_reason.as_ref().map(|reason| {
+                            json!({
+                                "reason": reason,
+                                "deadline": summary
+                                    .attention_deadline
+                                    .as_ref()
+                                    .map(|deadline| deadline.0.clone()),
+                            })
+                        }),
                     })
                 })
                 .collect::<Vec<_>>(),

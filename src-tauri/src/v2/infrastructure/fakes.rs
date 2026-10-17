@@ -996,14 +996,21 @@ impl OperationRepository for InMemoryRepositories {
             .operations
             .iter()
             .filter(|persisted| after.is_none_or(|after| persisted.operation.id < after))
-            .map(
-                |persisted| crate::v2::ports::repositories::OperationSummary {
+            .map(|persisted| {
+                // attention 走**与 sqlite 同一套**判据：挑最阻塞的那条 run
+                // （`operation_attention` 按 `ATTENTION_LADDER` 的严重度取最小）。
+                // 替身里手写一份"哪个状态更严重"就会与生产悄悄不一致，而这类漂移
+                // 在这个仓库里已经咬过（见 domain::operation::apply_tracking 的注释）。
+                let attention = crate::v2::domain::operation::operation_attention(&persisted.runs);
+                crate::v2::ports::repositories::OperationSummary {
                     id: persisted.operation.id,
                     status: persisted.operation.status,
                     created_at: persisted.operation.created_at.clone(),
                     run_count: persisted.runs.len() as u64,
-                },
-            )
+                    attention_reason: attention.as_ref().map(|attention| attention.reason.clone()),
+                    attention_deadline: attention.and_then(|attention| attention.deadline),
+                }
+            })
             .collect();
         summaries.sort_by_key(|summary| std::cmp::Reverse(summary.id));
         summaries.truncate(limit);
