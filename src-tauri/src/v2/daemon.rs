@@ -34,7 +34,9 @@ use crate::v2::ports::provider::{driver_key, DriverRegistry};
 use crate::v2::ports::stores::{SecretStore, SecretValue};
 use crate::v2::transports::http::{build_router, V2HttpState};
 
-pub const V2_DB_FILE: &str = "v2-workspace.db";
+/// 库文件名只有一个所有者：端口层（工作区契约的一部分）。这里只是沿用它的旧名字，
+/// 免得 `application` 为了拿这个常量去依赖组合根（分层守门会拦）。
+pub const V2_DB_FILE: &str = crate::v2::ports::repositories::WORKSPACE_DB_FILE;
 pub const BOOTSTRAP_TOKEN_FILE: &str = "v2-bootstrap.token";
 
 /// 基于 Actor scopes 的授权策略。领域层已内置 has_scope 检查，此处作为显式策略端口实现。
