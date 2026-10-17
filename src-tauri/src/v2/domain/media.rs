@@ -204,6 +204,20 @@ impl MediaMapping {
         self.positional.as_deref()
     }
 
+    /// 把映射表渲染成**一律 keyed** 的 JSON 条目（写新 revision 用；旧槽位在这一步被
+    /// 归一化成字段键，见 `recipe.rs` 的控件变更与 `recipe_import` 的导入）。
+    pub fn keyed_entries(&self) -> BTreeMap<String, Value> {
+        self.slots
+            .iter()
+            .map(|(key, slot)| {
+                (
+                    key.clone(),
+                    serde_json::json!({ "node": slot.node, "field": slot.field }),
+                )
+            })
+            .collect()
+    }
+
     fn describe_keys(&self) -> String {
         if self.slots.is_empty() {
             return "（它没有任何媒体字段）".to_string();

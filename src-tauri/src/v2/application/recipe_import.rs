@@ -790,7 +790,6 @@ fn build_input_schema(schema: &WebappSchema) -> DomainResult<BuiltSchema> {
     let mut plans = Vec::new();
     let mut field_mapping = BTreeMap::new();
     let mut media_mapping = BTreeMap::new();
-    let mut media_index = 0usize;
 
     for node in &schema.nodes {
         if node.field_name.is_empty() || node.node_id.is_empty() {
@@ -812,11 +811,13 @@ fn build_input_schema(schema: &WebappSchema) -> DomainResult<BuiltSchema> {
             defaults.insert(key.clone(), value.clone());
         }
         if is_media {
+            // ⚠️ 键 = **字段键**（不是 asset-N 位置槽）：资产的语义是"写进哪个节点字段"，
+            // 上游节点顺序、schema 键序、调用方顺序谁都不该是语义。旧 revision 的
+            // asset-N 形状由 MediaMapping 读取时归一化（见 domain::media）。
             media_mapping.insert(
-                format!("asset-{media_index}"),
+                key.clone(),
                 json!({ "node": node.node_id, "field": node.field_name }),
             );
-            media_index += 1;
         } else {
             field_mapping.insert(
                 key.clone(),
@@ -1425,7 +1426,6 @@ fn build_comfyui_schema_with(
     let mut plans = Vec::new();
     let mut field_mapping = BTreeMap::new();
     let mut media_mapping = BTreeMap::new();
-    let mut media_index = 0usize;
 
     for candidate in candidates {
         // 用户对这条字段的决定（勾没勾、备注名、控件、候选项）——没有勾选这条路时是 None。
@@ -1525,11 +1525,11 @@ fn build_comfyui_schema_with(
             defaults.insert(key.clone(), value);
         }
         if is_media {
+            // 键 = **字段键**（见 `build_input_schema` 的同款说明）。
             media_mapping.insert(
-                format!("asset-{media_index}"),
+                key.clone(),
                 json!({ "node": node_id, "field": field_name }),
             );
-            media_index += 1;
         } else {
             field_mapping.insert(key.clone(), json!({ "node": node_id, "field": field_name }));
         }
@@ -2219,7 +2219,7 @@ mod tests {
             .contains(&json!("17::image")));
         assert!(!field_mapping.contains_key("17::image"));
         assert_eq!(
-            media_mapping["asset-0"],
+            media_mapping["17::image"],
             json!({ "node": "17", "field": "image" })
         );
         assert!(fields
@@ -2227,24 +2227,40 @@ mod tests {
             .any(|field| field.media && field.key == "17::image"));
     }
 
+    /// ⚠️ 回归（用户场景）：媒体映射的键是**字段键**，不是位置槽。此前它按上游节点
+    /// 声明顺序生成 `asset-0..N`，而上游顺序 / schema 键序 / 调用方顺序各自漂移，于是
+    /// 4 槽换装配方在界面上第二格其实是 519（图4）。现在键就是节点::字段，读的人不需要
+    /// 知道任何顺序。
     #[test]
-    fn media_mapping_index_follows_declaration_order() {
+    fn media_mapping_is_keyed_by_field_key_not_by_position() {
         let mut schema = schema();
+        // 故意让上游声明顺序与键的字典序**不一致**：槽位语义完全由键决定，顺序不参与。
         schema
             .nodes
-            .push(node("17", "image", "IMAGE", None, json!(["IMAGE", {}])));
+            .push(node("475", "image", "IMAGE", None, json!(["IMAGE", {}])));
+        schema
+            .nodes
+            .push(node("519", "image", "IMAGE", None, json!(["IMAGE", {}])));
         schema
             .nodes
             .push(node("90", "video", "VIDEO", None, json!(["VIDEO", {}])));
         let (_input_schema, _defaults, _fields, _field_mapping, media_mapping) =
             build_input_schema(&schema).unwrap();
         assert_eq!(
-            media_mapping["asset-0"],
-            json!({ "node": "17", "field": "image" })
+            media_mapping["475::image"],
+            json!({ "node": "475", "field": "image" })
         );
         assert_eq!(
-            media_mapping["asset-1"],
+            media_mapping["519::image"],
+            json!({ "node": "519", "field": "image" })
+        );
+        assert_eq!(
+            media_mapping["90::video"],
             json!({ "node": "90", "field": "video" })
+        );
+        assert!(
+            !media_mapping.keys().any(|key| key.starts_with("asset-")),
+            "新导入不许再写位置槽：{media_mapping:?}"
         );
     }
 
@@ -2300,7 +2316,7 @@ mod tests {
             !properties.contains_key("17::image") || properties["17::image"]["format"] == "file"
         );
         assert_eq!(
-            media_mapping["asset-0"],
+            media_mapping["17::image"],
             json!({ "node": "17", "field": "image" })
         );
         // defaults 只保留**被暴露的**字段的默认值：旋钮没暴露，它们的默认值自然也不在这里
@@ -2576,7 +2592,7 @@ mod tests {
         // 参考图 → 媒体输入。
         assert!(keys.contains(&"17::image"));
         assert_eq!(
-            media_mapping["asset-0"],
+            media_mapping["17::image"],
             json!({ "node": "17", "field": "image" })
         );
         // 旋钮与管道：**不默认暴露**（对话框里仍列出来让用户勾）。
@@ -2814,7 +2830,7 @@ mod tests {
         assert_eq!(schema["properties"]["17::image"]["format"], "file");
         assert_eq!(schema["properties"]["17::image"]["x-widget-source"], "user");
         assert_eq!(
-            media_mapping["asset-0"],
+            media_mapping["17::image"],
             json!({ "node": "17", "field": "image" })
         );
         assert!(!field_mapping.contains_key("17::image"));
