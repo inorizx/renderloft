@@ -296,6 +296,7 @@ schtasks /create /tn RenderLoft收图 /sc minute /mo 10 ^
 | `operation get` | `--operation <id>` |
 | `operation wait` | `--operation <id>` · `[--interval <1-60 秒>]`（缺省 5）· `[--timeout <秒>]`（缺省 0 = 一直等） |
 | `operation cancel` | `--operation <id>` |
+| `operation retry` | `--operation <id>` · `[--run <id>]`（只重试这一条；不给就重跑该任务的全部 run——已成功的那几条会**再计费一次**） |
 | `artifact list` | `[--limit <1-200>]`（缺省 50）· `[--after <id>]` |
 | `artifact get` | `--artifact <id>` |
 | `artifact download` | `--artifact <id>` · `[--to <文件或目录>]` · `[--on-conflict rename\|skip\|overwrite]`（缺省 rename）· `[--name-template <模板>]` |
