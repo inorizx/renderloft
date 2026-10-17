@@ -75,6 +75,12 @@
 ## 当前进行中
 
 - 应用参数预设、批量运行和结果工作区的产品化体验。
+- **迁移与备份**：工作区（`%LOCALAPPDATA%\renderloft-workspace` 的库 + `artifacts\`）本身就是普通
+  文件——换机器＝拷目录、恢复＝换回去、密钥永远由人重填（README 的「你的东西在哪」已写明）。
+  缺的是**一致快照**：运行中的库跑在 WAL 模式下，直接拷会缺数据甚至打不开，而且**不报错**。
+  计划加一个只读的 `workspace backup`（`VACUUM INTO` 导库 + 拷 `artifacts\`）；恢复**不新增动作**
+  （`daemon stop` → 换目录 → 任意一条 CLI 命令会把 daemon 拉起来）。验收判据：备份出来的库能重新
+  打开、且数据与源一致。
 
 ## 暂未实现或暂缓
 
@@ -86,7 +92,7 @@
 - RunningHub 应用市场的站内搜索、作者浏览和完整发现体验。
 - 发布渠道：**GitHub 是发布渠道，Gitee 是代码镜像**。CI（`.github/workflows/ci.yml`，push 触发）
   与 Release（`.github/workflows/release.yml`，`v*` tag 触发）都在 GitHub 上跑；Release 产出
-  NSIS 安装包 + 免安装 zip + Linux 便携包 tar.gz + `SHA256SUMS.txt`（Linux 构建失败会拦截发布）。Gitee 同步代码与 tag，但**不发 Release 附件**。
+  NSIS 安装包 + 免安装 zip + Linux 便携包 tar.gz + `SHA256SUMS.txt`（Linux 构建失败会拦截发布）。Gitee 同步代码、tag 与 Release 附件（附件由本机手动搬运，Gitee 不跑 CI）。
 
 ## 当前产品优先级
 
