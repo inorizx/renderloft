@@ -63,6 +63,14 @@
   `RenderLoft_<版本>_x64-linux.tar.gz`（三件套 + `dist/`，解压即用），CI 的 `linux-portable`
   job 从**解压出来的包**做全链路冒烟（CLI → daemon → 控制台 → MCP），防打包静默烂掉。
   Linux 不做桌面壳；密钥走系统密钥环（Secret Service）。
+- 媒体资产按**字段键**定位（根因修复）：资产的语义身份是 `(recipe revision, 字段键)`（如 `475::image`），
+  数组位置只是 HTTP 兼容编码。新导入/新追加的 revision 一律写 keyed `mediaMapping`；旧 revision 经同一
+  归一化路径继续可读；keyed revision 收到位置数组明确拒绝（`POSITIONAL_ASSETS_UNSUPPORTED`）。
+  Provider（RunningHub / ComfyUI）按字段键写入节点槽位，不再按下标或扫描工作流猜目标；
+  未知字段键/资产缺失/checksum 不符在提交前报稳定错误码（避免 scheduler 读到空字节把空文件发上去）。
+  媒体提交闭环补齐：CLI `operation run --asset '字段键=文件'`（自动上传）与 `--dry-run`（只读预检，
+  与提交共用判据、不落库不花钱）、MCP 的 `assets`（keyed 对象）与 `dryRun`（runs[] 里的 assets 此前会被
+  静默丢弃）；GUI 解除「必须连续填文件槽位」的提交限制。Agent 实操见 [`agent-cookbook.md`](agent-cookbook.md)。
 
 ## 当前进行中
 
