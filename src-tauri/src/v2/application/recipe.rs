@@ -8,6 +8,7 @@ use crate::v2::application::field_widget::{apply_field_widgets, FieldWidgetChang
 use crate::v2::domain::actor::{ActorRef, Scope};
 use crate::v2::domain::errors::{DomainResult, SafeError};
 use crate::v2::domain::ids::{ConnectionId, RecipeId, RecipeRevisionId};
+use crate::v2::domain::media::MediaMapping;
 use crate::v2::domain::model::{
     Recipe, RecipeBinding, RecipeRevision, RecipeSource, RecipeVisibility, Timestamp,
 };
@@ -136,16 +137,15 @@ fn derived_mapping_entry(key: &str) -> Option<Value> {
     Some(json!({ "node": node, "field": field }))
 }
 
-/// 下一个空闲的资产槽位（`asset-N`）。
-fn next_asset_slot(media_mapping: &BTreeMap<String, Value>) -> String {
-    let mut index = media_mapping.len();
-    loop {
-        let slot = format!("asset-{index}");
-        if !media_mapping.contains_key(&slot) {
-            return slot;
-        }
-        index += 1;
-    }
+/// 把 revision 的 `mediaMapping` 归一化成**一律 keyed**（新 revision 一律写字段键）。
+///
+/// 旧 revision 的 `asset-N` 槽位在这一步按数字序展开成字段键——语义由值里的 node/field
+/// 决定，与任何"顺序"无关（错位事故的根因就是顺序被当成了语义）。归一化失败（映射形状
+/// 坏了）必须报错：带着一张读不懂的映射往前跑，等于继续静默丢资产。
+fn keyed_media_mapping(
+    provider_config: &BTreeMap<String, Value>,
+) -> DomainResult<BTreeMap<String, Value>> {
+    Ok(MediaMapping::from_provider_config(provider_config)?.keyed_entries())
 }
 
 /// 改一个已有配方的**字段控件**（导入之后、随时）。
@@ -206,11 +206,16 @@ impl UpdateFieldWidgets {
             ));
         }
 
-        // 映射表跟着控件走：变成"文件"的字段从 `fieldMapping` 挪进 `mediaMapping`（值要走资产上传），
-        // 变回普通控件的字段把它的资产槽回收掉。**这一步才是"控件不是纯展示"的地方**。
+        // 映射表跟着控件走：变成"文件"的字段从 `fieldMapping` 挪进 `mediaMapping`（值要走
+        // 资产上传），变回普通控件的字段把它的资产槽回收掉。**这一步才是"控件不是纯展示"
+        // 的地方**。
+        //
+        // ⚠️ 两个形状规则：**先归一化**（旧 revision 的 asset-N 槽位换算成字段键），
+        // **再写 keyed**（新 revision 一律字段键）。归一化失败直接报错——读不懂的映射
+        // 不许被"跳过"，那会让资产在新 revision 里指向不存在的槽位。
         let mut provider_config = current.binding.provider_config.clone();
         let mut field_mapping = mapping_object(&provider_config, "fieldMapping");
-        let mut media_mapping = mapping_object(&provider_config, "mediaMapping");
+        let mut media_mapping = keyed_media_mapping(&provider_config)?;
         for (key, (_, is_media)) in &applied.effective {
             // 键的形状是 `<节点>::<字段>`（导入时就是这么造的），据此推出映射项。
             // 推不出来（非这类图）就当没有映射可动 —— 不猜。
@@ -218,17 +223,12 @@ impl UpdateFieldWidgets {
             if *is_media {
                 let entry = field_mapping.remove(key).or_else(|| derived.clone());
                 if let Some(entry) = entry {
-                    let slot = next_asset_slot(&media_mapping);
-                    media_mapping.insert(slot, entry);
+                    media_mapping.insert(key.clone(), entry);
                 }
             } else {
                 let Some(derived) = derived else { continue };
-                let slot = media_mapping
-                    .iter()
-                    .find(|(_, entry)| **entry == derived)
-                    .map(|(slot, _)| slot.clone());
-                if let Some(slot) = slot {
-                    media_mapping.remove(&slot);
+                // 归一化之后键就是字段键：按**键**删，不再按值去猜哪一个槽像它。
+                if media_mapping.remove(key).is_some() {
                     field_mapping.insert(key.clone(), derived);
                 }
             }
@@ -550,13 +550,19 @@ mod tests {
             config["fieldMapping"].get("6::text").is_none(),
             "不再是普通字段映射：{config:?}"
         );
+        // ⚠️ 新 revision 一律写 **keyed**（键 = 字段键）；旧 fixture 里的 `asset-0` 在
+        // 归一化时被换算成了 `17::image`（见下面反向断言），6::text 以它的键落位。
+        assert_eq!(
+            config["mediaMapping"]["6::text"],
+            json!({ "node": "6", "field": "text" }),
+            "要挪进媒体映射：{config:?}"
+        );
         assert!(
-            config["mediaMapping"]
+            !config["mediaMapping"]
                 .as_object()
-                .unwrap()
-                .values()
-                .any(|entry| entry == &json!({ "node": "6", "field": "text" })),
-            "要挪进媒体映射（槽位不能和已有的撞）：{config:?}"
+                .map(|map| map.keys().any(|key| key.starts_with("asset-")))
+                .unwrap_or(false),
+            "新 revision 不许再有位置槽键：{config:?}"
         );
         // 反向：把原本是文件的字段改回文本 ⇒ 资产槽回收、回到普通映射。
         let service = UpdateFieldWidgets::new(RecipeDependencies {
@@ -586,22 +592,54 @@ mod tests {
             "回到普通字段映射：{config:?}"
         );
         assert!(
-            !config["mediaMapping"]
-                .as_object()
-                .map(|map| map
-                    .values()
-                    .any(|entry| entry == &json!({ "node": "17", "field": "image" })))
-                .unwrap_or(false),
-            "17::image 的资产槽要回收掉：{config:?}"
-        );
-        assert!(
             config["mediaMapping"]
                 .as_object()
-                .map(|map| map
-                    .values()
-                    .any(|entry| entry == &json!({ "node": "6", "field": "text" })))
-                .unwrap_or(false),
+                .map(|map| !map.contains_key("17::image"))
+                .unwrap_or(true),
+            "17::image 的资产槽要回收掉：{config:?}"
+        );
+        assert_eq!(
+            config["mediaMapping"]["6::text"],
+            json!({ "node": "6", "field": "text" }),
             "但 6::text 仍然是文件输入，它的槽要留着：{config:?}"
+        );
+    }
+
+    /// 旧 revision（asset-N 形状）被追加新 revision 时**归一化成 keyed**：
+    /// 旧槽位与它的语义（node/field）一一对应地带过去，位置名不再出现在新 revision 里。
+    #[tokio::test]
+    async fn appending_a_revision_normalizes_legacy_slots_to_field_keys() {
+        let (repositories, recipe) = seeded_recipe().await;
+        let service = UpdateFieldWidgets::new(RecipeDependencies {
+            recipes: repositories.clone(),
+        });
+        // 只改一个**无关**字段的控件，让映射表原样被带进新 revision。
+        let updated = service
+            .execute(
+                &test_actor(),
+                recipe.id,
+                &[FieldWidgetChange {
+                    key: "6::text".to_string(),
+                    widget: "text".to_string(),
+                    options: vec![],
+                }],
+            )
+            .await
+            .expect("改控件应当成功");
+        let revision =
+            RecipeRepository::find_revision(repositories.as_ref(), updated.current_revision_id)
+                .await
+                .expect("查 revision")
+                .expect("revision 应当在");
+        let media = &revision.binding.provider_config["mediaMapping"];
+        assert_eq!(
+            media["17::image"],
+            json!({ "node": "17", "field": "image" }),
+            "旧 asset-0 槽位要归一化成 17::image：{media:?}"
+        );
+        assert!(
+            media.get("asset-0").is_none(),
+            "新 revision 里不许再有位置槽名：{media:?}"
         );
     }
 
