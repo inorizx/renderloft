@@ -41,3 +41,6 @@ opencode.jsonc
 
 # Local package store (never committed)
 .pnpm-store/
+
+# 运行期工作区（游离出来的话不该进版本库；真库在 %LOCALAPPDATA%）
+v2-workspace.db*

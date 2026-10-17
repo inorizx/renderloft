@@ -196,6 +196,20 @@ pub trait SettingsRepository: Send + Sync {
     async fn save_settings(&self, record: &SettingsRecord) -> DomainResult<()>;
 }
 
+/// 工作区**整体**的三件事：库在哪、产物缓存在哪、把库一致地导出一份。
+///
+/// 为什么值得单独一个端口：迁移/备份要的不是"某张表的数据"，而是整个工作区；而"一致的快照"
+/// 只有**握着数据库连接**的人做得到（`VACUUM INTO`，见 sqlite 实现）——直接拷文件不行。
+#[async_trait]
+pub trait WorkspaceRepository: Send + Sync {
+    /// 库文件路径（工作区目录就是它的父目录）。内存库返回 `None`。
+    fn database_path(&self) -> Option<std::path::PathBuf>;
+    /// 产物本地缓存目录。内存库返回 `None`。
+    fn artifact_dir(&self) -> Option<std::path::PathBuf>;
+    /// 把库一致地导出到 `target`（对活库用 `VACUUM INTO`，不是拷文件）。
+    async fn snapshot_database(&self, target: &std::path::Path) -> DomainResult<()>;
+}
+
 #[async_trait]
 pub trait TokenStore: Send + Sync {
     async fn create(&self, record: &ActorTokenRecord) -> DomainResult<i64>;

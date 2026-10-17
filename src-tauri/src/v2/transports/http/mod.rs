@@ -19,6 +19,7 @@ use crate::v2::application::create_operation::CreateOperation;
 use crate::v2::application::recipe_import::RecipeImportService;
 use crate::v2::application::settings::{RunningHubStatusService, SettingsService};
 use crate::v2::application::validate_operation::ValidateOperation;
+use crate::v2::application::workspace_backup::WorkspaceBackupService;
 use crate::v2::domain::actor::ActorRef;
 use crate::v2::ports::provider::DriverRegistry;
 use crate::v2::ports::repositories::{
@@ -49,6 +50,8 @@ pub struct V2HttpState {
     pub import_service: Arc<RecipeImportService>,
     /// 受限的远端 HTTP 读取（产物/结果 URL 拉取，内置 SSRF 防护）。
     pub safe_http: Arc<dyn SafeHttpClient>,
+    /// 迁移/备份：把工作区一致地导出一份（见 `application/workspace_backup.rs`）。
+    pub workspace_backup: Arc<WorkspaceBackupService>,
 }
 
 impl V2HttpState {
@@ -71,6 +74,7 @@ impl V2HttpState {
         status: Arc<RunningHubStatusService>,
         import_service: Arc<RecipeImportService>,
         safe_http: Arc<dyn SafeHttpClient>,
+        workspace_backup: Arc<WorkspaceBackupService>,
     ) -> Self {
         Self {
             tokens,
@@ -90,6 +94,7 @@ impl V2HttpState {
             status,
             import_service,
             safe_http,
+            workspace_backup,
         }
     }
 }
@@ -246,6 +251,7 @@ pub fn build_router(state: Arc<V2HttpState>) -> Router {
         .route("/api/v1/diagnostics", get(shell::diagnostics))
         .route("/api/v1/runninghub/account", get(shell::runninghub_account))
         .route("/api/v1/runninghub/queue", get(shell::runninghub_queue))
+        .route("/api/v1/workspace/backup", post(handlers::backup_workspace))
         .route("/api/v1/openapi.json", get(handlers::openapi))
         .fallback(api_not_found)
         .route_layer(middleware::from_fn_with_state(state.clone(), auth));
@@ -531,6 +537,14 @@ mod tests {
                 std::sync::Arc::new(drivers.clone()),
             ),
         );
+        // 替身库没有真库文件：它的 `snapshot_database` 只保证"目标位置会出现一个库文件"，
+        // 一致性由 `application::workspace_backup` 里那条**真库**测试钉住。
+        let workspace_backup = std::sync::Arc::new(
+            crate::v2::application::workspace_backup::WorkspaceBackupService::new(
+                std::sync::Arc::new(repositories.clone())
+                    as std::sync::Arc<dyn crate::v2::ports::repositories::WorkspaceRepository>,
+            ),
+        );
         std::sync::Arc::new(V2HttpState::new(
             std::sync::Arc::new(crate::v2::infrastructure::token_service::TokenService::new(
                 std::sync::Arc::new(repositories.clone()),
@@ -553,6 +567,7 @@ mod tests {
             std::sync::Arc::new(
                 crate::v2::infrastructure::providers::safety::ReqwestSafeHttpClient,
             ),
+            workspace_backup,
         ))
     }
 
@@ -1104,6 +1119,44 @@ mod tests {
             .is_empty(),
             "dry-run 不许落库"
         );
+    }
+
+    /// 工作区备份：**要 `settings:manage`**；被拒时**不写任何东西**，允许时给出报告。
+    ///
+    /// 替身库没有真库文件，所以这条只钉"路由 + 权限 + 报告形状"；"备份出来的库真能重新打开"
+    /// 由 `application::workspace_backup` 里那条**真库**测试钉住。
+    #[tokio::test]
+    async fn workspace_backup_requires_settings_manage_and_reports_what_landed() {
+        let (app, repositories) = test_app();
+        let target =
+            std::env::temp_dir().join(format!("renderloft-http-backup-{}", uuid::Uuid::new_v4()));
+        let body = json!({ "to": target.to_string_lossy() });
+
+        // 权限不足：403，而且目标目录**一个字都没写**。
+        let weak = issue_token(&repositories, &["diagnostics:read"]).await;
+        let (status, payload) =
+            post_json(&app, "/api/v1/workspace/backup", &weak, body.clone()).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{payload}");
+        assert_eq!(payload["error"]["code"], "SCOPE_REQUIRED");
+        assert!(!target.exists(), "被拒的请求不该写任何东西");
+
+        // 有权限：报告里要有调用方需要的事实（备份落在哪、里面有多少东西）。
+        let token = issue_token(&repositories, &["settings:manage"]).await;
+        let (status, payload) = post_json(&app, "/api/v1/workspace/backup", &token, body).await;
+        assert_eq!(status, StatusCode::OK, "{payload}");
+        assert_eq!(payload["data"]["artifactCount"], 0, "{payload}");
+        assert!(
+            payload["data"]["path"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("renderloft-http-backup-"),
+            "报告要说清备份落在哪：{payload}"
+        );
+        assert!(
+            target.join(crate::v2::daemon::V2_DB_FILE).exists(),
+            "替身也会在目标位置放一个库文件"
+        );
+        let _ = std::fs::remove_dir_all(&target);
     }
 
     /// 负对照：顶层 `assets` 与 `runs` 同时给 ⇒ **明确报错**，不落库、不上传。
@@ -1708,6 +1761,14 @@ mod tests {
                 std::sync::Arc::new(drivers.clone()),
             ),
         );
+        // 替身库没有真库文件：它的 `snapshot_database` 只保证"目标位置会出现一个库文件"，
+        // 一致性由 `application::workspace_backup` 里那条**真库**测试钉住。
+        let workspace_backup = std::sync::Arc::new(
+            crate::v2::application::workspace_backup::WorkspaceBackupService::new(
+                std::sync::Arc::new(repositories.clone())
+                    as std::sync::Arc<dyn crate::v2::ports::repositories::WorkspaceRepository>,
+            ),
+        );
         std::sync::Arc::new(V2HttpState::new(
             std::sync::Arc::new(crate::v2::infrastructure::token_service::TokenService::new(
                 std::sync::Arc::new(repositories.clone()),
@@ -1730,6 +1791,7 @@ mod tests {
             std::sync::Arc::new(
                 crate::v2::infrastructure::providers::safety::ReqwestSafeHttpClient,
             ),
+            workspace_backup,
         ))
     }
 

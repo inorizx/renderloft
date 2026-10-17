@@ -243,6 +243,10 @@ pub static GROUPS: &[Group] = &[
         name: "artifact",
         about: "产物：任务产出的文件元数据",
     },
+    Group {
+        name: "workspace",
+        about: "工作区：迁移与备份（导出一份一致的快照）",
+    },
 ];
 
 /// 参数构造器：两个通道都有、可选、无缺省。
@@ -955,6 +959,42 @@ pub static VERBS: &[Verb] = &[
                 ..opt("mimeType", Kind::Text)
             },
         ],
+    },
+    // ---------- workspace ----------
+    Verb {
+        id: "workspace.backup",
+        group: "workspace",
+        action: "backup",
+        summary: "把工作区导出一份一致的快照（迁移 / 备份）",
+        mcp_name: Some("renderloft_backup_workspace"),
+        mcp_description: Some(
+            "Write a CONSISTENT snapshot of the whole local workspace (app library, forms, field \
+             labels, task history, uploaded media, artifact cache) into a directory you choose, \
+             and report what landed there. Use it to back up, or to move to another machine. \
+             Pass an ABSOLUTE directory path on THIS machine — the MCP server is a local process \
+             and writes it itself. \
+             Three facts you need: (1) restoring has NO tool — stop the daemon (`daemon stop`), \
+             replace the workspace directory with the snapshot, then run any command and the CLI \
+             starts the daemon again; (2) API keys are NEVER in this snapshot (they live in the OS \
+             credential store), so after a move the HUMAN must re-enter them in the GUI's \
+             Connections page — do not report the migration as done until they have; (3) do NOT \
+             copy the live workspace directory yourself: its SQLite file runs in WAL mode, and a \
+             plain copy can silently lose data or end up unreadable. This tool exists because of \
+             (3).",
+        ),
+        read_only: true,
+        destructive: false,
+        idempotent: false,
+        spends_credits: false,
+        params: &[Param {
+            cli_flag: Some("to"),
+            help: "备份目录（已有一份备份的目录会被拒，不覆盖）",
+            mcp: Some(
+                "Absolute path of the directory to write the snapshot into. Refused if it already \
+                 contains a backup — pick another directory rather than overwriting.",
+            ),
+            ..req("to", Kind::Text)
+        }],
     },
 ];
 
@@ -1887,6 +1927,7 @@ pub async fn execute(
         }
         "artifact.get" => client.get_artifact(args.u64("artifactId")?).await,
         "asset.upload" => upload_asset(client, args).await,
+        "workspace.backup" => client.backup_workspace(&args.text("to")?).await,
         other => Err(argument_error(
             "UNKNOWN_VERB",
             format!("动词表里没有为 {other} 写分发（表与实现漂移了）"),
@@ -2753,6 +2794,8 @@ mod tests {
                 &["artifact", "to", "on-conflict", "name-template"],
             ),
             ("asset.upload", &["file", "filename", "mime-type"]),
+            // 后加的：迁移/备份——把工作区一致地导出一份（`--to <目录>`）。
+            ("workspace.backup", &["to"]),
         ];
         assert_eq!(
             expected.len(),
@@ -3508,9 +3551,11 @@ mod tests {
         // 不算，写密钥/关 daemon/删配方那些属于人的动作也算不进去（见上一条测试）。
         // 这个数字变了要在这里显式改一次——它是"MCP 对外承诺的工具数"，改小等于**删能力**，
         // 不该悄悄发生。
+        // 14 → 15：加了 `workspace.backup`（迁移/备份）。它是**只读**动作（不改任何状态），
+        // 所以给 AI 是对的；恢复没有对应动词（换目录是人的事），密钥也永远不在这份快照里。
         assert_eq!(
             VERBS.iter().filter(|verb| verb.mcp_name.is_some()).count(),
-            14
+            15
         );
     }
 

@@ -18,7 +18,7 @@ use crate::v2::domain::operation::{
 };
 use crate::v2::ports::repositories::{
     ConnectionRepository, EventStore, NewOperation, OperationRepository, PersistedOperation,
-    RecipeRepository, SettingsRecord, SettingsRepository,
+    RecipeRepository, SettingsRecord, SettingsRepository, WorkspaceRepository,
 };
 
 pub mod exec;
@@ -393,6 +393,35 @@ impl SqliteRepositories {
             connection: Arc::new(Mutex::new(connection)),
             artifact_dir,
         })
+    }
+}
+
+#[async_trait]
+impl WorkspaceRepository for SqliteRepositories {
+    fn database_path(&self) -> Option<std::path::PathBuf> {
+        // 连接自己知道它开在哪个文件上；内存库给 None。
+        self.connection
+            .lock()
+            .ok()
+            .and_then(|connection| connection.path().map(std::path::PathBuf::from))
+    }
+
+    fn artifact_dir(&self) -> Option<std::path::PathBuf> {
+        self.artifact_dir.clone()
+    }
+
+    async fn snapshot_database(&self, target: &std::path::Path) -> DomainResult<()> {
+        let connection = self
+            .connection
+            .lock()
+            .map_err(|_| SafeError::storage("V2 数据库锁不可用"))?;
+        // `VACUUM INTO` 是 SQLite 官方的"给活库做一份一致副本"的做法：它在一个读事务里重新
+        // 写出一份完整自洽的库文件——不像拷文件那样可能漏掉 WAL 里还没落盘的事务。
+        // 目标文件必须**不存在**（SQLite 自己也会拒绝），这与用例里的"不覆盖已有备份"是同一件事。
+        connection
+            .execute("VACUUM INTO ?1", params![target.to_string_lossy()])
+            .map_err(|error| SafeError::storage(format!("导出数据库失败：{error}")))?;
+        Ok(())
     }
 }
 

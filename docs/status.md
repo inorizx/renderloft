@@ -72,15 +72,17 @@
   与提交共用判据、不落库不花钱）、MCP 的 `assets`（keyed 对象）与 `dryRun`（runs[] 里的 assets 此前会被
   静默丢弃）；GUI 解除「必须连续填文件槽位」的提交限制。Agent 实操见 [`agent-cookbook.md`](agent-cookbook.md)。
 
+- **迁移与备份**：工作区本身就是普通文件（`%LOCALAPPDATA%\renderloft-workspace` 的库 + `artifacts\`），
+  换机器＝拷目录、恢复＝换回去；README 的「你的东西在哪」写明了路径与"密钥必须由人重填"。
+  只读动词 `workspace backup`（CLI `workspace backup --to <目录>`、MCP `renderloft_backup_workspace`）
+  用 `VACUUM INTO` 导出一份**一致**的快照并整份拷 `artifacts\`——因为运行中的 WAL 库直接拷会缺数据
+  甚至打不开，而且**不报错**。恢复**没有**对应动词（`daemon stop` → 换目录 → 任意 CLI 命令把 daemon
+  拉起来）。验收判据（备份出来的库能重新打开、数据与源一致）有**真库**测试钉住；四道校验各有负对照
+  （停用守卫后那四条测试实测变红）。界面上还没做按钮（CLI / MCP 已可用）。
+
 ## 当前进行中
 
 - 应用参数预设、批量运行和结果工作区的产品化体验。
-- **迁移与备份**：工作区（`%LOCALAPPDATA%\renderloft-workspace` 的库 + `artifacts\`）本身就是普通
-  文件——换机器＝拷目录、恢复＝换回去、密钥永远由人重填（README 的「你的东西在哪」已写明）。
-  缺的是**一致快照**：运行中的库跑在 WAL 模式下，直接拷会缺数据甚至打不开，而且**不报错**。
-  计划加一个只读的 `workspace backup`（`VACUUM INTO` 导库 + 拷 `artifacts\`）；恢复**不新增动作**
-  （`daemon stop` → 换目录 → 任意一条 CLI 命令会把 daemon 拉起来）。验收判据：备份出来的库能重新
-  打开、且数据与源一致。
 
 ## 暂未实现或暂缓
 

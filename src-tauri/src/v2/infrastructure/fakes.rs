@@ -29,7 +29,7 @@ use crate::v2::ports::repositories::{
     ActiveRun, ActorTokenRecord, AttemptResolution, CallbackDeliveryRecord,
     CallbackDeliveryRepository, ClaimedRun, ConnectionRepository, EventSpec, EventStore,
     LeaseRecord, LeaseStore, NewOperation, OperationRepository, PersistedOperation,
-    RecipeRepository, SettingsRecord, SettingsRepository, TokenStore,
+    RecipeRepository, SettingsRecord, SettingsRepository, TokenStore, WorkspaceRepository,
 };
 use crate::v2::ports::stores::{ArtifactObject, ArtifactStore};
 
@@ -1546,6 +1546,24 @@ impl crate::v2::ports::repositories::AssetRepository for InMemoryRepositories {
         let id = AssetId(state.next_asset_id);
         state.assets.insert(id, (media, bytes));
         Ok(id)
+    }
+}
+
+#[async_trait]
+impl WorkspaceRepository for InMemoryRepositories {
+    fn database_path(&self) -> Option<std::path::PathBuf> {
+        None
+    }
+
+    fn artifact_dir(&self) -> Option<std::path::PathBuf> {
+        None
+    }
+
+    /// 替身只保证"目标位置会出现一个库文件"，**不保证内容**——一致性由 sqlite 那条真测试钉住
+    /// （`workspace_backup::tests` 里用真实文件库跑 `VACUUM INTO`，再把备份打开来读）。
+    async fn snapshot_database(&self, target: &std::path::Path) -> DomainResult<()> {
+        std::fs::write(target, b"")
+            .map_err(|error| SafeError::storage(format!("写入替身快照失败：{error}")))
     }
 }
 
