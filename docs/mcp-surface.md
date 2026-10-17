@@ -35,6 +35,14 @@
 ### 1.1 已成立、不再讨论的两条
 
 1. `initialize.instructions` **已经接好了**（`mcp.rs` 的 `initialize` / `server/discover` 两个分支 返回 `verbs::MCP_IDENTITY`）—— 这是 A2 的对价，已经付了。
+
+   **那 agent 怎么知道这个 MCP 是干嘛的？** 常驻文本的**第一句**就是身份与触发条件：
+
+   > RenderLoft — a local workbench that runs the user's own image/video generation apps on their own cloud platform accounts (RunningHub / ComfyUI), tracks the tasks in the background, and collects the resulting files. **Use it when** the user asks to generate, edit, restyle, upscale or batch images/videos — or to see which apps (recipes) they have, what a task cost, or where its outputs went. Runs spend the user's own credits: **[COST]** marks the verbs that charge their account, **[IRREVERSIBLE]** the ones that cannot be undone.
+
+   同一句也放在 MCP 的 `initialize.instructions` 里（协议里专门放"这个 server 是干嘛的"字段）。**为什么必须说**：元层把自带领域暗示的工具名（`renderloft_run_recipe`）换成了中立的调用口，于是"这是什么"就没有别的地方可放了——**不可见就等于不存在**。
+
+   对你的实际意义：**没在干这活的时候，它对 agent 的判断与上下文的干扰很小** —— 而"这个动词花钱 / 会破坏东西"这类风险档，就写在常驻索引的那一行上，**首行固定 ASCII 前缀**（`[COST] operation.run — 提交任务`）——不是写进句子里，也不是靠一个容易看漏的符号。
 2. "挑应用"的三步流程本来就是渐进式：`recipe.list` → `recipe.describe` → `recipe.run`。这是**泛化动词 over 数据空间**（A7）＋ schema 按需取，形状是对的；工具数是 **O(能力) 不是 O(内容)**（导入 500 个应用，动词仍是常数个）。
 
 ### 1.2 本文档自身的两处更正（写"漂移"的文档先漂了两处）
@@ -62,6 +70,21 @@
 另：14 条描述之间的 8-gram 冗余 ≈ 0% —— 跨动词重复**只存在于一处**（`call` ↔ `operation.run`）。所以 §D 的收益就是这 776 字符，不是"搬家顺带省很多"；D 的真正作用是**防重复**（同一条规矩写 N 遍 = O(N) 常驻）。
 
 （口径：从 `VERBS` 表读渲染字符串统计，schema 按每参数 40 字符骨架粗估。要复核就跑脚本，别信手抄。）
+
+#### 1.3.1 今天的形状：量出来的常驻账单
+
+上表是**设计期的估算**。今天的形状可以直接量——`node scripts/mcp-cost.mjs`（先
+`cargo build --bin renderloft-mcp`；脚本驱动真的 `renderloft-mcp.exe`，只读、不花钱）：
+
+| | ≈ token | 占 128k 上下文 |
+|---|---|---|
+| **现状常驻**：`instructions` 246 ＋ 两个工具 855 | **≈1 100** | 0.86% |
+| 若把这 14 个动词平铺成原生工具（常驻） | ≈3 270 | 2.55% |
+| **省下** | **≈2 200** | — |
+| 索引本身（按需取，**不进常驻**） | ≈3 280 | — |
+
+> ⚠️ **改了描述或标记之后必须重跑那个脚本**——手抄的数字会漂，实测过。
+> 它同时是"索引常驻、schema 按需"这条决定的**可证伪账单**：数字变坏就是形状变坏了。
 
 ---
 

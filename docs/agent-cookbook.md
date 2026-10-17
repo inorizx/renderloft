@@ -95,6 +95,7 @@ renderloft_call { "verb": "operation.run", "args": {
 ```
 
 > 只传你想传的槽位：`{475::image, 520::image}` 只会落这两个；其它槽位保持工作流默认。
+> **键就是地址**——位置由上游节点顺序决定，**位置不是语义**。
 
 ---
 
@@ -114,7 +115,7 @@ renderloft_call { "verb": "operation.run", "args": {
 } }
 ```
 
-CLI 一次一个任务；批量走 MCP 的 `runs`（或 GUI 的批量页）。`clientRunId` 是你的对齐锚，
+CLI 一次一个任务；批量走 MCP 的 `runs`（或 GUI 运行页的「批量运行」模式）。`clientRunId` 是你的对齐锚，
 不依赖返回顺序。
 
 ---
@@ -132,9 +133,12 @@ renderloft_call { "verb": "operation.run", "args": {
   "callbackUrl": "https://your-receiver.example/hook" } }
 ```
 
-任务进终态时 daemon 会 POST 一份快照（`{operationId, status, runs:[…]}`），失败按退避重试。
-地址必须 https，或回环地址的 http。**不要**在 `operation.wait` 里等几分钟——那会占住 MCP
-客户端唯一的请求通道。
+任务进终态时 daemon 会 POST 一份快照（`{operationId, status, runs:[…]}`），失败按退避重试，
+投递记录留在库里。地址必须 https，或回环地址的 http。**不要**在 `operation.wait` 里等几分钟——
+那会占住 MCP 客户端唯一的请求通道。
+
+> 接收端怎么写、怎么用 HMAC-SHA256 验签（`X-RenderLoft-Signature`）、没收到怎么排查：
+> 见 [`callbacks.md`](callbacks.md)。
 
 ---
 
@@ -168,6 +172,8 @@ renderloft_call { "verb": "operation.run", "args": {
 | 提交"成功"但图是空的/默认图 | assetId 塞进了 `inputs`（schema 媒体字段 format 是 `"file"`，不是 `"asset"`） | 放进 `assets`，键 = 字段键 |
 | 图错位（第二格变成了上游的第 4 个槽） | 按**数组位置**猜字段（`assets:[a,b]` 里的第 2 个并不对应界面的第 2 格） | 用字段键；位置数组只在旧 revision 的兼容路径里被换算，新 revision 直接拒绝（`POSITIONAL_ASSETS_UNSUPPORTED`） |
 | `ASSET_FIELD_UNKNOWN` | 字段键写错（不在该 revision 的媒体字段集合里） | `recipe describe` 后逐个核对键 |
+| `ASSET_COUNT_EXCEEDED` | 走旧的位置数组，且多给了槽位 | 位置数组只是给老客户端/老版本的兼容编码；新提交一律用字段键 |
+| `ASSETS_NOT_ALLOWED_WITH_RUNS` | 顶层 `assets` 与 `runs` 同时给了 | 那是两种写法：批量每一行的资产写在该行自己的 `runs[i].assets` 里。歧义不猜，宁可报错也不静默丢一份 |
 | `ASSET_NOT_FOUND` / `ASSET_CHECKSUM_MISMATCH` | assetId 不存在、或 checksum 不是该资产的 | 用 `asset.upload` 原样返回的 `assetId`+`checksum` |
 | 上游报错但看不出哪个字段 | 只看错误、不看提交的 `inputs` | `operation.get` 回执里带提交时的 inputs；一起读 |
 
@@ -176,8 +182,156 @@ renderloft_call { "verb": "operation.run", "args": {
 ## 7. 边界与事实
 
 - **字段键 =（recipe revision, `<节点>::<字段>`）**，这是资产的真实身份；数组位置只是旧传输
-  编码，内部一律先换算成字段键再用。
+  编码（HTTP 上写作 `asset-N` 的位置数组，只给老客户端/老 revision 兼容），内部一律先换算成
+  字段键再用。
 - RenderLoft **不解释**上游槽位的含义（「图1」是上游文案）；不改上游语义、不重排字段。
 - 上传不计费；**提交计费**（RunningHub 每个 run 单独计费）。预检不花钱。
 - 自主调用方（MCP）有并发上限（按 Operation 计），铺开大量小调用不如一个 `runs` 批量。
-- 更细的协议细节（错误信封、签名、分页、截断）见 `docs/mcp-surface.md` 与 README。
+- **回执也是有界的**：列表超过 20 条会截断（上限 20 条 / 64KB），并**明说**"共多少、只给了多少、
+  怎么拿更多"——**绝不悄悄丢**（悄悄截断比不截断更坏：模型会以为看到的就是全部）。
+  要翻页就传 `limit` / `after`：`operation.list` 与 `artifact.list` 都支持（CLI 上就是
+  `operation list` / `artifact list` 的 `--limit` / `--after`）。
+- 更细的协议细节（错误信封、分页、截断）见 [`mcp-surface.md`](mcp-surface.md)；
+  回调与验签见 [`callbacks.md`](callbacks.md)；CLI 的完整旗标表见 §10
+  （MCP 那侧用 `renderloft_catalog` 取每个动词的完整 schema）。
+
+---
+
+## 8. 产物落盘：完整规则
+
+`artifact list` 里 `byteSize` 为 0 的产物，**字节还在平台上**（中转站定位，不落本地）——
+用这一条按需拉下来：
+
+```powershell
+renderloft-cli artifact download --artifact 999002000 --to D:\pics\        # 给目录（不存在会建）
+renderloft-cli artifact download --artifact 999002000 --to D:\pics\cat.png # 或指定文件
+```
+
+**文件名一律照抄平台给的**（浏览器、`curl -O`、`wget` 都不改名）。但**往一个目录里收一批**时会撞名：
+RunningHub 按输出节点命名，同一个应用的每个 run 都产出 `870.png`。所以目录落点带冲突策略——
+默认 `rename`，加序号（`870.png` → `870 (1).png`，与浏览器 / yt-dlp 同形），并在输出里说明改存到哪：
+
+```powershell
+renderloft-cli artifact download --artifact 999002001 --to D:\pics\                    # 默认 rename
+renderloft-cli artifact download --artifact 999002001 --to D:\pics\ --on-conflict skip # 收过就不动
+renderloft-cli artifact download --artifact 999002001 --to D:\pics\ --on-conflict overwrite
+```
+
+- `--to <文件>` 是**显式落点**：你说了算，照写（与 `curl -o` 一致）；
+- `--to <目录>` 是"你帮我决定名字"，所以由动词兜底。**静默覆盖是最坏的一种**——它不报错，
+  事后只能靠翻目录发现少了几张；
+- 不给 `--to` = 当前目录 + 产物原名。
+
+**想自己定名字就 `--name-template`**（对应 yt-dlp 的 `-o`）——占位符只有两个，都来自产物元数据：
+
+```powershell
+renderloft-cli artifact download --artifact 999002001 --to D:\pics\ --name-template "{artifactId}/{filename}"
+#   → D:\pics\999002001\870.png        （一个产物一个子目录：不污染文件名，也不会撞）
+renderloft-cli artifact download --artifact 999002001 --to D:\pics\ --name-template "{artifactId}-{filename}"
+#   → D:\pics\999002001-870.png        （前缀就是 id，随时能回查）
+```
+
+> 为什么只给 `{artifactId}` / `{filename}`：模板是"把已有的事实换个排法"，不是"生成新信息"。
+> `{date}` 这类会让同一条命令在不同时刻产生不同结果。模板必须是 `--to` 目录内的**相对路径**
+> （可含子目录）——绝对路径与 `..` 一律当场拒绝，否则"往哪写"就不再由你决定了。
+
+**同一个 run 内的产物名保证互不相同**（`870.png` → `870-2.png`）：RunningHub 按输出节点命名，
+一个节点吐多张图时会撞，而那是两条不同的记录——不区分开就没法认哪张是哪张。跨 run 重名是正常的
+（同一个应用每次跑都产出 `870.png`），那由上面的落点策略管。
+
+两个实测出来的坑：
+
+- `operation list` 给的是**摘要**（没有 `runs`），要按 runId 找产物得逐个 `operation get`；
+- 文件名可能是 `.png` 而**实际字节是 JPEG**（我们就遇到了）——看图软件一般不在乎，但严格按扩展名
+  解析的工具会在意。它和上面那条撞名不同：**字节类型是平台说了算，名字的冲突是"我们把它收进一个
+  目录"造成的**，所以后者由我们兜底。
+
+---
+
+## 9. 定时收产物（不写接收端也能闭环）
+
+不想写接收端、也不想挂着 daemon 等通知？仓库里带了一个示例脚本，它只调 CLI：
+
+```powershell
+node scripts\collect-artifacts.mjs --to D:\pics     # 收"已结束任务"里还没收过的产物
+```
+
+它把收过的记在 `D:\pics\.collected.json`，重复跑不会重复下载；每轮结果追加在 `D:\pics\.collect.log`
+（**后台任务不能是哑的**——挂上任务计划后 stdout 没人看，日志是排查"为什么没收到图"的唯一线索）；
+挂到任务计划就是全自动：
+
+```powershell
+schtasks /create /tn RenderLoft收图 /sc minute /mo 10 ^
+  /tr "node D:\path\to\collect-artifacts.mjs --to D:\pics --only-if-running"
+```
+
+> `--only-if-running`：daemon 没在跑就跳过。不加的话，普通动词会顺手把 daemon 启动
+> （"启动但不拥有"），于是一个每 10 分钟跑一次的后台任务会把你**手动停掉**的 daemon 反复拉活
+> ——那不是它该管的事。`daemon` 那一组（`status` / `stop`）**不自动拉起**，脚本问的就是 `daemon status`。
+
+---
+
+## 10. CLI 旗标表（完整）
+
+`renderloft-cli <组> <动词> --help` 看参数。全部动词与旗标：
+
+| 动词 | 旗标 |
+|---|---|
+| `connection list` | — |
+| `connection models` | `--connection <id>` |
+| `connection set-key` | `--connection <id>` · `--from-file <文件>`（值只从文件读）· `[--force]`（默认拒绝覆盖） |
+| `daemon status` | — |
+| `daemon stop` | — |
+| `callback set-secret` | `--from-file <文件>` · `[--force]` |
+| `callback status` | — |
+| `callback clear-secret` | — |
+| `recipe list` | `[--limit <1-200>]`（缺省 50）· `[--removed]`（列回收站） |
+| `recipe describe` | `--recipe <id>` |
+| `recipe import` | `--connection <id>` · `--source <链接或 ID>` |
+| `recipe import-workflow` | `--connection <id>` · `--source <链接或 ID>` · `[--name <名字>]` |
+| `recipe remove` | `--recipe <id>` |
+| `recipe restore` | `--recipe <id>` |
+| `operation list` | `[--limit <1-200>]`（缺省 50）· `[--after <id>]`（游标：只看更早的） |
+| `operation run` | `--recipe-revision <id>` · `[--input <JSON 文件>]` · `[--asset '<字段键>=<文件>']`（可重复）· `[--dry-run]` · `[--idempotency-key <键>]` · `[--callback-url <地址>]` |
+| `operation get` | `--operation <id>` |
+| `operation wait` | `--operation <id>` · `[--interval <1-60 秒>]`（缺省 5）· `[--timeout <秒>]`（缺省 0 = 一直等） |
+| `operation cancel` | `--operation <id>` |
+| `artifact list` | `[--limit <1-200>]`（缺省 50）· `[--after <id>]` |
+| `artifact get` | `--artifact <id>` |
+| `artifact download` | `--artifact <id>` · `[--to <文件或目录>]` · `[--on-conflict rename\|skip\|overwrite]`（缺省 rename）· `[--name-template <模板>]` |
+| `asset upload` | `--file <本机文件>` · `[--filename <名字>]` · `[--mime-type <类型>]` |
+
+> 批量只有 MCP 有（`runs`，每行单独计费、上限 100）：**CLI 一次提交一个任务**。见 §3 与 §7。
+
+几条 CLI 的机制：
+
+- **PATH**：安装包会把安装目录加进**用户 PATH**（卸载时自动移除），装完开一个**新**终端即可；
+  免安装 zip 不改 PATH，用解压目录里的全路径（`& "D:\你解压的位置\renderloft-cli.exe" recipe list`）。
+- **`--input` 是 JSON 文件**，内容要匹配该应用的 schema；**文件不要带 BOM**
+  （用 `Set-Content -Encoding utf8NoBOM` 或直接写）。
+- **退出码与输出流**：成功时信封走 **stdout**、退出码 **0**；失败时信封走 **stderr**、退出码 **1**。
+  所以在任务计划里 `if ($LASTEXITCODE -ne 0) { 报警 }` 是有效的，`> result.json` 也不会把错误混进去。
+- **daemon 没在跑也没关系**：CLI 会自己把旁边的 `renderloft.exe` 拉起来（**只启动，不拥有**——
+  它不会替你关掉 daemon，也不会改你的环境变量）。冷启动约 **0.6 秒**，之后每次调用约 **70 毫秒**。
+  `daemon status` / `daemon stop` 是例外：它们**不自动拉起**（问"它在不在"却先把它启动起来是自相矛盾的）。
+- **`--idempotency-key`**：同键同请求会重放原来的任务，而不是再花一次钱。
+- **`--asset` 的字段键**（`475::image` 这样的 `节点::字段`）见 §0 与 §2；
+  字段键错了会明确报 `ASSET_FIELD_UNKNOWN`，不会静默丢。
+
+典型的"跑一次并拿到结果"：
+
+```powershell
+renderloft-cli recipe list                            # 拿 recipeId 与 defaultConnectionId
+renderloft-cli recipe describe --recipe 1             # 拿 currentRevisionId 与字段 schema
+renderloft-cli operation run --recipe-revision 1 --input cat.json --idempotency-key daily-2026-10-09
+renderloft-cli operation run --recipe-revision 1 --input attrs.json --asset '475::image=person.png'   # 带图（先上传后提交）
+renderloft-cli operation wait --operation 70 --interval 5 --timeout 600
+renderloft-cli artifact list                          # 产物（byteSize 0 = 字节还在平台上，不是空文件）
+```
+
+因为是普通的命令行程序，它也能被任何调度器调用——例如「每天 9 点生成一张」用 Windows 任务计划即可。
+
+> **只给 CLI、不给 AI 的动词**（动词表里 `mcp_name: None`，MCP 那侧没有对应工具）：
+> `connection set-key` · `daemon status` · `daemon stop` · `callback set-secret` · `callback status` ·
+> `callback clear-secret` · `recipe remove` · `recipe restore` · `artifact download`。
+> 它们碰的是「谁能跑什么」这条授权边界本身，或者往磁盘任意路径写文件——而 AI 正受这条边界约束。

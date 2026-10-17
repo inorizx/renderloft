@@ -1,6 +1,6 @@
 // 收图脚本 —— **给用户的示例，不是构建工具**。
 //
-// 异步闭环里"任务跑完了"这一跳有两种做法：daemon 主动 POST（webhook，见 README 的验签一节），
+// 异步闭环里"任务跑完了"这一跳有两种做法：daemon 主动 POST（webhook，见 docs/callbacks.md），
 // 或者你这边**定时来收**（本脚本）。后者不需要中间人、不需要常驻进程，Windows 任务计划里挂一条
 // 就够了——这是"从通知到东西到手"最省事的做法。
 //
@@ -70,7 +70,8 @@ const reported = new Set(previous.reportedFailures ?? [])
 // 定时跑的时候用 `--only-if-running`：daemon 没在跑就跳过，**别把它拉起来**。
 // 理由：`operation list` 这类普通动词会在 daemon 不在时把它启动（"启动但不拥有"），
 // 而一个每 10 分钟跑一次的后台任务因此会把你**手动停掉**的 daemon 反复拉活——那不是它该管的事。
-// `daemon status` 恰好是唯一不自动拉起的动词（见 README），所以这里问它。
+// `daemon` 组的动词（`status` / `stop`）是**唯一不自动拉起 daemon** 的（动词表见
+// docs/agent-cookbook.md），所以这里问它。
 if (options.onlyIfRunning) {
   const status = runCli(options.cli, ['daemon', 'status'])
   if (status.running !== true) {

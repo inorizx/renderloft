@@ -7,7 +7,16 @@
 
 ![应用库](docs/screenshots/library.jpg)
 
-它不是画图工具（它不生成图，它让**别的机器**去生成），不是云平台（连接、密钥、历史、产物都在你自己的机器上），也不是「内置了一个 AI」——它是**接口**。
+它不是画图工具（它不生成图，它让**别的机器**去生成），不是云平台（连接、密钥、历史、产物都在你自己的机器上），不是「内置了一个 AI」（也不用 LLM 才能用），不是 ComfyUI 的节点编辑器（工作流还在你自己的 ComfyUI 里搭），不是 RunningHub 的替代平台或市场镜像（应用与工作流仍归平台和作者），不是模型训练平台，也不是让模型任意访问网络和本地文件的通用 Agent——它是**接口**。
+
+**给谁用**：
+
+- **普通用户**：连上平台、导入一个应用，填参数就出图。
+- **ComfyUI 用户**：把已经搭好的工作流变成可复用的应用，再批量跑。
+- **开发者与自动化**：用 CLI 把它接进自己的脚本与调度器。
+- **外部 AI**：通过 MCP 发现并调用你配置好的应用（怎么编排由它自己决定）。
+
+**表单路径始终是第一公民——即使没有 LLM，也能直接运行应用。**
 
 ## 现在能连什么
 
@@ -118,169 +127,30 @@ pnpm smoke:linux   # （可选）从解压包全链路自检：CLI → daemon �
 
 ## 用 AI 驱动它（可选）
 
-RenderLoft 自带一个 MCP 服务器（stdio），把本机 daemon 的能力暴露给任何 MCP 客户端。**它对外只有两个工具**：
+RenderLoft 自带一个 MCP 服务器（stdio），把本机 daemon 的能力暴露给任何 MCP 客户端。**它对外只有两个工具**：`renderloft_catalog`（看能做什么：给一个 verb id 就返回那个动词的完整 schema 与语义）与 `renderloft_call`（调用，`{"verb": "operation.run", "args": {...}}`）。
 
-```
-renderloft_catalog          看能做什么（索引；给一个 verb id 就返回那个动词的完整 schema 与语义）
-renderloft_call             调用：{"verb": "operation.run", "args": {...}}
-```
-
-为什么只有两个：模型每一轮都要重新从文本里推出"我能做什么"，所以**索引必须常驻**（否则能力等于不存在）；但"怎么调"（完整描述 + schema）**用到才要**。扁平列表把两件事混在一起——它把"怎么调"对每一个能力、每一轮都付一遍。
-
-**这两个数字是量出来的，不是估的**（`node scripts/mcp-cost.mjs`，驱动真的 `renderloft-mcp.exe`，只读、不花钱）：现在**常驻 ≈1,100 tokens**（`instructions` 246 + 两个工具 855，占 128k 上下文的 0.86%）；若把这 14 个动词平铺成原生工具，**常驻 ≈3,270 tokens**（2.55%）——**省下约 2,200 tokens**。索引本身 ≈3,280 tokens，按需取、不进常驻。想复量就自己跑那个脚本（改了描述或标记之后**必须**重跑——手抄的数字会漂，实测过）。
-
-> 这套形状的完整推导（公理 → 设计律 → 物理边界 → 可证伪的判据），以及"元层该不该继续当自动化入口"这个**尚未决定**的岔路，写在 [`docs/mcp-surface.md`](docs/mcp-surface.md)。
-
-**那 agent 怎么知道这个 MCP 是干嘛的？** 常驻文本的**第一句**就是身份与触发条件：
-
-> RenderLoft — a local workbench that runs the user's own image/video generation apps on their own cloud platform accounts (RunningHub / ComfyUI), tracks the tasks in the background, and collects the resulting files. **Use it when** the user asks to generate, edit, restyle, upscale or batch images/videos — or to see which apps (recipes) they have, what a task cost, or where its outputs went. Runs spend the user's own credits: **[COST]** marks the verbs that charge their account, **[IRREVERSIBLE]** the ones that cannot be undone.
-
-同一句也放在 MCP 的 `initialize.instructions` 里（协议里专门放"这个 server 是干嘛的"字段）。**为什么必须说**：元层把自带领域暗示的工具名（`renderloft_run_recipe`）换成了中立的调用口，于是"这是什么"就没有别的地方可放了——**不可见就等于不存在**。
-
-对你的实际意义：**没在干这活的时候，它对 agent 的判断与上下文的干扰很小** ✓ —— 而"这个动词花钱 / 会破坏东西"这类风险档，就写在常驻索引的那一行上，**首行固定 ASCII 前缀**（`[COST] operation.run — 提交任务`）——不是写进句子里，也不是靠一个容易看漏的符号（这类标记有测试钉着"标记集合 == 动词表"，漏一行就红）。
-
-**服务端已经在强制的上限，都写在协议地板上**（不是只写在说明文字里）：单次调用最多 100 个 Run（**每条单独计费**，落成参数 schema 的 `maxItems`）、自主调用方（MCP）并发 ≤4、列表回执截断 20 条 / 64KB——三档数字直接取自执行它们的常量，`instructions` 里同步报一遍。
-
-**回执也是有界的**（输入侧管"每轮付多少"，输出侧管"一次调用能灌进多少"）：列表超过 20 条会截断，并**明说**"共多少、只给了多少、怎么拿更多"——**绝不悄悄丢**（悄悄截断比不截断更坏：模型会以为看到的就是全部）。要翻页就传 `limit` / `after`（`artifact.list`、`operation.list` 都支持）。
-
-**刻意不给 AI 的动词不在索引里，也调不到**（元层会拒绝）：写密钥、关 daemon、往磁盘写文件、建连接——它们属于人的动作。这条有测试钉着（负对照：把拒绝删掉 ⇒ 红）。
-
-在你的 MCP 客户端配置里指向 `renderloft-mcp.exe` 即可。**它和界面是同一个安装包里的同一个目录**（安装版默认在 `%LOCALAPPDATA%\RenderLoft`），不需要单独下载：
+在你的 MCP 客户端配置里指向 `renderloft-mcp.exe` 即可——**它和界面是同一个安装包里的同一个目录**（安装版默认在 `%LOCALAPPDATA%\RenderLoft`），不需要单独下载；免安装 zip 与 Linux 便携包里就是解压目录里的那个（Linux 无 `.exe` 后缀）：
 
 ```json
-{
-  "mcpServers": {
-    "renderloft": { "command": "C:\\Users\\<你>\\AppData\\Local\\RenderLoft\\renderloft-mcp.exe" }
-  }
-}
+{ "mcpServers": { "renderloft": { "command": "C:\\Users\\<你>\\AppData\\Local\\RenderLoft\\renderloft-mcp.exe" } } }
 ```
 
-> 自己编译的话路径是 `<仓库路径>\src-tauri\target\release\renderloft-mcp.exe`；用免安装 zip 的话就是解压目录里的那个；**Linux 便携包里是解压目录里的 `renderloft-mcp`**（无 `.exe` 后缀）。
-> `renderloft-mcp.exe` 是 **stdio 服务**：由 MCP 客户端按需拉起，不用常驻。它连的 daemon 如果没在跑，**它会自己把旁边的 `renderloft.exe` 拉起来**（CLI 也一样）——所以不必先打开界面。
+> `renderloft-mcp.exe` 是 **stdio 服务**：由 MCP 客户端按需拉起，不用常驻；自己编译的话路径是 `<仓库路径>\src-tauri\target\release\renderloft-mcp.exe`。它连的 daemon 如果没在跑，**它会自己把旁边的 `renderloft.exe` 拉起来**（CLI 也一样）——所以不必先打开界面。
 
-然后就能直接说：
+然后就能直接说「用 Krea2-turbo 画一只在草地上的猫，等它完成，把图给我」——它背后走的是 `catalog → call(recipe.list) → call(recipe.describe) → call(operation.run)`，**不需要你解释字段是什么意思**，因为备注名已经写在 schema 里了。
 
-> 用 Krea2-turbo 画一只在草地上的猫，等它完成，把图给我。
+**刻意不给 AI 的动词不在索引里，也调不到**（元层会拒绝）：写密钥、写备注名、建/删连接、关 daemon、往磁盘写文件——它们属于人的动作，改的是「谁能跑什么」这条授权边界本身。
 
-它背后走的是 `catalog → call(recipe.list) → call(recipe.describe) → call(operation.run)`——**不需要你解释字段是什么意思**，因为备注名已经写在 schema 里了。
+> **带图提交、批量、回调、dry-run、分页与常见坑**：[`docs/agent-cookbook.md`](docs/agent-cookbook.md)。
+> **这套工具面的完整推导**（公理 → 设计律 → 物理边界 → 可证伪的判据、常驻 token 账单，以及"元层该不该继续当自动化入口"这个**尚未决定**的岔路）：[`docs/mcp-surface.md`](docs/mcp-surface.md)。
 
-**带图的配方（换装、图生图这类）**：媒体字段在 schema 里是 `format: "file"`，提交时把资产放进
-`runs[].assets`，**键 = 字段键**（`475::image` 这样的 `节点::字段`，`recipe describe` 里就有）——
-不是放进 `inputs`，也不是按数组位置排（位置由上游节点顺序决定，**位置不是语义**）。CLI 里一条
-`--asset '475::image=person.png'` 就替你把上传做了。完整的两版写法（CLI / MCP）、批量、回调、
-dry-run 与常见坑，都在 **[`docs/agent-cookbook.md`](docs/agent-cookbook.md)**。
+## 产物怎么拿到手
 
-提交前想先验证形状（不花钱）：任何 `operation run` 都支持 `--dry-run` / `dryRun: true`——
-等价于一次不落库、不调上游的预检。
+产物落在**下载目录**（「服务配置」里可改，默认是系统下载目录）；**文件名照抄平台给的**，往一个目录里收一批时重名按浏览器口径递增（`870.png` → `870 (1).png`），不覆盖你已有的文件；任务完成的通知上点「在文件夹中显示」，会打开下载目录并选中那个文件。
 
-**长任务别在工具调用里等。** MCP 的工具调用是请求/响应：`operation.wait` 等太久会把客户端那条通道占住（实测过一次，后面的调用全部排队超时）。要"提交完就走、跑完通知我"，就在提交时给一个回调地址：
+`byteSize` 为 0 的产物**字节还在平台上**（中转站定位，不落本地）——用这一条按需拉下来：`renderloft-cli artifact download --artifact 999002000 --to D:\pics\`（给目录，不存在会建）或 `--to D:\pics\cat.png`（指定文件）。
 
-```powershell
-renderloft-cli operation run --recipe-revision 1 --input cat.json --callback-url http://127.0.0.1:8787/hook
-```
-
-任务进终态时，daemon 会 POST 一份快照过去（失败按退避重试，投递记录留在库里）：
-
-```json
-{ "operationId": 73, "status": "SUCCEEDED",
-  "runs": [ { "runId": 77, "status": "SUCCEEDED", "clientRunId": "run-b6f50adf…" } ] }
-```
-
-地址必须是 **https**，或**回环地址的 http**（`127.0.0.1` / `localhost` / `[::1]`）——本地接收端不用造证书；内网与公网地址只收 https。
-
-### 验签（接收端怎么确认"这确实来自我的 RenderLoft"）
-
-自己生成一串随机密钥，两边填同一个值——**它只进不出**：RenderLoft 只写不读（读回来只有"配没配"）。
-
-```powershell
-# 你自己生成（例：32 字节随机），填进接收端，再交给 RenderLoft
-renderloft-cli callback set-secret --from-file .\callback-key.txt   # 值只从文件读，不进命令行
-renderloft-cli callback status                                      # {"configured": true}
-renderloft-cli callback clear-secret                                # 关掉签名（想换密钥时先清再设）
-```
-
-配上之后，每次投递都带这个头：
-
-```text
-X-RenderLoft-Signature: t=1791609031058,v1=<hex>
-```
-
-接收端按这个契约验（**顺序别弄反**）：
-
-1. 取 `t`（毫秒时间戳）与 `v1`（十六进制签名）；
-2. 用同一个密钥，对 **`"{t}.{请求体的原始字节}"`** 算 HMAC-SHA256；
-3. 与 `v1` 比较（常数时间比较），并拒绝太旧的 `t`（防重放，窗口多大你自己定）。
-
-> 为什么签的是"原始字节"：签名那头用的是同一份序列化结果，所以两边逐字节一致。
-> 这也意味着**别在中间重新序列化 body**（换键序、加空格都会验不过）。
-
-没配密钥就**不带**这个头——宁可不签，也不签一个假的。所以"要不要验签"由你的接收端决定：**看到头就必须验，验不过就拒收**。
-
-### 产物怎么拿到手
-
-`artifact list` 里 `byteSize` 为 0 的产物，**字节还在平台上**（中转站定位，不落本地）——用这一条按需拉下来：
-
-```powershell
-renderloft-cli artifact download --artifact 999002000 --to D:\pics\        # 给目录（不存在会建）
-renderloft-cli artifact download --artifact 999002000 --to D:\pics\cat.png # 或指定文件
-```
-
-**文件名一律照抄平台给的**（浏览器、`curl -O`、`wget` 都不改名）。但**往一个目录里收一批**时会撞名：
-RunningHub 按输出节点命名，同一个应用的每个 run 都产出 `870.png`。所以目录落点带冲突策略——
-默认 `rename`，加序号（`870.png` → `870 (1).png`，与浏览器 / yt-dlp 同形），并在输出里说明改存到哪：
-
-```powershell
-renderloft-cli artifact download --artifact 999002001 --to D:\pics\                    # 默认 rename
-renderloft-cli artifact download --artifact 999002001 --to D:\pics\ --on-conflict skip # 收过就不动
-renderloft-cli artifact download --artifact 999002001 --to D:\pics\ --on-conflict overwrite
-```
-
-> `--to <文件>` 是**显式落点**：你说了算，照写（与 `curl -o` 一致）；`--to <目录>` 是"你帮我决定名字"，
-> 所以由动词兜底。**静默覆盖是最坏的一种**——它不报错，事后只能靠翻目录发现少了几张。
-
-**想自己定名字就 `--name-template`**（对应 yt-dlp 的 `-o`）——占位符只有两个，都来自产物元数据：
-
-```powershell
-renderloft-cli artifact download --artifact 999002001 --to D:\pics\ --name-template "{artifactId}/{filename}"
-#   → D:\pics\999002001\870.png        （一个产物一个子目录：不污染文件名，也不会撞）
-renderloft-cli artifact download --artifact 999002001 --to D:\pics\ --name-template "{artifactId}-{filename}"
-#   → D:\pics\999002001-870.png        （前缀就是 id，随时能回查）
-```
-
-> 为什么只给 `{artifactId}` / `{filename}`：模板是"把已有的事实换个排法"，不是"生成新信息"。
-> `{date}` 这类会让同一条命令在不同时刻产生不同结果。模板必须是 `--to` 目录内的**相对路径**
-> （可含子目录）——绝对路径与 `..` 一律当场拒绝，否则"往哪写"就不再由你决定了。
-
-**同一个 run 内的产物名保证互不相同**（`870.png` → `870-2.png`）：RunningHub 按输出节点命名，
-一个节点吐多张图时会撞，而那是两条不同的记录——不区分开就没法认哪张是哪张。跨 run 重名是正常的
-（同一个应用每次跑都产出 `870.png`），那由上面的落点策略管。
-
-不想写接收端、也不想挂着 daemon 等通知？那就**定时来收**——仓库里带了一个示例脚本，它只调 CLI：
-
-```powershell
-node scripts\collect-artifacts.mjs --to D:\pics     # 收"已结束任务"里还没收过的产物
-```
-
-它把收过的记在 `D:\pics\.collected.json`，重复跑不会重复下载；每轮结果追加在 `D:\pics\.collect.log`
-（**后台任务不能是哑的**——挂上任务计划后 stdout 没人看，日志是排查"为什么没收到图"的唯一线索）；挂到任务计划就是全自动：
-
-```powershell
-schtasks /create /tn RenderLoft收图 /sc minute /mo 10 ^
-  /tr "node D:\path\to\collect-artifacts.mjs --to D:\pics --only-if-running"
-```
-
-> `--only-if-running`：daemon 没在跑就跳过。不加的话，普通动词会顺手把 daemon 启动
-> （"启动但不拥有"），于是一个每 10 分钟跑一次的后台任务会把你**手动停掉**的 daemon 反复拉活
-> ——那不是它该管的事。`daemon status` 恰好是唯一不自动拉起的动词，脚本问的就是它。
-
-> 一个实测出来的坑，脚本已经替你处理了：`operation list` 给的是**摘要**（没有 `runs`），
-> 要按 runId 找产物得逐个 `operation get`。
->
-> 还有一件**真的是平台的怪癖**：文件名可能是 `.png` 而**实际字节是 JPEG**（我们就遇到了）——
-> 看图软件一般不在乎，但严格按扩展名解析的工具会在意。它和上面那条撞名不同：**字节类型是平台说了算，
-> 名字的冲突是"我们把它收进一个目录"造成的**，所以后者由我们兜底。
-
-**刻意不给 AI 的三件事**：写密钥、写备注名、建/删连接。它们改的是「谁能跑什么」这条授权边界本身，而 AI 正受这条边界约束。同理只给 CLI 的还有两处：`callback set-secret`（MCP 的参数是模型生成的，密钥进去就等于进了模型上下文与对话记录）与 `artifact download`（它往磁盘任意路径写文件）。
+> 撞名策略（`--on-conflict`）、`--name-template`、同 run 内重名、定时收图脚本与两个实测坑，都在 [`docs/agent-cookbook.md`](docs/agent-cookbook.md)。
 
 ## 用命令行（可选）
 
@@ -291,58 +161,17 @@ renderloft-cli recipe list                               # 有哪些应用
 renderloft-cli recipe describe --recipe 1                # 它的字段（含备注名）
 renderloft-cli operation run --recipe-revision 1 --input cat.json
 renderloft-cli operation run --recipe-revision 1 --input inputs.json `
-  --asset '475::image=person.png' --asset '520::image=cloth.png'   # 带图：按字段键传资产（先上传后提交）
-renderloft-cli operation run --recipe-revision 1 --input inputs.json --dry-run   # 只预检，不花钱
+  --asset '475::image=person.png' --dry-run              # 带图：按字段键传资产；--dry-run 只预检不花钱
 renderloft-cli operation wait --operation 70
 renderloft-cli artifact list
 ```
 
-> 免安装 zip 不会改 PATH（那本来就不是"安装"），用解压目录里的全路径即可：
-> `& "D:\你解压的位置\renderloft-cli.exe" recipe list`。
+- **退出码与输出流**：成功时信封走 **stdout**、退出码 **0**；失败时信封走 **stderr**、退出码 **1**——所以任务计划里 `if ($LASTEXITCODE -ne 0) { 报警 }` 是有效的。
+- daemon 没在跑也没关系：CLI 会自己把旁边的 `renderloft.exe` 拉起来（**只启动，不拥有**）。
+- **有几条动词只给 CLI、不给 AI**：写密钥（`connection set-key` / `callback set-secret`）、关 daemon、策展（`recipe remove` / `restore`）、往磁盘写文件（`artifact download`）。
+- 免安装 zip 不改 PATH，用解压目录里的全路径即可；CLI 一次提交一个任务，**批量走 MCP 的 `runs`，或在运行页切到「批量运行」**。
 
-> `--input` 是 JSON 文件，内容要匹配该应用的 schema；**文件不要带 BOM**（用 `Set-Content -Encoding utf8NoBOM` 或直接写）。
-> CLI 一次提交一个任务；**一次提交多个用 MCP 的 `run_recipe`**。
-> **退出码与输出流**：成功时信封走 **stdout**、退出码 **0**；失败时信封走 **stderr**、退出码 **1**。所以在任务计划里 `if ($LASTEXITCODE -ne 0) { 报警 }` 是有效的，`> result.json` 也不会把错误混进去。
-
-全部动词（`renderloft-cli <组> <动词> --help` 看参数）：
-
-| 组 | 动词 |
-|---|---|
-| `connection` | `list` · `models`（拉平台声明的模型清单）· `set-key`（值只从文件读，默认拒绝覆盖，要覆盖加 `--force`） |
-| `daemon` | `status` · `stop`（守护进程本身；**只给 CLI，不给 AI**） |
-| `callback` | `set-secret` · `status` · `clear-secret`（回调签名密钥；**只给 CLI，不给 AI**） |
-| `recipe` | `list` · `describe` · `import` · `remove` · `restore`（后两个只给 CLI，不给 AI） |
-| `operation` | `list` · `run`（`--input` 文本输入；媒体加可重复的 `--asset '字段键=文件'`（先上传后提交），预检加 `--dry-run`；`--callback-url` 见上）· `get` · `wait` · `cancel` |
-| `asset` | `upload` |
-| `artifact` | `list` · `get` · `download`（下载字节；只给 CLI，不给 AI） |
-> daemon 没在跑也没关系：CLI 会自己把旁边的 `renderloft.exe` 拉起来（**只启动，不拥有**——它不会替你关掉 daemon，也不会改你的环境变量）。冷启动约 **0.6 秒**，之后每次调用约 **70 毫秒**。
->
-> **媒体资产按「字段键」定位**（`475::image` 这样的 `节点::字段`，`recipe describe` 的 `inputSchema` 里就有）。
-> HTTP 还接受旧的 `asset-N` 位置数组，但那只是给老客户端/老版本兼容的编码——新提交一律用字段键，
-> 让位置决定放哪张图正是「图片错位」的来源。字段键错了会明确报 `ASSET_FIELD_UNKNOWN`，不会静默丢。
-> 位置数组**多给槽位会被拒**（`ASSET_COUNT_EXCEEDED`），不再静默丢掉多余的。
-> 顶层 `assets` 与 `runs` **不能同时给**（`ASSETS_NOT_ALLOWED_WITH_RUNS`）：那是两种写法，
-> 批量每一行的资产要写在该行自己的 `runs[i].assets` 里——歧义不猜，宁可报错也不静默丢一份。
->
-> 想知道它在不在、想关掉它：
-> ```powershell
-> renderloft-cli daemon status   # 在不在跑、版本、日志在哪、还有几条任务没结束
-> renderloft-cli daemon stop     # 优雅退出（任务不会丢：平台侧继续跑，下次启动对账回来）
-> ```
-> 这两条**只给 CLI**（MCP 那侧没有）：进程生命周期是人的事——任务在后台跑、对账靠 daemon 常驻，不该让 AI 有权把它关掉。
-
-典型的"跑一次并拿到结果"：
-
-```powershell
-renderloft-cli recipe list                            # 拿 recipeId 与 defaultConnectionId
-renderloft-cli recipe describe --recipe 1             # 拿 currentRevisionId 与字段 schema
-renderloft-cli operation run --recipe-revision 1 --input cat.json --idempotency-key daily-2026-10-09
-renderloft-cli operation run --recipe-revision 1 --input attrs.json --asset '475::image=person.png'   # 带图（先上传后提交）
-renderloft-cli operation wait --operation 70 --interval 5 --timeout 600
-renderloft-cli artifact list                          # 产物（byteSize 0 = 字节还在平台上，不是空文件）
-```
-
-因为是普通的命令行程序，它也能被任何调度器调用——例如「每天 9 点生成一张」用 Windows 任务计划即可。
+> **完整旗标表、产物落盘规则、批量、回调、dry-run 与常见坑**，都在 [`docs/agent-cookbook.md`](docs/agent-cookbook.md)。
 
 ## 它是怎么工作的
 
@@ -416,6 +245,9 @@ git push --tags                # tag 触发 .github/workflows/release.yml
 - [架构与技术选择](ARCHITECTURE.md)
 - [当前状态](docs/status.md)
 - [维护指南](docs/AGENTS.md)
+- [Agent Cookbook：从零跑通一个任务](docs/agent-cookbook.md)
+- [完成回调与验签](docs/callbacks.md)
+- [MCP 工具面：第一性推导与判据](docs/mcp-surface.md)
 
 ## 许可证
 
