@@ -34,6 +34,35 @@ jobs:
       - run: cargo test --manifest-path src-tauri/Cargo.toml
       - run: pnpm build
 
+  # Linux 无头便携包的**真打包 + 全链路冒烟**。
+  #
+  # 与 windows-installer 同理：打包路径没有自动化跑过就会**静默烂掉**。Linux 这边烂掉的方式
+  # 更隐蔽——包在、二进制也在，但少了 dist/、或解压后根本拉不起 daemon，用户拿到手才发现。
+  # 所以这个 job 不只构建：它把产出的 tar.gz 解压到临时目录，用**包里的**三件套真跑一遍
+  # （CLI → daemon → 控制台 → MCP），再上传产物供下载调试。
+  linux-portable:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 11.20.0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+      - uses: dtolnay/rust-toolchain@stable
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm build:linux
+      - run: node scripts/smoke-linux.mjs
+      - uses: actions/upload-artifact@v4
+        with:
+          name: renderloft-linux-portable
+          path: RenderLoft_*_x64-linux.tar.gz
+          # 打包静默失败（没产出 tar.gz）时必须红，不能只是"没东西可传"
+          if-no-files-found: error
+          retention-days: 14
+
   # 真打包：产出 NSIS 安装包并上传。
   #
   # 为什么这个 job 必须存在（而不只是"能编译"）：打包这条路一旦没有自动化跑过，就会**静默
