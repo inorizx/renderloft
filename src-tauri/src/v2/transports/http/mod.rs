@@ -1106,6 +1106,61 @@ mod tests {
         );
     }
 
+    /// 负对照：顶层 `assets` 与 `runs` 同时给 ⇒ **明确报错**，不落库、不上传。
+    ///
+    /// 两种写法各自都合法，合在一起是歧义。过去批量路径**根本不看**顶层 `assets`：每一行都没图
+    /// 却照常提交、照常计费、零提示。工具的立场是：要么照做、要么说清楚，不许静默。
+    #[tokio::test]
+    async fn mcp_assets_with_runs_is_rejected_instead_of_silently_dropped() {
+        use crate::v2::clients::client::V2Client;
+        use crate::v2::clients::verbs::{self, Args};
+
+        let (app, repositories) = test_app();
+        seed_media_recipe(&repositories, true);
+        seed_media_asset(&repositories, 8, "sum-cloth");
+        let token = issue_token(&repositories, &["operations:execute"]).await;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("绑定端口");
+        let address = listener.local_addr().expect("端口地址");
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        let client =
+            V2Client::new(format!("http://127.0.0.1:{}", address.port()), token).with_driver("mcp");
+
+        let verb = verbs::find_by_id("operation.run").expect("operation.run");
+        let args = Args::from_mcp(
+            verb,
+            &json!({
+                "recipeRevisionId": 2,
+                "assets": { "520::image": { "assetId": 8, "checksum": "sum-cloth" } },
+                "runs": [{ "clientRunId": "look-1", "inputs": {} }],
+            }),
+        )
+        .expect("参数形状本身是合法的");
+        let error = verbs::execute(&client, verb, &args)
+            .await
+            .expect_err("歧义请求必须报错，不许静默丢弃");
+        assert_eq!(error.code, "ASSETS_NOT_ALLOWED_WITH_RUNS");
+        assert!(
+            error.message.contains("runs[i].assets"),
+            "报错要说清两种正确写法：{}",
+            error.message
+        );
+        assert!(
+            crate::v2::ports::repositories::OperationRepository::list_operations(
+                &repositories,
+                10,
+                None
+            )
+            .await
+            .expect("列举")
+            .is_empty(),
+            "歧义请求不许落库"
+        );
+    }
+
     /// MCP 批量：`runs[]` 里每行的 assets **真的被传下去**（过去被静默丢弃）。
     #[tokio::test]
     async fn mcp_batch_run_assets_are_transmitted() {

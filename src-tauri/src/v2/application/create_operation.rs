@@ -323,8 +323,15 @@ impl CreateOperation {
         //
         // ⚠️ 这是"资产的真实身份是字段键"落地的一步：写库/哈希之前，每个资产都带上
         // `field_key`。位置数组（旧形状）只在这一刻按下标解释一次，之后全链路只认字段键。
-        let mapping = MediaMapping::from_provider_config(&revision.binding.provider_config)?;
-        let bindings = mapping.bind(&request.assets)?;
+        // 只有真的要绑资产时才解析映射：一张坏 `mediaMapping` 不该让**纯文本 run** 也失败
+        // （改动前这些形状对无资产的 run 完全无影响——ComfyUI 那条路根本不读它）。没有资产
+        // 就没有绑定，也就没有可校验的东西。
+        let bindings = if request.assets.is_empty() {
+            Vec::new()
+        } else {
+            MediaMapping::from_provider_config(&revision.binding.provider_config)?
+                .bind(&request.assets)?
+        };
         let mut assets = Vec::with_capacity(bindings.len());
         for binding in &bindings {
             let asset_id = binding.asset.asset_id;
@@ -774,7 +781,6 @@ mod tests {
         repositories: &InMemoryRepositories,
         keyed_shape: bool,
     ) -> RecipeRevisionId {
-        seed_environment(repositories);
         let mapping = if keyed_shape {
             json!({
                 "475::image": { "node": "475", "field": "image" },
@@ -790,6 +796,16 @@ mod tests {
                 "asset-3": { "node": "521", "field": "image" }
             })
         };
+        seed_media_environment_with_mapping(repositories, mapping)
+    }
+
+    /// 同上，但映射由调用方给——用来构造**坏映射**这种边界：没有资产就不该解析它，
+    /// 否则同一 recipe 的纯文本 run 会被一张它根本不读的映射拖下水。
+    fn seed_media_environment_with_mapping(
+        repositories: &InMemoryRepositories,
+        mapping: Value,
+    ) -> RecipeRevisionId {
+        seed_environment(repositories);
         let revision = RecipeRevision {
             id: RecipeRevisionId(2),
             recipe_id: RecipeId(1),
@@ -942,6 +958,23 @@ mod tests {
         assert_eq!(stored.len(), 1);
         assert_eq!(stored[0].field_key.as_deref(), Some("520::image"));
         assert_eq!(stored[0].asset_id, AssetId(8));
+    }
+
+    /// 负对照：**纯文本 run 不该被一张坏 `mediaMapping` 拖下水**。
+    ///
+    /// 改动前 create 会**无条件**解析映射，于是一张坏映射会让同一 recipe 的纯文本 run 也全报
+    /// `MEDIA_MAPPING_INVALID`——而它对无资产的 run 本该毫无影响（ComfyUI 那条路根本不读它）。
+    /// 没有资产就没有绑定，也就没有可校验的东西。
+    #[tokio::test]
+    async fn a_text_only_run_survives_a_broken_media_mapping() {
+        let repositories = InMemoryRepositories::new();
+        let revision = seed_media_environment_with_mapping(&repositories, json!("not-an-object"));
+        let use_case = use_case(repositories.clone());
+        let persisted = use_case
+            .execute(media_request(revision, "text-only", vec![]))
+            .await
+            .expect("没有资产就不该解析映射：纯文本 run 必须能过");
+        assert!(persisted.runs[0].assets.is_empty());
     }
 
     /// 新 revision（keyed 映射）收到位置数组 ⇒ POSITIONAL_ASSETS_UNSUPPORTED（不许猜）。

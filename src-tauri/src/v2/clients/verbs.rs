@@ -926,7 +926,7 @@ pub static VERBS: &[Verb] = &[
              \"<returned checksum>\"}} — the field key (e.g. \"475::image\") comes from \
              renderloft_describe_recipe's inputSchema. Example: renderloft_run_recipe with \
              assets {\"475::image\": {\"assetId\": 12, \"checksum\": \"..\"}}. \
-             The `renderloft` CLI does this end to end with: renderloft operation run \
+             The `renderloft-cli` CLI does this end to end with: renderloft-cli operation run \
              --recipe-revision N --input inputs.json --asset '475::image=person.png'. \
              Pass an ABSOLUTE path to a file on THIS machine — the MCP server is a local \
              process, it reads the file itself and uploads the bytes.",
@@ -1246,7 +1246,7 @@ fn cli_arg(param: &'static Param) -> Arg {
             .value_name("LIST")
             .value_parser(clap::value_parser!(String)),
         // 可重复的 `--asset '<字段键>=<本机文件路径>'`：同一字段给两次在解析时报错
-        // （见 `parse_asset_specs`），而不是让后一个悄悄覆盖前一个。
+        // （见 `parse_asset_spec`），而不是让后一个悄悄覆盖前一个。
         Kind::KeyedAssets => arg
             .value_name("字段键=文件")
             .action(ArgAction::Append)
@@ -1412,7 +1412,13 @@ impl Args {
                             specs.push(json!({ "fieldKey": field_key, "path": path }));
                         }
                     }
-                    Some(json!(specs))
+                    // 一个 `--asset` 都没给就**不放这个键**：`run_request` 那边"没给"与"给了空对象"
+                    // 是两件事（空对象等于显式声明"零个资产"，那不是同一个意思）。
+                    if specs.is_empty() {
+                        None
+                    } else {
+                        Some(json!(specs))
+                    }
                 }
             };
             if let Some(value) = value {
@@ -1914,11 +1920,32 @@ async fn run_operation(client: &V2Client, args: &Args) -> Result<Value, ClientEr
     });
     let callback = callback_body(args)?;
     let dry_run = args.flag("dryRun")?;
-    let single_assets = match args.opt_json("assets")? {
+    let assets_arg = args.opt_json("assets")?;
+    let runs_arg = args.opt_json("runs")?;
+    // ⚠️ 顶层 `assets` 与 `runs` 同时给 = **歧义**，不是"每行都用这份"。
+    //
+    // 两种写法各自都合法，合在一起却有两种读法（每行的默认？还是只给单次用的？）。这里过去更糟：
+    // 批量路径根本不看顶层 `assets`，于是每一行都没图却照常提交、**照常计费**，且零提示。
+    // 工具的立场是：要么照做、要么说清楚，不许静默——尤其不许在花钱的事上静默。
+    //
+    // 为什么不选"当作每行的默认"：那是**不可逆**的——一旦有人依赖它，收紧就是破坏性变更；
+    // 而报错 → 以后放宽是兼容的。不可逆的设计决策往保守那一侧站。
+    //
+    // 这道检查在 `prepare_assets` 之前：歧义请求**一个字节都不上传**。
+    if assets_arg.is_some() && runs_arg.is_some() {
+        return Err(argument_error(
+            "ASSETS_NOT_ALLOWED_WITH_RUNS",
+            "同时给了 `assets` 和 `runs`，这是两种写法，不能合用（顶层 `assets` 是给单次提交的）。\
+             两种正确写法：① 单次：给 `inputs` + `assets`；\
+             ② 批量：给 `runs`，资产写在该行自己的 `runs[i].assets` 里（keyed 对象，键 = 字段键）。"
+                .to_string(),
+        ));
+    }
+    let single_assets = match assets_arg {
         Some(value) => Some(prepare_assets(client, &value).await?),
         None => None,
     };
-    if let Some(runs) = args.opt_json("runs")? {
+    if let Some(runs) = runs_arg {
         let runs = runs.as_array().cloned().unwrap_or_default();
         if runs.is_empty() {
             return Err(argument_error(
@@ -3109,6 +3136,12 @@ mod tests {
             let mut arguments = Map::new();
             for param in verb.mcp_params() {
                 arguments.insert(param.mcp_name().to_string(), dummy(param));
+            }
+            // `operation.run` 的两种写法（单次 `inputs` + `assets` / 批量 `runs`）**不能同时给**
+            // ——按表补全会把两个都塞进去，那是歧义（以前被静默忽略，现在明确报错）。
+            // 这里按单次那种走，动词照样会走到实现。
+            if verb.id == "operation.run" {
+                arguments.remove("runs");
             }
             let args = Args::from_mcp(verb, &Value::Object(arguments))
                 .unwrap_or_else(|error| panic!("{} 的参数应当能补全：{error}", verb.id));
