@@ -13,9 +13,11 @@ import {
   RotateCcw,
   Send,
   TriangleAlert,
+  Wand2,
   X
 } from '@lucide/vue'
 import { useRouter } from 'vue-router'
+import { useRunnerSessionsStore } from '@/features/v2/stores/runner-sessions'
 import Card from '@/components/ui/Card.vue'
 import Button from '@/components/ui/Button.vue'
 import Dialog from '@/components/ui/Dialog.vue'
@@ -25,7 +27,7 @@ import EmptyState from '@/components/shared/EmptyState.vue'
 import SectionHeader from '@/components/shared/SectionHeader.vue'
 import StatusIndicator from '@/components/shared/StatusIndicator.vue'
 import ResultPreviewDialog from '@/components/shared/ResultPreviewDialog.vue'
-import { isTerminalStatus, v2, type OperationDetail } from '@/shared/api/v2'
+import { isTerminalStatus, v2, type OperationDetail, type RunRef } from '@/shared/api/v2'
 import { runGroupLabel } from '@/shared/lib/runLabel'
 import type { TaskResult } from '@/shared/types/runninghub'
 import { useV2WorkspaceStore } from '@/features/v2/stores/workspace'
@@ -41,6 +43,7 @@ import { formatRelativeTime, timestampOf } from '@/shared/lib/relativeTime'
 const router = useRouter()
 const workspace = useV2WorkspaceStore()
 const taskCenter = useTaskCenterStore()
+const runnerSessions = useRunnerSessionsStore()
 const appStore = useAppStore()
 const { t, dateLocale } = useLocale()
 
@@ -852,6 +855,84 @@ const retryOperation = async (operation: OperationDetail) => {
   await refresh()
 }
 
+const reuseError = ref('')
+const reusingRunId = ref<number | null>(null)
+
+/** 这个应用的表单里已经有东西了吗（决定复用参数要不要先问一句"覆盖吗"）。 */
+const sessionHasContent = (appId: string) => {
+  const session = runnerSessions.get(appId)
+  if (!session) return false
+  return (
+    Object.keys(session.values).length > 0 ||
+    Object.keys(session.files).length > 0 ||
+    (session.batchRows ?? []).length > 0
+  )
+}
+
+/**
+ * **用这套参数再跑一次（可改）** —— 产品愿景里"保存参数、复用历史"的那一步。
+ *
+ * 与「重新运行」的区别要说清楚（它们不是一回事，所以不是同一个按钮）：
+ * - `operation retry` = **立刻再提交一次**，参数原样、不能改；
+ * - 这里 = **打开那个应用的表单、把参数填好**，改不改、跑不跑都由人按 —— **钱永远由人按**。
+ *
+ * 三处刻意的取舍：
+ * 1. **只填当前 schema 认得的字段**：应用重新导入过之后，旧修订留下的键塞进表单没有意义
+ *    （而且会被 `create` 的 schema 校验挡下——报错虽清楚，但那是把问题留给用户）；
+ * 2. **素材按字段键还原**，`fieldKey` 为空（旧位置编码）的**跳过**：不许猜字段键 ——
+ *    猜错就是"把钱花在错素材上"。跳过的那些在表单里是空的，必填的会被提交前的校验拦住；
+ * 3. 那个应用的表单里**已经有内容**时先问一句：复用是显式动作，但**不该静默丢掉**用户打了一半的东西。
+ */
+const reuseRunParams = async (operation: OperationDetail, run: RunRef) => {
+  if (reusingRunId.value !== null) return
+  const recipeId = run.recipeId
+  // 后端查不到这个应用（已被删）时**不做**：宁可没有这个入口，也不要跳到一个 schema 都不一样的表单里。
+  if (!recipeId) return
+  const appId = String(recipeId)
+  if (sessionHasContent(appId) && !window.confirm(t('task.confirmReuseOverwrite'))) return
+  reusingRunId.value = run.runId
+  reuseError.value = ''
+  try {
+    const schema = await v2.getRecipeSchema(recipeId)
+    // `inputSchema` 在后端是**自由 JSON**（见 `getRecipeSchema` 的类型），这里按表单要用的形状收窄
+    // —— 与 `V2Runner` 同一手法，别把它当成强类型契约。
+    const properties = (schema.inputSchema as { properties?: Record<string, unknown> } | undefined)
+      ?.properties
+    const known = new Set(Object.keys(properties ?? {}))
+    const values: Record<string, unknown> = {}
+    for (const [key, value] of Object.entries(run.inputs ?? {})) {
+      if (known.has(key)) values[key] = value
+    }
+    // 素材：按字段键还原；名字按需取（取不到就用 `素材 #id`，**不编一个文件名**）。
+    const files: Record<string, { assetId: number; checksum: string; filename: string }> = {}
+    for (const asset of run.assets ?? []) {
+      const fieldKey = asset.fieldKey ?? ''
+      if (!fieldKey) continue
+      let filename = t('task.assetFallbackName', { id: asset.assetId })
+      try {
+        filename = (await v2.getAsset(asset.assetId)).filename || filename
+      } catch {
+        // 取名字失败不该让"复用参数"整个失败：提交真正需要的是字段键 + assetId + checksum。
+      }
+      files[fieldKey] = { assetId: asset.assetId, checksum: asset.checksum, filename }
+    }
+    // 先写会话再导航：`open` 是所有打开配方的唯一漏斗（它也会记"最近使用"），
+    // 而 Runner 是在 `onMounted` 里读会话的，顺序反了就白填。
+    runnerSessions.open(appId, operation.recipeName ?? '')
+    runnerSessions.update(appId, { values, files })
+    detailTask.value = undefined
+    batchDetail.value = undefined
+    await router.push(`/library/${recipeId}`)
+  } catch (error) {
+    reuseError.value =
+      error instanceof Error
+        ? t('task.reuseFailedDetail', { message: error.message })
+        : t('task.reuseFailed')
+  } finally {
+    reusingRunId.value = null
+  }
+}
+
 /**
  * 这一批里**失败**的那些 run。
  *
@@ -1414,9 +1495,23 @@ onBeforeUnmount(() => {
               <StatusBadge :status="statusTone(run.status)">{{
                 statusLabel(run.status)
               }}</StatusBadge>
+              <!--
+                「用这套参数再跑一次（可改）」：打开那个应用的表单并预填这次提交的参数。
+                与旁边的「重新运行」**不是一回事**（那个是立刻再投一次、参数不能改），
+                所以是两个入口而不是一个开关。
+              -->
+              <IconButton
+                v-if="run.recipeId"
+                :label="t('task.reuseParams')"
+                size="sm"
+                :disabled="reusingRunId === run.runId"
+                @click="reuseRunParams(detailTask, run)"
+                ><Wand2 class="size-3.5"
+              /></IconButton>
             </div>
           </div>
           <p v-else class="mt-2 text-sm text-muted-foreground">{{ t('task.noRunsRecorded') }}</p>
+          <p v-if="reuseError" class="mt-3 text-xs text-destructive">{{ reuseError }}</p>
           <div
             v-if="detailReasons.length"
             class="mt-4 space-y-1.5 rounded-md border border-destructive/30 bg-destructive/5 px-3 py-2 text-xs"
@@ -1475,11 +1570,25 @@ onBeforeUnmount(() => {
               <StatusBadge :status="statusTone(run.status)">{{
                 statusLabel(run.status)
               }}</StatusBadge>
+              <!--
+                「用这套参数再跑一次（可改）」：打开那个应用的表单并预填这次提交的参数。
+                与旁边的「重新运行」**不是一回事**（那个是立刻再投一次、参数不能改），
+                所以是两个入口而不是一个开关。
+              -->
+              <IconButton
+                v-if="run.recipeId"
+                :label="t('task.reuseParams')"
+                size="sm"
+                :disabled="reusingRunId === run.runId"
+                @click="reuseRunParams(batchDetail, run)"
+                ><Wand2 class="size-3.5"
+              /></IconButton>
             </div>
           </div>
           <p v-if="retryFailedError" class="mt-3 text-xs text-destructive">
             {{ retryFailedError }}
           </p>
+          <p v-if="reuseError" class="mt-3 text-xs text-destructive">{{ reuseError }}</p>
           <template #footer>
             <!--
               「只重试失败的 N 条」：批量里失败了几条时，**别整批重跑**——那会把已经成功的那几条
