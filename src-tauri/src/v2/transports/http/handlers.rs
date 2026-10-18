@@ -1046,8 +1046,13 @@ pub async fn get_operation(
         .ok_or_else(|| error::not_found("OPERATION_NOT_FOUND", "Operation 不存在"))?;
     let operation = &persisted.operation;
     // 用首个 run 的配方修订解析出一个友好的"应用名"，供前端展示（失败后再重试等场景普通用户只看得到机器串）。
+    // 顺手把"这个修订属于哪个应用"记进下面的缓存：界面要拿 `recipeId` 才能"用这套参数再跑一次"
+    // （跳到那个应用的表单），而它和这里的名字查询是**同一次**读，不该查两遍。
+    let mut recipe_of_revision: std::collections::HashMap<u64, Option<u64>> =
+        std::collections::HashMap::new();
     let recipe_name = if let Some(first) = persisted.runs.first() {
         if let Ok(Some(revision)) = state.recipes.find_revision(first.recipe_revision_id).await {
+            recipe_of_revision.insert(first.recipe_revision_id.0, Some(revision.recipe_id.0));
             if let Ok(Some(recipe)) = state.recipes.find_recipe(revision.recipe_id).await {
                 Some(recipe.name)
             } else {
@@ -1059,6 +1064,26 @@ pub async fn get_operation(
     } else {
         None
     };
+    // 每条 run 的 `recipeId`：**按不同修订缓存**。正常一批只有一个修订（查 1 次）；
+    // 混合修订的批量（只有 API 能构造）最多查 N 次，但每条 run 拿到的都是**它自己那个应用**，
+    // 而不是"第一个 run 的应用"——后者会让"用这套参数再跑"打开一个 schema 都不一样的表单。
+    let mut runs: Vec<Value> = Vec::with_capacity(persisted.runs.len());
+    for run in &persisted.runs {
+        let revision_id = run.recipe_revision_id.0;
+        // 用 `get` 而不是 `contains_key`：后者 + `insert` 是 clippy 的 `map_entry` 告警，
+        // 而这里**不能用 entry API** —— 查修订要 `await`，entry 会把借用跨过 await 点。
+        let recipe_id = if let Some(cached) = recipe_of_revision.get(&revision_id) {
+            *cached
+        } else {
+            let resolved = match state.recipes.find_revision(run.recipe_revision_id).await {
+                Ok(Some(revision)) => Some(revision.recipe_id.0),
+                _ => None,
+            };
+            recipe_of_revision.insert(revision_id, resolved);
+            resolved
+        };
+        runs.push(run_response(run, recipe_id));
+    }
     Ok(Json(
         serde_json::to_value(Envelope::new(json!({
             "operationId": operation.id.0,
@@ -1074,7 +1099,7 @@ pub async fn get_operation(
             // operation 级：挑"最该被看见"的那条（不确定 > 退避 > 提交中 > 排队）。
             // 调用方不该为了知道"这次在等什么"去遍历 runs —— 那正是这次事故里缺的那一步。
             "attention": crate::v2::domain::operation::operation_attention(&persisted.runs),
-            "runs": persisted.runs.iter().map(run_response).collect::<Vec<_>>(),
+            "runs": runs,
         })))
         .unwrap(),
     ))
@@ -1131,7 +1156,7 @@ pub async fn list_operations(
     ))
 }
 
-fn run_response(run: &crate::v2::domain::operation::Run) -> Value {
+fn run_response(run: &crate::v2::domain::operation::Run, recipe_id: Option<u64>) -> Value {
     json!({
         "runId": run.id.0,
         "operationId": run.operation_id.0,
@@ -1139,6 +1164,13 @@ fn run_response(run: &crate::v2::domain::operation::Run) -> Value {
         "sequence": run.sequence,
         "recipeRevisionId": run.recipe_revision_id.0,
         "connectionRevisionId": run.connection_revision_id.0,
+        // 这条 run 属于**哪个应用**（由它自己的修订反查，`null` = 应用已被删/查不到）。
+        //
+        // 为什么要有：界面要"**用这套参数再跑一次**"（跳到那个应用的表单并预填），
+        // 而路由是 `/library/:recipeId` —— 只有 `recipeRevisionId` 是跳不过去的。
+        // 不在这里让界面自己反查：那要它去比对"哪个应用的当前修订等于这个修订"，
+        // 应用一旦重新导入过就**对不上**，而对不上时最坏的结果是**默默用错 schema 提交**。
+        "recipeId": recipe_id,
         "status": run.status.as_str(),
         "trackingState": run.tracking_state.as_str(),
         // 提交时用的**输入**（`inputs`）。
@@ -1153,6 +1185,18 @@ fn run_response(run: &crate::v2::domain::operation::Run) -> Value {
         // 只加在**详情**（与 `GET /api/v1/runs/{id}`）上：列表接口按设计只回摘要
         // （`runCount` + `attention`），**不带** runs、更不带 inputs —— 那条边界没动。
         "inputs": run.inputs,
+        // 提交时用的**素材**，形状与 `POST /operations/validate` 的解析结果一致
+        // （`[{ fieldKey, assetId, checksum }]`）：同一个概念在两条读路径上只有一种形状。
+        //
+        // ⚠️ `fieldKey` 为空的那些是**旧的位置编码**（`AssetRef::field_key == None`）：
+        // 它们**不能**被当成字段键用（见 `MediaMapping::bind` 的第一性原理：资产的真实身份是
+        // 「(revision, 字段键)」，不是数组下标）。界面据此**跳过**它们并让用户重新选择，
+        // 而不是猜一个字段键——猜错就是"把钱花在错素材上"。
+        "assets": run.assets.iter().map(|asset| json!({
+            "fieldKey": asset.field_key,
+            "assetId": asset.asset_id.0,
+            "checksum": asset.checksum,
+        })).collect::<Vec<_>>(),
         // 「它为什么没在动」：非终态里"在等什么"的那些给出原因 + 死线 + 下一动作
         // （见 `domain::operation::run_attention`）。正常在跑的与终态是 null。
         "attention": crate::v2::domain::operation::run_attention(run),
@@ -1191,8 +1235,14 @@ pub async fn get_run(
         cursor = Some(operation_id + 1);
     }
     let run = found.ok_or_else(|| error::not_found("RUN_NOT_FOUND", "Run 不存在"))?;
+    // 与详情同一条：这条 run 属于哪个应用（查不到就是 `null`，界面据此**不做**"用这套参数再跑"
+    // —— 宁可不给那个按钮，也不要跳到一个 schema 都不一样的表单里去）。
+    let recipe_id = match state.recipes.find_revision(run.recipe_revision_id).await {
+        Ok(Some(revision)) => Some(revision.recipe_id.0),
+        _ => None,
+    };
     Ok(Json(
-        serde_json::to_value(Envelope::new(run_response(&run))).unwrap(),
+        serde_json::to_value(Envelope::new(run_response(&run, recipe_id))).unwrap(),
     ))
 }
 
