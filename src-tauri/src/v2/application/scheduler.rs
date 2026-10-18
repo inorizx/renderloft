@@ -308,7 +308,13 @@ impl SchedulerService {
                     .complete_attempt(
                         run_id,
                         &claimed.attempt.fencing_token,
-                        AttemptResolution::Uncertain { remote_handle },
+                        AttemptResolution::Uncertain {
+                            remote_handle,
+                            // 驱动自己报的"不确定"没有 `SafeError`（它给的是 `submission.reason`），
+                            // 那句原因进事件载荷。网络失败那条路**有**结构化错误，见
+                            // `resolve_submit_error`——证据必须落到 attempt 上。
+                            error: None,
+                        },
                     )
                     .await?;
                 // 已被 cancel fencing：放弃后续状态推进。
@@ -377,6 +383,11 @@ impl SchedulerService {
                     &claimed.attempt.fencing_token,
                     AttemptResolution::Uncertain {
                         remote_handle: None,
+                        // ⚠️ 这是**唯一**会把"字节到底出没出去"的证据留下来的一步：
+                        // 事件载荷只有一句 message（不含原因链），日志那一行要等到死线判失败才写。
+                        // 落库之后，「连接被拒」（`details.nothingSent = true`）与
+                        // 「发出去后超时」（`false`）才分得开——而这两类能不能重投是相反的回答。
+                        error: Some(error.clone()),
                     },
                 )
                 .await?;
@@ -486,7 +497,7 @@ mod tests {
         Connection, ConnectionOverride, ConnectionRevision, LifecycleFeatures, Recipe,
         RecipeBinding, RecipeRevision, RecipeSource, RecipeVisibility,
     };
-    use crate::v2::domain::operation::RunStatus;
+    use crate::v2::domain::operation::{AttemptStatus, RunStatus};
     use crate::v2::infrastructure::fakes::{
         completed_artifact_draft, FakeProviderDriver, InMemoryRepositories,
     };
@@ -1244,6 +1255,21 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(persisted.runs[0].status, RunStatus::SubmissionUncertain);
+
+        // 「为什么不明」必须留在 attempt 上：这是**唯一**会留下来的证据（事件载荷只有一句
+        // message，日志那一行要等到死线才写）。少了它，「连接被拒」与「发出去后超时」在库里
+        // 长得一模一样 —— 而这两类能不能重投是相反的回答。
+        let attempt = repositories
+            .find_latest_attempt(persisted.runs[0].id)
+            .await
+            .expect("查 attempt")
+            .expect("应当有 attempt");
+        assert_eq!(attempt.status, AttemptStatus::Uncertain);
+        let stored = attempt
+            .error
+            .expect("不确定的 attempt 必须留下原因（否则排查与重投判断都没有依据）");
+        assert_eq!(stored.code, "SUBMIT_TIMEOUT");
+        assert_eq!(stored.message, "提交超时");
     }
 
     #[tokio::test]

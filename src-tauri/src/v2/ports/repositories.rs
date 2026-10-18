@@ -49,9 +49,24 @@ pub struct ClaimedRun {
 
 #[derive(Debug, Clone)]
 pub enum AttemptResolution {
-    Succeeded { remote_handle: Option<RemoteHandle> },
-    Failed { error: SafeError, retryable: bool },
-    Uncertain { remote_handle: Option<RemoteHandle> },
+    Succeeded {
+        remote_handle: Option<RemoteHandle>,
+    },
+    Failed {
+        error: SafeError,
+        retryable: bool,
+    },
+    /// 提交结果不明。`error` = **我们手上关于"为什么不明"的全部证据**。
+    ///
+    /// 为什么把它带进来（实测缺口，2026-10-17）：此前这里只有 `remote_handle`，于是
+    /// 「连接被拒」（字节一定没出去）与「发出去后超时」（字节可能出去了）在库里长得**一模一样**
+    /// —— 两个字段都是 NULL，事件里只有一句不含原因链的话，日志那一行要等到死线才写。
+    /// 而"能不能证明没出去"正是**能不能安全重投**的前提（见
+    /// `infrastructure::providers::safety::nothing_sent_evidence`）。
+    Uncertain {
+        remote_handle: Option<RemoteHandle>,
+        error: Option<SafeError>,
+    },
 }
 
 #[derive(Debug, Clone)]

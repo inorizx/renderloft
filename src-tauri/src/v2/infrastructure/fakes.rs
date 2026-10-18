@@ -703,9 +703,14 @@ impl OperationRepository for InMemoryRepositories {
                 attempt.status = AttemptStatus::Failed;
                 attempt.error = Some(error.clone());
             }
-            AttemptResolution::Uncertain { remote_handle } => {
+            AttemptResolution::Uncertain {
+                remote_handle,
+                error,
+            } => {
                 attempt.status = AttemptStatus::Uncertain;
                 attempt.remote_handle = remote_handle.clone();
+                // 与 sqlite 一致：不确定态也要把"为什么不明"留下来（替身不一致 = 测试替生产说谎）。
+                attempt.error = error.clone();
             }
         }
         attempt.completed_at = Some(Timestamp::now());
