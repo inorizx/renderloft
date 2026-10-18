@@ -315,7 +315,12 @@ pub fn run_attention(run: &Run) -> Option<RunAttention> {
         RunStatus::SubmissionUncertain => (
             "提交时连接断了或超时——**平台到底收没收到不知道**，所以不重投（重投可能重复扣费）。\
              系统正在对账；到死线仍确认不了就判失败，不会自动重投。",
-            Some("判为失败（不会自动重投）"),
+            // 「到点会怎样」**只在真有死线时才说**（这条判据对每一档都成立，见测试）：
+            // 死线是 `apply_tracking` 保证的，缺了 reconcile 还会补设；但真没有时就不许承诺 ——
+            // 让调用方去等一个不会发生的事件，正是这一整套 attention 要消灭的误报。
+            run.tracking_deadline
+                .is_some()
+                .then_some("判为失败（不会自动重投）"),
             &[
                 "operation.get",
                 "operation.wait",
@@ -324,12 +329,17 @@ pub fn run_attention(run: &Run) -> Option<RunAttention> {
             ],
         ),
         RunStatus::RetryWait => (
-            "上一次提交被平台拒了（或可重试地失败了），正在退避等待后自动重试——不需要人做任何事。",
-            // ⚠️ **不是"判为失败"**（这里此前写着 `Some("判为失败")`，是错的）：`RETRY_WAIT`
-            // **没有死线**（`apply_tracking` 把它清成 `None`），重试也没有次数上限 —— 平台一直拒
-            // 就一直每 30 秒重试一次，直到被受理或被取消。说"到点会判失败"会**让调用方去等一个
-            // 不会发生的事件**（这正是这一整套 attention 要消灭的那种误报）。
-            None,
+            "上一次提交没成功（平台拒了、限流/5xx，或连接被拒这类「字节没出去」的失败），\
+             正在退避等待后自动重试——不需要人做任何事。到死线仍未成功就判失败。",
+            // ⚠️ 这半句在 2026-10-18 又变回真话了：`RETRY_WAIT` 此前**没有死线**（`apply_tracking`
+            // 把它清成 `None`，调度器也没写），于是它会每 30 秒一直重试、永不结束——那时说
+            // "到点判失败"是**让调用方去等一个不会发生的事件**，所以当时把这半句删掉了。
+            // 现在调度器在第一次进入这一档时写下死线（连接上的 `trackingDeadlineSeconds`，
+            // 默认 1 小时）并在到期后判失败，于是这里可以如实说 —— 但仍然**只在真有死线时说**
+            //（那一档理论上可能没有：`Uncertain + Idempotent` 那条路今天不可达，但它也没写死线）。
+            run.tracking_deadline
+                .is_some()
+                .then_some("判为失败（不会自动重投；重试要显式 operation retry）"),
             &["operation.get", "operation.wait", "operation.cancel"],
         ),
         RunStatus::Submitting => (
@@ -727,9 +737,11 @@ mod tests {
                 "{status:?} 要说下一步能做什么"
             );
         }
-        // 不确定态必须说清"到点会怎样"——否则调用方只能猜（这正是那次 40 分钟误报的成因）。
+        // 不确定态的**下一动作必须点名恢复路径**（这是那次 40 分钟误报的教训：
+        // 调用方知道"它在等"还不够，还得知道"现在能做什么"）。
+        // ⚠️ "要说清到点会怎样"那半句**不在这里**验：它取决于 run 上有没有死线，
+        // 所以统一放到下面那段"两种取值都验"的循环里（否则这里会造出一个生产里不存在的组合）。
         let uncertain = run_attention(&run(1, RunStatus::SubmissionUncertain)).expect("uncertain");
-        assert!(uncertain.deadline_effect.is_some(), "要说清到死线会怎样");
         assert!(
             uncertain
                 .next_actions
@@ -737,21 +749,41 @@ mod tests {
                 .any(|name| name == "operation.retry"),
             "恢复路径要在下一动作里点名"
         );
-        // ⚠️ 反向：**没有死线的状态不许说"到点会怎样"**。
+        // ⚠️ **"有死线才许说「到点会怎样」"** —— 这条判据现在是**一般规则**，不再是针对某一档的
+        // 一次性断言：
         //
-        // `RETRY_WAIT` 此前写着 `deadlineEffect: "判为失败"`，而它**没有死线**
-        //（`apply_tracking` 清成 `None`），重试也没有次数上限 —— 平台一直拒就一直每 30 秒重试。
-        // 那句话会让调用方**去等一个不会发生的事件**，正是这一整套 attention 要消灭的误报。
+        // 历史上 `RETRY_WAIT` 写着 `deadlineEffect: "判为失败"` 而它**根本没有死线**
+        //（`apply_tracking` 把它清成 `None`，调度器也没写）⇒ 那句话让调用方**去等一个不会发生的
+        // 事件**。上一批把这半句删了；这一批给 `RETRY_WAIT` 真的写了死线（调度器在第一次进入
+        // 这一档时写：连接上的 `trackingDeadlineSeconds`，默认 1 小时，到期判失败），于是它
+        // 又可以如实说。**两种取值都要验**，因为这两句话是静态的、而死线是运行时写进去的
+        // —— 它们正是会各自漂开的一对。
         //
-        // 负对照：把 `RetryWait` 那档的 `None` 改回 `Some("判为失败")` ⇒ 这条红。
-        let retry_wait = run_attention(&run(1, RunStatus::RetryWait)).expect("retry_wait");
-        assert_eq!(
-            retry_wait.deadline, None,
-            "RETRY_WAIT 没有死线（它一直退避重试，不会自己失败）"
-        );
-        assert_eq!(
-            retry_wait.deadline_effect, None,
-            "没有死线就不能说「到点会怎样」——调用方会去等一个不会发生的事件"
+        // 负对照：把 `RetryWait` 那档改回 `None` ⇒ "有死线却不说"红；
+        // 把 `Queued` 那档塞一句 `Some("判为失败")` ⇒ "没死线却说了"红。
+        for status in [RunStatus::SubmissionUncertain, RunStatus::RetryWait] {
+            let mut with_deadline = run(1, status);
+            with_deadline.tracking_deadline =
+                Some(Timestamp::from_millis(Timestamp::now_millis() + 60_000));
+            let stated = run_attention(&with_deadline).expect("等待中的档位");
+            assert!(
+                stated.deadline.is_some() && stated.deadline_effect.is_some(),
+                "{status:?} 有死线就必须说清到点会怎样，否则调用方只能猜"
+            );
+            let silent = run_attention(&run(1, status)).expect("等待中的档位");
+            assert!(
+                silent.deadline_effect.is_none(),
+                "{status:?} 没有死线就不许说「到点会怎样」——调用方会去等一个不会发生的事件"
+            );
+        }
+        // `SUBMITTING` 的那句话说的是**另一个时钟**（租约恢复窗口，不是 `tracking_deadline`）：
+        // 它没有 run 级死线可报，所以那半句必须**不提**判失败，只说到点会转成什么。
+        let submitting = run_attention(&run(1, RunStatus::Submitting)).expect("submitting");
+        assert!(submitting.deadline.is_none());
+        let effect = submitting.deadline_effect.clone().unwrap_or_default();
+        assert!(
+            effect.contains("等确认") && !effect.contains("失败"),
+            "提交中的那句话是关于恢复窗口的，不许混进「判失败」：{effect}"
         );
         for status in [
             RunStatus::Accepted,
