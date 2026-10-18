@@ -407,7 +407,7 @@ renderloft-cli daemon status     # data.workspace 与 data.logFile 就是那两�
 > ⚠️ 事件流**没有对应的 CLI / MCP 动词**（它是界面实时刷新用的通道，要 token）。
 > Agent 该看的是 `operation get` 的 `attention`；事件流是给"要看原始时间线"的人或工具用的。
 
-### 11d. 「它到底到没到平台」——今天查不出来，只能承认「不知道」
+### 11d. 「它到底到没到平台」——先分清「能证明」与「不知道」
 
 这条最要紧，因为**猜错的代价是重复扣费**。库里每个 run 的每一次提交尝试是 `v2_run_attempts`
 一行（`number` 递增，最新那条就是当前这次）：
@@ -416,29 +416,28 @@ renderloft-cli daemon status     # data.workspace 与 data.logFile 就是那两�
 |---|---|
 | `status` | `SUBMITTING` / `ACCEPTED` / `SUCCEEDED` / `FAILED` / `UNCERTAIN` / `CANCELLED` |
 | `remote_handle_json` | 远端任务句柄；**不确定态的 attempt 一定是 `NULL`** |
-| `error_json` | 结构化错误（`cause` 是原因链）——⚠️ **不确定态的 attempt 也是 `NULL`**（见下） |
+| `error_json` | 这次失败的结构化错误：`code` / `message` / `cause`（原因链）/ `nothingSent` |
 
-**先把现状说清楚（这是已知缺口，不是你看漏了）**：
-
-| 想知道的 | 今天在哪 | 有吗 |
-|---|---|---|
-| 这次提交的远端句柄 | `v2_run_attempts.remote_handle_json` | 不确定时是 `NULL` |
-| 失败**原因链**（`connection refused` / `dns error` / `timed out`） | `v2_run_attempts.error_json` | 不确定时**没有** |
-| 那句人话原因 | 事件流 `run.submission_uncertain` 的 `payload.reason` | 有（**只有一句话，不含原因链**） |
-| daemon 日志 | —— | 走到死线判失败时才有（`TRACKING_UNRESOLVED`） |
-
-所以 **`remote_handle_json = NULL` 不是「没到平台」的证据**：它的意思是**我们连一个可以拿去问
+⚠️ **`remote_handle_json = NULL` 不是「没到平台」的证据**：它的意思是**我们连一个可以拿去问
 平台的远端 id 都没拿到**（拿到了就不会停在不确定态）⇒ 对账循环没有句柄可查，只能等死线。
-而"到底出没出去"要看的是**原因链**，它现在没有被记下来 —— 所以对不确定的 run，
-**诚实的答案就是「不知道」**，这也是它必须等到死线才能判失败的原因。
 
-判据本身是清楚的（等它落地后照这个读）：
+「到底出没出去」要看 `error_json.details`：
 
-- **能证明「字节没出去」**：连接被拒（`connection refused`）、DNS 解析失败、连接握手阶段就超时；
-- **证明不了**：发送之后才超时、连接被重置、响应读到一半断 —— 请求**可能已经到达平台**。
+| 看什么 | 含义 |
+|---|---|
+| `nothingSent: true` + `nothingSentEvidence` | **能证明字节没出去**，证据是 `CONNECTION_REFUSED` / `DNS_FAILURE` / `CONNECT_TIMEOUT` |
+| `nothingSent: false` | **证明不了** —— 请求可能已经在平台上跑起来了 |
+| `cause` | 原因链原文（`connection refused` / `dns error` / `timed out`…），排查全靠它 |
 
-> 这正是本项目**不做「提交失败就自动重投」**的原因：没有服务端去重时，"可能已经收下"的那一类
-> 再投一次就是再花一次钱（`AGENTS.md` 铁律二）。"先能证明，再谈重投"是唯一不重复扣费的路。
+判据（`nothing_sent_evidence`，与上面那张表一一对应）：
+
+- **能证明「字节没出去」**：连接被拒、DNS 解析失败、连接握手阶段就超时；
+- **证明不了**：发送之后才超时、连接被重置、响应读到一半断 —— TCP 层已经通了。
+
+> ⚠️ **`nothingSent` 不是「可以重投」的许可。** 唯一能证明"重投不会重复计费"的东西是**平台侧
+> 去重**，而幂等指纹从来没有发给平台（见 `domain::execution::RecoveryProof`：`Idempotent` /
+> `LookupByRequestId` 在生产代码里没有生产者）。所以本项目**不做「提交失败就自动重投」**：
+> 恢复永远是显式动作（见 11e），而 `nothingSent` 是给你判断用的**证据**。
 
 要在库里看 attempt（**只读**；`operation get` 目前只到 run 级）：
 
