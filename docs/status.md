@@ -95,6 +95,21 @@
   所以**返回的是新 operationId，要改盯新的那个**，且每个重试的 run 都会**再计费一次**；
   `--run` 只重试一条 —— 批量里只失败了几条时用它，重跑整个任务会把已成功的那几条也再提交一次
   （也就是再花一次钱）。
+- **提交结果不明时，「字节到底出没出去」有证据了**：此前 run 落 `SUBMISSION_UNCERTAIN` 时那次
+  attempt 的 `remote_handle_json` 与 `error_json` **都是空的**，事件里只有一句不含原因链的话，
+  日志那一行要等到死线才写 ⇒「连接被拒」（字节一定没出去）与「发出去后超时」（可能已经在平台上
+  跑起来了）在库里长得一模一样。现在网络失败的结构化错误会**存到那次 attempt 上**，并带一个
+  判据 `nothingSent`：只有**连接被拒 / DNS 解析失败 / 握手阶段超时**才为 `true`
+  （证据码写在 `nothingSentEvidence`），其余（发送后超时、连接被重置…）一律 `false`。
+  ⚠️ 它**不是"可以重投"的许可**：那要求平台侧去重，而幂等指纹从来没发给平台
+  （`RecoveryProof` 在生产代码里没有生产者）——所以本项目仍然**不做"提交失败就自动重投"**。
+  判据与查法见 [`agent-cookbook.md`](agent-cookbook.md) §11d。
+- **等待确认的 run 不再占住连接唯一的执行位**：一个 `SUBMISSION_UNCERTAIN` 的 run 此前会占满
+  这条连接唯一的执行位（默认并发 1）**直到死线（默认 1 小时）**，后面的 run 全排队 —— 而平台上
+  可能一个都没在跑。现在占位只算 `ACCEPTED` / `RUNNING`（真的在平台上跑的）；撞上平台上限时
+  平台会拒，而 RunningHub 的拒绝（`TASK_QUEUE_MAXED`，实测"拒了一分钱没花"）本来就是可重试的
+  ⇒ 退避 30 秒自动重试。对账队列（`list_active_runs`）**照旧**包含不确定的 run，否则它永远不会
+  被确认。
 
 ## 当前进行中
 
@@ -102,12 +117,12 @@
 
 ## 暂未实现或暂缓
 
-- **提交结果不明时的原因链还没有落地**：run 落 `SUBMISSION_UNCERTAIN` 时，那次 attempt 的
-  `error_json` 是空的（`remote_handle_json` 也是），daemon 日志那一行也要等到死线判失败才写
-  ⇒「字节到底出没出去」在本地查不出来，只能看事件流里那句不含原因链的话。
-  这是「能不能对'连接被拒 / DNS 失败'这类做自动重投」的**前置条件**（判据见
-  [`agent-cookbook.md`](agent-cookbook.md) §11d）：没有它，"没出去"与"不知道"在库里长得一模一样，
-  而把"不知道"当"没出去"重投一次就是再花一次钱。
+- **"能证明没出去就自动重投"还没接**：判据（`nothingSent`）已经有了，但**故意没有**据此自动重投
+  —— 唯一能证明"重投不会重复计费"的东西是平台侧去重，而幂等指纹
+  （`PreparedExecution.request_id`）从来没有发给平台，`RecoveryProof::Idempotent` /
+  `LookupByRequestId` 在生产代码里**没有生产者**（scheduler 里那条 `ToRetryWait` 因此不可达）。
+  要接自动重试，先让 recovery proof 有真生产者——那是另一件事（判据见
+  [`agent-cookbook.md`](agent-cookbook.md) §11d）。
 - A2A Transport 及其 conformance 测试；当前没有 A2A 路由、代码或测试。
 - Prompt Assistant 的生成端点：**评估后不做**（2026-09-22）。参数层的"这个字段该填什么"已由提示词模板与官方示例变量覆盖
   （确定性、可复现），任务层的"给个目标自动完成"由外部 AI 通过 MCP 驱动（见 README 的「用 AI 驱动它」）；
