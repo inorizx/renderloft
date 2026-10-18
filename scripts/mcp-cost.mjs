@@ -1,8 +1,13 @@
 // MCP 常驻成本的量具：驱动**真的** `renderloft-mcp.exe`（stdio），量三件事——
 //
-//   ① 常驻成本：`instructions` + `tools/list` 全文（每一轮都要付的那部分）
-//   ② 平铺假设：把这 N 个动词当成原生工具，各自"描述 + schema"求和（当前形状省下的就是它）
-//   ③ 索引体量：`catalog` 无参返回的索引（按需取，不算常驻）
+//   ① 常驻成本：`instructions` + `tools/list` 全文（每一轮都要付的那部分），并拆成
+//      "描述 / schema / 名字与标注"三块 —— 下一次要判断"能不能再小一点"时，
+//      需要知道的正是"长的是描述还是 schema"（描述可裁，schema 是动词的参数面）
+//   ② 按需成本：`catalog` 无参返回的索引，以及逐条取详情的总量（都不算常驻）
+//   ③ 每个动词的详情体量（谁最贵）
+//
+// ⚠️ 工具面压平之后（每个动词一个原生工具，2026-10-18）**"平铺假设 vs 现状"这个对比没有了**
+// —— 现状就是平铺。所以这里不再算"省下多少"：那个数字现在恒等于噪音。
 //
 // 为什么要有它：README 与 `docs/mcp-surface.md` 都拿"常驻多少 token"当论据，而**手抄的数字
 // 会漂**（实测过一次：改了 `instructions` 与标记之后，`docs/mcp-surface.md` 里的 ≈790
@@ -123,22 +128,27 @@ const toolsText = tools
   .map((tool) => `${tool.name}\n${tool.description ?? ''}\n${JSON.stringify(tool.inputSchema ?? {})}`)
   .join('\n')
 const resident = tokens(instructions) + tokens(toolsText)
-const flat = perVerb.reduce((sum, verb) => sum + verb.tokens, 0)
+// 常驻账单拆成三块：描述（可以裁）/ schema（=动词的参数面，不许为了省钱动它）/ 其余（名字与标注）。
+const descriptionChars = tools.reduce((sum, tool) => sum + (tool.description ?? '').length, 0)
+const schemaChars = tools.reduce((sum, tool) => sum + JSON.stringify(tool.inputSchema ?? {}).length, 0)
+const otherChars = toolsText.length - descriptionChars - schemaChars
+const onDemandDetails = perVerb.reduce((sum, verb) => sum + verb.tokens, 0)
 
 console.log('=== 常驻（每一轮都要付）===')
 console.log(`  instructions           ≈ ${tokens(instructions)} tokens`)
 console.log(`  tools/list（${tools.length} 个工具） ≈ ${tokens(toolsText)} tokens`)
+console.log(
+  `     其中：描述 ${descriptionChars} 字符 / schema ${schemaChars} 字符 / 名字与标注 ${otherChars} 字符`
+)
 console.log(`  合计                   ≈ ${resident} tokens（128k 上下文的 ${((resident / 128000) * 100).toFixed(2)}%）`)
-console.log(`\n=== 平铺假设（把 ${verbIds.length} 个动词做成原生工具）===`)
-console.log(`  合计                   ≈ ${flat} tokens（128k 上下文的 ${((flat / 128000) * 100).toFixed(2)}%）`)
+console.log(`\n=== 按需（不算常驻）===`)
+console.log(`  catalog 索引           ≈ ${tokens(indexText)} tokens`)
+console.log(`  逐条取详情（${perVerb.length} 个动词合计） ≈ ${onDemandDetails} tokens`)
 console.log(`  最贵的几个：${perVerb
   .sort((a, b) => b.tokens - a.tokens)
   .slice(0, 4)
   .map((verb) => `${verb.id} ≈${verb.tokens}`)
   .join('  ')}`)
-console.log(`\n  当前形状省下           ≈ ${flat - resident} tokens`)
-console.log(`\n=== 按需（不算常驻）===`)
-console.log(`  catalog 索引           ≈ ${tokens(indexText)} tokens`)
 
 child.kill()
 process.exit(0)

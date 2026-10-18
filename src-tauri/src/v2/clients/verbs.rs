@@ -284,10 +284,9 @@ pub static VERBS: &[Verb] = &[
         summary: "列出已配置的平台连接（不含密钥）",
         mcp_name: Some("renderloft_list_connections"),
         mcp_description: Some(
-            "List the platform connections configured in this workspace: id, display name, vendor, \
-             protocol and status. No secret is ever returned. This is how you get a `connectionId` \
-             for renderloft_import_recipe when the workspace has no recipes yet — otherwise you can \
-             take one from any recipe's `defaultConnectionId` in renderloft_list_recipes.",
+            "List the configured platform connections: id, name, vendor, protocol, status. No \
+             secret is ever returned. Each id is a connectionId, the only source of one with no \
+             recipe yet.",
         ),
         read_only: true,
         destructive: false,
@@ -302,10 +301,9 @@ pub static VERBS: &[Verb] = &[
         summary: "列出这条连接上平台声明的可用模型",
         mcp_name: Some("renderloft_list_models"),
         mcp_description: Some(
-            "List the model ids the platform behind a connection reports (OpenAI-compatible \
-             `GET {baseUrl}/models`). Read-only and free. Use it to pick a `model` value instead \
-             of guessing one: pass a connectionId from renderloft_list_connections. Providers that \
-             have no model listing (RunningHub, ComfyUI) answer with MODELS_NOT_SUPPORTED.",
+            "List the model ids a connection's platform reports (OpenAI-compatible `GET \
+             {baseUrl}/models`). Free. Providers with no listing (RunningHub, ComfyUI) return \
+             MODELS_NOT_SUPPORTED.",
         ),
         read_only: true,
         destructive: false,
@@ -443,10 +441,9 @@ pub static VERBS: &[Verb] = &[
         summary: "列出应用（Recipe）",
         mcp_name: Some("renderloft_list_recipes"),
         mcp_description: Some(
-            "List AIGC recipes available in the local RenderLoft workspace. Start here: this is the \
-             app index (id, name, capability, favorite, and the `defaultConnectionId` that \
-             renderloft_import_recipe needs). It deliberately carries NO field schemas — pick an app \
-             here, call renderloft_describe_recipe for its fields, then renderloft_run_recipe to submit.",
+            "List AIGC recipes in the local workspace: id, name, capability, favorite and \
+             `defaultConnectionId`. It deliberately carries NO field schemas: input fields are not \
+             visible here.",
         ),
         read_only: true,
         destructive: false,
@@ -477,9 +474,9 @@ pub static VERBS: &[Verb] = &[
         summary: "看一个应用的输入/输出 schema",
         mcp_name: Some("renderloft_describe_recipe"),
         mcp_description: Some(
-            "Get a recipe's input and output JSON Schemas — call this before renderloft_run_recipe: \
-             `inputs` must match the input schema exactly. Field descriptions come from the upstream \
-             platform and are often just the field name; a human may have added a clearer label.",
+            "Get a recipe's input/output JSON Schemas. `inputs` must match the input schema \
+             exactly. Field descriptions come from the platform, often just the field name; a human \
+             may have added a clearer label.",
         ),
         read_only: true,
         destructive: false,
@@ -498,12 +495,9 @@ pub static VERBS: &[Verb] = &[
         summary: "从平台链接/应用 ID 导入一个应用",
         mcp_name: Some("renderloft_import_recipe"),
         mcp_description: Some(
-            "Import an app (recipe) from a platform app link or app id into the local workspace, \
-             so it becomes runnable and curatable locally. `connectionId` is required and you can \
-             take one from any recipe's `defaultConnectionId` in renderloft_list_recipes (the \
-             workspace is single-account in practice). Afterwards call renderloft_describe_recipe \
-             to see the fields it needs. Importing the same platform app twice is refused with \
-             WEBAPP_ALREADY_IMPORTED — remove the old copy first if you really want a refresh.",
+            "Import a platform app (recipe) from an app link or bare app id as a runnable local \
+             app. `connectionId` is required. Re-importing the same app is refused with \
+             WEBAPP_ALREADY_IMPORTED.",
         ),
         read_only: false,
         destructive: false,
@@ -531,13 +525,9 @@ pub static VERBS: &[Verb] = &[
         // 勾字段与写备注才是人的事（这里刻意一个字段都不挑，全暴露）。
         mcp_name: Some("renderloft_import_workflow"),
         mcp_description: Some(
-            "Import a RunningHub workflow (the platform's `/post/<id>` link or bare workflow id) \
-             as a runnable local app. `connectionId` is a RunningHub connection (see \
-             renderloft_list_connections). The workflow itself stays on the platform — we store \
-             the workflow id plus the discovered input fields, so the graph never drifts from \
-             what the platform has. Every input field is exposed; call \
-             renderloft_describe_recipe afterwards to see them. Importing the same workflow twice \
-             is refused with WORKFLOW_ALREADY_IMPORTED.",
+            "Import a RunningHub workflow (`/post/<id>` or bare id). `connectionId` must be \
+             RunningHub. Only the id and discovered fields are stored; the graph stays upstream. \
+             Repeats: WORKFLOW_ALREADY_IMPORTED.",
         ),
         read_only: false,
         destructive: false,
@@ -604,15 +594,9 @@ pub static VERBS: &[Verb] = &[
         summary: "列出最近的任务（新的在前）",
         mcp_name: Some("renderloft_list_operations"),
         mcp_description: Some(
-            "List recent operations (tasks), newest first: id, status, run count and creation time. \
-             Use this when an operation id has been lost — renderloft_run_recipe already returns one, \
-             so you rarely need it. Each item also carries `attention` when one of its runs is \
-             waiting for something: `{reason, deadline}` says why it is not moving and when it will \
-             be given up on (null = nothing is stuck). Read it before telling the user how long a \
-             task will take — `status: RUNNING` alone does NOT mean work is progressing. This \
-             carries summaries only: for the inputs a task was submitted with, call \
-             renderloft_get_operation. To page further back, pass `after` a previous \
-             `nextCursor`.",
+            "List recent operations (tasks), newest first, summaries only, no `inputs`. `attention` \
+             (while a run waits): `{reason, deadline}` says why it is stuck and when it is given \
+             up on. `RUNNING` alone does NOT mean progress.",
         ),
         read_only: true,
         destructive: false,
@@ -641,23 +625,9 @@ pub static VERBS: &[Verb] = &[
         summary: "提交任务（会花用户额度：CLI 一次一个，批量用 MCP 的 runs）",
         mcp_name: Some("renderloft_run_recipe"),
         mcp_description: Some(
-            "Submit recipe execution(s). Most providers CHARGE THE USER'S OWN CREDITS per run \
-             (every entry in `runs` is a separate charged run), and \
-             real work takes tens of seconds to minutes — this call returns as soon as the work is \
-             queued, not when it finishes. For several inputs, put them in ONE call's `runs` array \
-             (up to 100) instead of making many calls: it is cheaper to track and the daemon caps \
-             concurrent operations from autonomous callers. For media recipes, pass `assets` keyed \
-             by the recipe's field keys ({fieldKey: {assetId, checksum}}; upload files with \
-             renderloft_upload_asset first) — never positional arrays. `dryRun: true` pre-checks the \
-             whole request (revision, keys, assets) without creating or charging anything. For a long \
-             job, pass `callbackUrl`: the \
-             daemon POSTs a terminal snapshot to that URL when the operation finishes, so you can \
-             submit and end your turn instead of waiting inside this call — a tool call is \
-             request/response, and a long wait occupies the client's request channel (its own \
-             timeout may be shorter than yours). If you do wait, use renderloft_wait_operation with \
-             a SHORT timeoutSeconds and call it again as needed. If a run fails, read its `error` \
-             together with the `inputs` that were submitted, fix the offending parameter, and only \
-             then resubmit — blindly retrying costs money again.",
+            "Submit recipe run(s); returns once queued, not when done. Each `runs` entry is charged \
+             to the user's credits. Media inputs: `assets` as {fieldKey:{assetId,checksum}}. \
+             `dryRun:true` free. `callbackUrl` must be https or loopback http.",
         ),
         read_only: false,
         destructive: false,
@@ -748,9 +718,9 @@ pub static VERBS: &[Verb] = &[
         summary: "查一个任务及其全部 run",
         mcp_name: Some("renderloft_get_operation"),
         mcp_description: Some(
-            "Get an operation with all its runs and current statuses. Each run carries the `inputs` \
-             that were actually submitted alongside its `error` — read them together when diagnosing \
-             a failure (the platform's message alone often does not say which parameter was wrong).",
+            "Get an operation with its runs and statuses. Each run carries the `inputs` submitted \
+             alongside its `error`; read both when diagnosing a failure: the platform's message \
+             alone often does not name the bad parameter.",
         ),
         read_only: true,
         destructive: false,
@@ -769,13 +739,9 @@ pub static VERBS: &[Verb] = &[
         summary: "等一个任务到终态",
         mcp_name: Some("renderloft_wait_operation"),
         mcp_description: Some(
-            "Wait for an operation to reach a terminal state. The waiting happens INSIDE this \
-             call, so it occupies the client's request channel — and the client's own request \
-             timeout may be shorter than timeoutSeconds, in which case this call (and the ones \
-             right after it) time out even though the work is fine. Use a SHORT timeoutSeconds and \
-             call again if needed. For long jobs prefer `callbackUrl` on renderloft_run_recipe: \
-             submit, end your turn, get notified. renderloft_get_operation is a cheap read that \
-             never blocks — checking it between turns is fine.",
+            "Wait for an operation to finish. The wait is INSIDE this call: the client's timeout \
+             may fire before `timeoutSeconds`, so it can time out while the work is fine. Use a \
+             short `timeoutSeconds`.",
         ),
         read_only: true,
         destructive: false,
@@ -813,12 +779,9 @@ pub static VERBS: &[Verb] = &[
         summary: "取消一个任务",
         mcp_name: Some("renderloft_cancel_operation"),
         mcp_description: Some(
-            "Cancel a queued or running operation. Runs that could not be cancelled remotely are \
-             reported in remoteMayContinue — and that includes runs we have NO remote handle for: a \
-             submission whose outcome is unknown (SUBMISSION_UNCERTAIN / SUBMITTING) may still be \
-             running on the platform and may still be charged, so do not read `cancelled` alone as \
-             \"nothing is left on the platform\". Runs that were never submitted (QUEUED) only show \
-             up in `cancelled`.",
+            "Cancel an operation. Runs not cancelled remotely are in `remoteMayContinue`, including \
+             SUBMISSION_UNCERTAIN/SUBMITTING (no remote handle): they may still run and be charged. \
+             `cancelled` alone does not clear the platform.",
         ),
         read_only: false,
         destructive: true,
@@ -837,16 +800,9 @@ pub static VERBS: &[Verb] = &[
         summary: "重试：用原参数**新建一个任务**（新 id；不带 --run 就重跑全部 run）",
         mcp_name: Some("renderloft_retry_operation"),
         mcp_description: Some(
-            "Retry by creating a NEW operation that reuses the source runs' recipe revisions, \
-             inputs and assets. It does NOT resume the old one: the response carries the new \
-             operationId, so watch THAT id from now on and stop polling the old operation (leave it \
-             alone, or renderloft_cancel_operation it if you no longer want it). Every retried run \
-             is submitted again and CHARGES THE USER'S CREDITS AGAIN. Pass `runId` to retry a single \
-             run: use that whenever only some runs of a batch failed — retrying the whole operation \
-             re-submits and re-charges the runs that already succeeded. This is the recovery path \
-             named by a run's `attention.nextActions` when it is stuck in SUBMISSION_UNCERTAIN: the \
-             new operation is independent, and the uncertain one is neither cancelled nor charged \
-             by this call.",
+            "Retry creates a NEW operation from the source runs' revisions, inputs, assets; it does \
+             NOT resume the old one: watch the new `operationId`. Every retried run is re-submitted \
+             and charged. Pass `runId` for a single run.",
         ),
         read_only: false,
         // 不破坏任何东西：旧的 operation 原样留着（这也是它与 cancel 的区别）。
@@ -880,10 +836,9 @@ pub static VERBS: &[Verb] = &[
         summary: "列出产物",
         mcp_name: Some("renderloft_list_artifacts"),
         mcp_description: Some(
-            "List generated artifacts produced by operations. Some providers store results as a \
-             remote URL only (bytes stay on the platform), so a missing/zero byte size does NOT \
-             mean the artifact is empty — fetch it by id if you need the bytes. Paged: pass `limit` \
-             (default 50, max 200) and `after` an artifact id to walk backwards.",
+            "List generated artifacts. Some providers store results as a remote URL only, so a \
+             missing or zero byteSize does NOT mean it is empty. Paged: `limit` (default 50, max \
+             200) and `after` an id.",
         ),
         read_only: true,
         destructive: false,
@@ -907,9 +862,9 @@ pub static VERBS: &[Verb] = &[
         summary: "看单个产物的元数据",
         mcp_name: Some("renderloft_get_artifact"),
         mcp_description: Some(
-            "Get one artifact's metadata by id: filename, mimeType, byteSize and checksum. Use it \
-             after renderloft_list_artifacts when you need the details of a specific result — and \
-             remember byteSize 0 does not mean empty (the bytes may live on the platform).",
+            "Get one artifact's metadata by id: filename, mimeType, byteSize and checksum. byteSize \
+             0 does not mean empty: some providers keep the bytes on the platform and store only a \
+             remote URL.",
         ),
         read_only: true,
         destructive: false,
@@ -972,18 +927,9 @@ pub static VERBS: &[Verb] = &[
         summary: "把本机文件上传成资产",
         mcp_name: Some("renderloft_upload_asset"),
         mcp_description: Some(
-            "Upload a local file as an asset and get its assetId. Use this for recipe media \
-             inputs: the recipe's inputSchema media fields have \"format\": \"file\", and the \
-             uploaded asset belongs in the run's `assets` object keyed by the recipe's field key \
-             — NOT in `inputs` (putting assetId in inputs silently fails) and NOT by array \
-             position. Shape: {\"<field key>\": {\"assetId\": <returned id>, \"checksum\": \
-             \"<returned checksum>\"}} — the field key (e.g. \"475::image\") comes from \
-             renderloft_describe_recipe's inputSchema. Example: renderloft_run_recipe with \
-             assets {\"475::image\": {\"assetId\": 12, \"checksum\": \"..\"}}. \
-             The `renderloft-cli` CLI does this end to end with: renderloft-cli operation run \
-             --recipe-revision N --input inputs.json --asset '475::image=person.png'. \
-             Pass an ABSOLUTE path to a file on THIS machine — the MCP server is a local \
-             process, it reads the file itself and uploads the bytes.",
+            "Upload a local file as an asset; returns an assetId+checksum for a run's `assets`, \
+             keyed by field key (e.g. \"475::image\"). An assetId in `inputs` fails silently. Pass an \
+             ABSOLUTE local path; the server reads it.",
         ),
         read_only: false,
         destructive: false,
@@ -1018,19 +964,9 @@ pub static VERBS: &[Verb] = &[
         summary: "把工作区导出一份一致的快照（迁移 / 备份）",
         mcp_name: Some("renderloft_backup_workspace"),
         mcp_description: Some(
-            "Write a CONSISTENT snapshot of the whole local workspace (app library, forms, field \
-             labels, task history, uploaded media, artifact cache) into a directory you choose, \
-             and report what landed there. Use it to back up, or to move to another machine. \
-             Pass an ABSOLUTE directory path on THIS machine — the MCP server is a local process \
-             and writes it itself. \
-             Three facts you need: (1) restoring has NO tool — stop the daemon (`daemon stop`), \
-             replace the workspace directory with the snapshot, then run any command and the CLI \
-             starts the daemon again; (2) API keys are NEVER in this snapshot (they live in the OS \
-             credential store), so after a move the HUMAN must re-enter them in the GUI's \
-             Connections page — do not report the migration as done until they have; (3) do NOT \
-             copy the live workspace directory yourself: its SQLite file runs in WAL mode, and a \
-             plain copy can silently lose data or end up unreadable. This tool exists because of \
-             (3).",
+            "Write a CONSISTENT snapshot of the workspace. API keys are NEVER in it (they live in \
+             the OS credential store), so the human must re-enter them after a move. Never copy the \
+             live workspace: its SQLite is in WAL mode.",
         ),
         read_only: true,
         destructive: false,
@@ -1118,8 +1054,15 @@ restyle, upscale or batch images/videos — or to see which apps (recipes) they 
 cost, or where its outputs went. Runs spend the user's own credits: [COST] marks the verbs that \
 charge their account, [IRREVERSIBLE] the ones that cannot be undone.";
 
-/// MCP 的两个工具名。**渐进式披露的形状**：常驻只有"索引 + 一个调用口"。
+/// MCP 的工具名：**每个动词一个原生工具**（名字来自表里的 `mcp_name`），外加下面这个
+/// 只读的参考工具（索引 + 逐动词语义，按需查阅）。
 pub const MCP_CATALOG_TOOL: &str = "renderloft_catalog";
+
+/// **已从清单里撤掉的旧调用口**（`verb` + `args` 的元层）。
+///
+/// ⚠️ 它**不再出现在 `tools/list` 里**（有测试钉着），但**仍然认得**：调用方可能缓存过旧清单，
+/// 让它因为我们的形状改变而突然失败是不礼貌的。这就是"留一个弃用窗口"的实现方式——
+/// 兼容不花常驻成本，因为它不在清单里。
 pub const MCP_CALL_TOOL: &str = "renderloft_call";
 
 /// 成本与不可逆的**机器可读标记**：行首、顺序固定、纯 ASCII、码点唯一。
@@ -1189,88 +1132,82 @@ pub fn mcp_catalog() -> String {
     lines.join("\n")
 }
 
-/// MCP 的工具清单：**只有两个**。
+/// MCP 的工具清单：**表里开放的动词各一个原生工具** ＋ 一个按需查阅的参考工具。
 ///
-/// 这是刻意的形状，不是省事：常驻面越小，"没在干这活的时候"对判断与上下文的干扰就越小。
-/// 加动词**不改这里**（改动词表即可，索引会自动多一行）。
+/// ## 为什么压平（而不是"索引 + 一个调用口"）
+///
+/// 审批层读的是 `tools/list` 里**每个动作那一格** `annotations`（`readOnlyHint` /
+/// `destructiveHint` / `idempotentHint`）——而**一个工具只有一格**：装 N 个动作时物理上只能报
+/// 最保守值，于是"只读的"和"会花钱、不可逆的"在审批层长得一模一样。准确的说法不是
+/// "`call` 不好"，而是 **`call` 与"逐动作标注"不相容**。
+///
+/// ## 常驻成本与它的边界
+///
+/// 代价说清楚：常驻随**动词数**线性增长（不是随应用数、也不是随每个动词的复杂度——
+/// 描述只放"调用它之前必须知道的东西"，语义细节留在参考工具的返回里）。
+/// 上限由 `the_resident_tool_list_stays_within_its_budget` 钉住（字符数写在测试里）。
+///
+/// 加动词**不改这里**：加一行表，清单与索引都会自动多一条（有测试按表算，不写死数字）。
 pub fn mcp_tools() -> Vec<Value> {
-    let catalog = mcp_catalog();
-    vec![
-        json!({
-            "name": MCP_CATALOG_TOOL,
-            "description": format!(
-                "{MCP_IDENTITY}\n\n\
-                 This tool is the index: every line below is one verb — `id — what it does · \
-                 required params`, with `[COST]` / `[IRREVERSIBLE]` marking the ones that charge the \
-                 user's own credits or cannot be undone. \
-                 Call it with a `verb` id to get that verb's full input schema and semantics before \
-                 calling it (worth doing the first time you use a verb, or whenever a call is \
-                 rejected for a bad parameter).\n\n\
-                 Available verbs:\n{catalog}"
-            ),
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "verb": {
-                        "type": "string",
-                        "description": "A verb id from the index (e.g. \"operation.run\"). Omit to get the index as structured data."
-                    }
-                },
-                "required": []
+    let mut tools: Vec<Value> = VERBS
+        .iter()
+        .filter_map(|verb| verb.mcp_name.map(|name| (verb, name)))
+        .map(|(verb, name)| {
+            json!({
+                "name": name,
+                // 标记挂在**首行**（位置固定、可正则）：与索引、详情共用同一条路，
+                // 所以"这个动词花钱 / 不可逆"在**清单里**就看得见，而不是要读到详情才知道。
+                "description": format!(
+                    "{}{}",
+                    mcp_markers(verb),
+                    verb.mcp_description.unwrap_or(verb.summary)
+                ),
+                "inputSchema": mcp_input_schema(verb),
+                "annotations": mcp_annotations(verb),
+            })
+        })
+        .collect();
+    tools.push(catalog_reference_tool());
+    tools
+}
+
+/// 参考工具：**按需查阅**的索引与逐动词语义（只读、纯本地、不碰 daemon）。
+///
+/// 它**不是入口**：每个动词都有自己的工具与 schema，所以调用方不必先调它。
+/// 它的价值是"schema 说不出来的东西"——语义边界、契约、失败语义；调用时给 `verb` 取详情，
+/// 不给参数就取索引。
+///
+/// ⚠️ **索引不再嵌在这条描述里**（压平前它在这里，是常驻账单里最大的一笔）。两条理由：
+/// ① 每个动词现在自己就在清单上，常驻里再抄一份索引是重复付费；② 一旦"索引常驻"，
+/// 它就会被当成入口（"先调 catalog 看索引"），而那正是这次要拆掉的形状。
+pub fn catalog_reference_tool() -> Value {
+    json!({
+        "name": MCP_CATALOG_TOOL,
+        "description": format!(
+            "{MCP_IDENTITY}\n\n\
+             Reference for every verb this server exposes: read-only, purely local, no side \
+             effects. Each verb is also its own tool with its own input schema, so nothing has to \
+             be looked up before calling one — use this when you want a single verb's full \
+             semantics (what a failure means, what is guaranteed, what is refused), or the index \
+             of verb ids. Call it with a `verb` id, or without arguments for the index."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "verb": {
+                    "type": "string",
+                    "description": "A verb id (e.g. \"operation.run\"). Omit to get the index."
+                }
             },
-            "annotations": {
-                "readOnlyHint": true,
-                "destructiveHint": false,
-                "idempotentHint": true,
-                "openWorldHint": false
-            }
-        }),
-        json!({
-            "name": MCP_CALL_TOOL,
-            "description": "Run one RenderLoft verb. RenderLoft is the user's local AIGC workbench \
-                            (image/video generation apps on their own cloud accounts) — call \
-                            renderloft_catalog first to see what it can do and what each verb needs.\n\n\
-                            Pass `verb` (an id from that index) and `args` (an object keyed by the \
-                            verb's parameter names).\n\n\
-                            Most providers CHARGE THE USER'S OWN CREDITS per run ([COST] in the index \
-                            marks which verbs do, and each entry in `runs` is a separate charged \
-                            run), and real work \
-                            takes tens of seconds to minutes — the call returns as soon as the work \
-                            is queued, not when it finishes. For several inputs, put them in ONE \
-                            call's `runs` array (up to 100) instead of making many calls: it is \
-                            cheaper to track and the daemon caps concurrent operations from \
-                            autonomous callers. For a long job, pass `callbackUrl`: the daemon POSTs \
-                            a terminal snapshot to that URL when the operation finishes, so you can \
-                            submit and end your turn instead of waiting inside this call — a tool \
-                            call is request/response, and a long wait occupies the client's request \
-                            channel (its own timeout may be shorter than yours). If you do wait, keep \
-                            it SHORT and call again as needed. If a run fails, read its `error` \
-                            together with the `inputs` that were submitted, fix the offending \
-                            parameter, and only then resubmit — blindly retrying costs money again.",
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "verb": {
-                        "type": "string",
-                        "description": "Verb id from the catalog index, e.g. \"operation.run\"."
-                    },
-                    "args": {
-                        "type": "object",
-                        "description": "Arguments keyed by the verb's parameter names (see renderloft_catalog for the exact shape)."
-                    }
-                },
-                "required": ["verb"]
-            },
-            // 标注只能给一个：`call` 能碰的东西取决于 verb，所以按最保守的报
-            //（不声称只读、不声称幂等）——宁可让客户端多问一句，也别让它以为这是只读的。
-            "annotations": {
-                "readOnlyHint": false,
-                "destructiveHint": true,
-                "idempotentHint": false,
-                "openWorldHint": true
-            }
-        }),
-    ]
+            "required": []
+        },
+        "annotations": {
+            "readOnlyHint": true,
+            "destructiveHint": false,
+            "idempotentHint": true,
+            "openWorldHint": false
+        }
+    })
 }
 
 /// 某个动词的**详情**（`catalog(<verb>)` 的返回）：完整 schema + 语义 + 标注 + CLI 等价写法。
@@ -3023,21 +2960,24 @@ mod tests {
             json!(["recipeRevisionId"]),
             "MCP 上只有 recipeRevisionId 必填：{run_tool}"
         );
-        // 跨动词的规矩住在**常驻**的那一份描述里（`renderloft_call`）：付费警告与
-        // "长任务用回调、要等就用短超时"必须**每一轮都在**——它们不能等到模型读了详情才知道。
-        let call_tool = mcp_tools()
+        // 这个动词**自己**的描述必须说清它是付费的（压平之后它就在常驻清单里，
+        // 所以"付费"这件事不再依赖某一条跨动词的说明）。
+        let run_tool = mcp_tools()
             .into_iter()
-            .find(|tool| tool["name"] == MCP_CALL_TOOL)
-            .expect("call tool");
-        let description = call_tool["description"].as_str().expect("description");
+            .find(|tool| tool["name"] == "renderloft_run_recipe")
+            .expect("run tool");
+        let description = run_tool["description"].as_str().expect("description");
         assert!(
-            description.contains("CHARGE"),
+            description.contains("charged"),
             "必须说清这是付费的：{description}"
         );
         assert!(
-            description.contains("callbackUrl") && description.contains("SHORT"),
-            "必须告诉模型：长任务用 callbackUrl，要等就用短超时：{description}"
+            description.starts_with(MCP_COST_MARKER),
+            "付费的动词必须在描述**首行**带 [COST]（审批层与模型都按位置读）：{description}"
         );
+        // ⚠️ 跨动词的规矩（"长任务用 callbackUrl、要等就用短超时、失败先读 inputs+error"）
+        // **已经搬到 `instructions`**（只付一次，见 `mcp::tests::instructions_carry_the_cross_verb_rules`）
+        // —— 所以这里不再断言它在某条工具描述里。把它写回每条描述 = 同一句话付 N 遍。
         // 索引里也要看得见"这个动词花钱"（模型看目录时就该看见，而不是读了详情才知道）。
         // 判据必须**指到那一行、那个标记**：整份索引里有某个记号是不够的（`operation.cancel`
         // 也带一个），而"花钱"恰恰不是 destructive —— 它曾经因此漏掉过标记。
