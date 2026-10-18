@@ -35,18 +35,47 @@ pub fn tools() -> Vec<Value> {
     verbs::mcp_tools()
 }
 
-/// `initialize` / `server/discover` 的 `instructions`：身份句 ＋ **已经在强制的边界**。
+/// `initialize` / `server/discover` 的 `instructions`：身份句 ＋ **跨动词的规矩** ＋ 已经在强制的边界。
 ///
-/// 为什么边界必须在这里：调用方要能**据以规划**，而不是撞墙才知道。"按目录铺开 5 个任务"
-/// 被并发闸拒掉，浪费的不只是一轮 —— 还会被误判成故障。这些边界在代码里**早就存在**，
-/// 缺的只是把它们搬到协议地板上（设计律：**凡是服务端已经在强制的边界，都必须出现在协议
-/// 地板上**；它不新增权力，只是把已经存在的边界公开）。
+/// ## 为什么这里放"流程"，而工具描述只放"这一个动词"（§D）
+///
+/// 工具面压平之后（每个动词一个原生工具），**每一轮都要付 N 条描述**。把"典型流程 / 付费 /
+/// 长任务 / 失败怎么查"这类**跨动词**的话写进每一条描述里，等于同一句话付 N 遍 —— 而且改一次
+/// 要改 N 处（漏一处就是"清单说一件事、另一个工具说另一件"）。所以分工是死的：
+///
+/// * **`instructions` 说流程**（这一份，只付一次）；
+/// * **工具 `description` 说这一个动词**（那句里不许出现别的工具名）。
+///
+/// 判据（有测试钉着）：流程、付费警告与并发上限的数字都能在 `instructions` 里读到；
+/// 且没有任何一条工具描述在教"先调哪个工具"。
+///
+/// ## 为什么边界必须在这里
+///
+/// 调用方要能**据以规划**，而不是撞墙才知道。"按目录铺开 5 个任务"被并发闸拒掉，浪费的不只是
+/// 一轮 —— 还会被误判成故障。这些边界在代码里**早就存在**，缺的只是把它们搬到协议地板上
+/// （设计律：**凡是服务端已经在强制的边界，都必须出现在协议地板上**；它不新增权力，只是把已经
+/// 存在的边界公开）。
 ///
 /// ⚠️ 数字全部来自强执行方（`create_operation` 与本文件的 `MCP_RESULT_*`），**不手抄**：
 /// 手抄的那些迟早与代码分叉。
 fn instructions() -> String {
     format!(
         "{identity}\n\n\
+         Typical flow: list the apps (recipes) → read one app's input schema → submit a run → \
+         follow it up with the cheap read-only `operation.get` until it reaches a terminal state. \
+         Submitting returns as soon as the work is QUEUED, not when it finishes; `operation.wait` \
+         and `callbackUrl` are optional conveniences, never required — a tool call is \
+         request/response, and a long wait inside one occupies the client's request channel (whose \
+         own timeout may be shorter than the wait).\n\n\
+         Money: runs spend the USER'S OWN platform credits. Each entry in `runs` is a separate \
+         charged run, and retrying an operation submits (and charges) again — so before resubmitting \
+         after a failure, read the run's `inputs` together with its `error`, fix the offending \
+         parameter, and only then retry.\n\n\
+         Do not read `status: RUNNING` as \"work is progressing\": a run may be queued behind \
+         another, waiting to retry, or waiting for confirmation of a submission whose outcome is \
+         unknown. Every run that is waiting for something carries an `attention` object saying why, \
+         until when, and what can be done — read it before telling the user how long a task will \
+         take.\n\n\
          Limits this server already enforces — plan with them instead of discovering them by \
          failing: one operation carries at most {runs} runs, and **every run is a separate charged \
          run**; an autonomous caller such as this one may have at most {concurrency} operations in \
@@ -82,13 +111,12 @@ pub async fn call_tool(name: &str, arguments: &Value) -> Value {
 
 /// 工具名 → 动词 → 参数 → 分发。**三个通道里唯一的一条路**（CLI 那条在 `cli.rs`）。
 ///
-/// 现在对外只有两个工具（见 `verbs::mcp_tools`）：
-/// - `renderloft_catalog`：索引；给 `verb` 就返回那个动词的详情（**纯本地，不问 daemon**）；
-/// - `renderloft_call`：`verb` + `args` → 走同一条分发。
+/// 对外是**每个动词一个原生工具**（见 `verbs::mcp_tools`），外加一个只读的参考工具
+/// `renderloft_catalog`（索引 + 单个动词的完整语义，**纯本地，不问 daemon**）。
 ///
-/// 旧工具名（`renderloft_list_recipes` 这些）**仍然认**：调用方可能缓存过旧的
-/// `tools/list`，让它因为我们的形状改变而突然失败是不礼貌的——而兼容不花常驻成本，
-/// 因为它们**不再出现在清单里**。
+/// 旧工具名**仍然认**：调用方可能缓存过旧的 `tools/list`（包括已从清单里撤掉的
+/// `renderloft_call`，以及更早的 `renderloft_list_recipes` 这些），让它因为我们的形状改变而
+/// 突然失败是不礼貌的——而兼容不花常驻成本，因为它们**不再出现在清单里**。
 async fn invoke(client: &V2Client, name: &str, arguments: &Value) -> Result<Value, ClientError> {
     // 索引与详情：本地就能答，不用打扰 daemon。
     if name == verbs::MCP_CATALOG_TOOL {
@@ -436,16 +464,16 @@ mod tests {
         V2Client::new("http://127.0.0.1:31337", "offline-test-token").with_driver("mcp")
     }
 
-    /// 两个元工具的标注必须**按最保守的报**。
+    /// 每个工具的形状自检：有名字、有 schema、描述足够长；参考工具是只读的；
+    /// 两个"最容易被写错"的标注（会花钱的 `operation.run` 不许声称幂等、不可逆的
+    /// `operation.cancel` 必须声称破坏性）逐条钉住。
     ///
-    /// `catalog` 是纯本地只读 ✓；`call` 能碰的东西取决于 verb，所以**不能**声称只读、
-    /// 也不能声称幂等——宁可让客户端多问一句，也别让它以为"这个工具是安全的"。
-    /// 单动词的精确标注在 `catalog(<verb>)` 的返回里（`annotations` ✓）。
+    /// ⚠️ 这条**不再**断言"只有两个工具"：那是压平前的形状。工具数由
+    /// `the_listed_tools_are_the_table_s_verbs_plus_the_reference_tool` 按表钉住（不写死数字）。
     #[test]
     fn the_meta_tools_are_annotated_conservatively() {
         let tools = tools();
         assert_eq!(tools.len(), verbs::mcp_tools().len());
-        assert_eq!(tools.len(), 2, "渐进式披露的形状就是两个工具");
         for tool in &tools {
             assert!(tool.get("name").is_some());
             assert!(tool.get("inputSchema").is_some());
@@ -454,6 +482,7 @@ mod tests {
                 "描述太短等于没给模型任何领域知识"
             );
         }
+        // 参考工具（索引 + 详情）是只读的，而且不伸到外部世界。
         let catalog = tools
             .iter()
             .find(|tool| tool["name"] == verbs::MCP_CATALOG_TOOL)
@@ -461,19 +490,6 @@ mod tests {
         assert_eq!(catalog["annotations"]["readOnlyHint"], true);
         assert_eq!(catalog["annotations"]["openWorldHint"], false);
 
-        let call = tools
-            .iter()
-            .find(|tool| tool["name"] == verbs::MCP_CALL_TOOL)
-            .expect("call");
-        assert_eq!(
-            call["annotations"]["readOnlyHint"], false,
-            "call 能提交任务，绝不能声称只读"
-        );
-        assert_eq!(call["annotations"]["idempotentHint"], false);
-        assert_eq!(call["annotations"]["destructiveHint"], true);
-
-        // 单动词的精确标注在详情里。
-        //
         // ⚠️ `operation.run` 是**花钱且不幂等**的：幂等只在调用方显式传同一个 `idempotencyKey`
         // 时成立，而不带键的调用每次拿一个新键（`verbs::run_operation` 里生成）⇒ 重试就是
         // 第二次计费。所以这里必须断言 `false`——把它写成 `true`，等于在协议地板上对一条会
@@ -498,57 +514,260 @@ mod tests {
         assert_eq!(cancel["annotations"]["destructiveHint"], true);
     }
 
-    /// 服务端端出的**工具只有两个**（渐进式披露的形状），而**索引与表双向一致**。
+    /// **跨动词的规矩住在 `instructions`（只付一次），不在每条工具描述里（付 N 遍）。**
     ///
-    /// ⚠️ 为什么必须在这里（而不是在 `verbs.rs` 里对着渲染器断言）：渲染器与表同源，
-    /// 那种断言是同义反复。真正会漂移的是**这个函数**——有人又在这里手写一个工具，
-    /// 或者索引里漏掉/多出一个动词。
+    /// 判据（§D）：`instructions` 里能读到完整流程、付费警告**与并发上限的数字**；
+    /// 且**没有任何一条工具描述**在教"先调哪个工具"。
     ///
-    /// 负对照：把 `mcp_tools` 改回"每个动词一个工具" ⇒ 第一条红；
-    /// 把 `mcp_catalog` 里某个动词删掉 ⇒ 第二、三条红。
+    /// 负对照：把 `instructions` 里的流程段删掉 ⇒ 前两条红；
+    /// 在任意一条工具描述里写回 "call `renderloft_x` first" ⇒ 末一条红。
     #[test]
-    fn the_index_and_the_table_agree_in_both_directions() {
+    fn instructions_carry_the_cross_verb_rules() {
+        let text = instructions();
+        // 流程：提交之后用廉价的只读查询跟进（而不是在这条调用里干等）。
+        for needle in ["operation.get", "queued"] {
+            assert!(
+                text.contains(needle),
+                "instructions 里读不到流程（缺 {needle}）：{text}"
+            );
+        }
+        // 钱：花的是用户自己的额度，且重投会再花一次。
+        assert!(
+            text.contains("USER'S OWN platform credits") && text.contains("charged"),
+            "instructions 必须说清钱：{text}"
+        );
+        // 上限的数字必须**真的在里面**（数字来自强执行方，不手抄）。
+        assert!(
+            text.contains(&MAX_RUNS_PER_OPERATION.to_string()),
+            "instructions 里没有单次 runs 上限的数字：{text}"
+        );
+        assert!(
+            text.contains(&MAX_AUTONOMOUS_CONCURRENT_OPERATIONS.to_string()),
+            "instructions 里没有自主调用方并发上限的数字：{text}"
+        );
+        // 别把 `attention` 这件事漏了：`RUNNING` 不等于在动。
+        assert!(
+            text.contains("attention"),
+            "instructions 必须提醒 attention（RUNNING 不等于在动）：{text}"
+        );
+        // 工具描述里**不许**再教"先调哪个工具"（那正是压平要拆掉的形状）。
+        for tool in tools() {
+            let description = tool["description"].as_str().unwrap_or_default();
+            assert!(
+                !description.contains("first") || !description.contains("renderloft_"),
+                "{} 的描述里还在教先调别的工具：{description}",
+                tool["name"]
+            );
+        }
+    }
+
+    /// **已从清单里撤掉的调用口仍然认得**（弃用窗口），但**不许**再出现在 `tools/list` 里。
+    ///
+    /// 两件事必须同时成立，少一件都是坏的：
+    /// * 只撤不认 ⇒ 缓存过旧清单的调用方突然失败（不礼貌，而且是我们的形状变了）；
+    /// * 只认不撤 ⇒ 常驻里永远多一个"什么都能干"的工具，逐动作标注也就白压平了。
+    #[test]
+    fn the_deprecated_call_tool_is_still_accepted_but_no_longer_listed() {
+        assert!(
+            !tools()
+                .iter()
+                .any(|tool| tool["name"] == verbs::MCP_CALL_TOOL),
+            "`renderloft_call` 必须从 tools/list 里撤掉（这正是 B 那一步）"
+        );
+        // 名字仍然路由得到（兼容路径在 `invoke` 里，这里钉住路由本身不报错）。
+        let verb = verbs::route_call("operation.get").expect("动词应当仍然可达");
+        assert_eq!(verb.mcp_name, Some("renderloft_get_operation"));
+    }
+
+    /// **常驻预算**：`tools/list` 序列化后不许超过这个字符数。
+    ///
+    /// 为什么是一个写死的常数，而不是"看着还行"：压平之后**每一轮都要付这 N 条描述**，
+    /// 而"再补一句"是每次改动里最容易做、最难察觉的事。上限写在这里，越线就是红的。
+    ///
+    /// 口径：`tools/list` 的 JSON 序列化长度（名字 + 描述 + schema + 标注）。
+    /// **不含**索引 —— 索引是 `renderloft_catalog` 的返回，按需取，不进常驻。
+    ///
+    /// ⚠️ 设计文档（`docs/mcp-surface.md` §5.A）写的是"≤8000 字符"，那是**压平前的估算**；
+    /// 实测（2026-10-18，压平后）是 **12 534**（本测试量的口径 = `tools/list` 的 JSON 序列化；
+    /// `node scripts/mcp-cost.mjs` 另给拆分：描述 4 142 + schema 5 422 + 名字与标注 463）。
+    /// 上限按实测留约 5% 余量定在 13 200 —— 它要抓的是"又悄悄长了"，不是一个好看的整数。
+    ///
+    /// 为什么不再往下压：文档的判据是"**超预算就裁 description，不许动 schema**"，而描述已经被
+    /// 压到"只留调用它之前必须知道的事实"（16 条共 3 191 字符，平均 ~200）；再压就只剩同义反复，
+    /// 等于把逐动作的信息从常驻地板上撤掉——那正是这次压平要修的东西。
+    /// **要真正变小，唯一的杠杆是 schema（= 动词的参数面），那是另一件事。**
+    const TOOLS_LIST_BUDGET_CHARS: usize = 13_200;
+
+    /// 工具清单 = **表里开放的那些动词**（每个一个原生工具）＋ 一个按需查阅的参考工具。
+    ///
+    /// 判据里**不许写死数字**：写死的数字会过期（这份文档自己就漂过两次：13 → 14 → 16）。
+    /// 等于"表里 `mcp_name` 非空的行数 + 1"。
+    ///
+    /// 为什么压平（而不是留两个元工具）：审批层读的是 `tools/list` 里的**逐动作标注**，
+    /// 而一个工具只有一格 `annotations`，装 N 个动作时物理上只能报最保守值 ——
+    /// 于是"只读的"和"会花钱、不可逆的"在审批层长得一模一样。
+    ///
+    /// 负对照：把 `mcp_tools` 改回"索引 + 调用口"两个工具 ⇒ 第一条红。
+    #[test]
+    fn the_listed_tools_are_the_table_s_verbs_plus_the_reference_tool() {
         let served = tools()
             .iter()
             .map(|tool| tool["name"].as_str().expect("name").to_string())
             .collect::<Vec<_>>();
-        assert_eq!(
-            served,
-            vec![
-                verbs::MCP_CATALOG_TOOL.to_string(),
-                verbs::MCP_CALL_TOOL.to_string()
-            ],
-            "对外只该有两个工具：索引 + 调用口。多一个，常驻成本就长回来了"
-        );
-
-        let index = verbs::mcp_catalog();
         let exposed = verbs::VERBS
+            .iter()
+            .filter_map(|verb| verb.mcp_name)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            served.len(),
+            exposed.len() + 1,
+            "清单应当恰好是「表里开放的动词」+ 一个参考工具：{served:?}"
+        );
+        for name in &exposed {
+            assert!(served.contains(&name.to_string()), "清单里少了 {name}");
+        }
+        assert!(
+            served.contains(&verbs::MCP_CATALOG_TOOL.to_string()),
+            "参考工具（索引/详情）应当保留"
+        );
+        // 每个动词的工具必须带 schema 与标注（缺了就等于把门控信息又藏起来）。
+        for tool in tools() {
+            assert!(
+                tool.get("inputSchema").is_some(),
+                "{} 没有 schema",
+                tool["name"]
+            );
+            assert!(
+                tool.get("annotations").is_some(),
+                "{} 没有标注",
+                tool["name"]
+            );
+            assert!(
+                tool["description"].as_str().unwrap_or_default().len() > 20,
+                "{} 的描述太短，等于没给调用方任何信息",
+                tool["name"]
+            );
+        }
+        // 索引仍然与表双向一致（有人手写清单就会红）。
+        let index = verbs::mcp_catalog();
+        for verb_id in verbs::VERBS
             .iter()
             .filter(|verb| verb.mcp_name.is_some())
             .map(|verb| verb.id)
-            .collect::<Vec<_>>();
-        // 方向一：表里开放的动词，索引里都得有。
-        for verb_id in &exposed {
-            assert!(index.contains(verb_id), "索引里少了 {verb_id}：\n{index}");
+        {
+            assert!(index.contains(verb_id), "索引里少了 {verb_id}");
         }
-        // 方向二：索引行数必须**恰好**等于开放的动词数（多一行 = 有人手写了东西）。
         assert_eq!(
             index.lines().count(),
             exposed.len(),
-            "索引行数与表不一致（有人手写了一份清单？）：\n{index}"
+            "索引行数与表不一致（有人手写了一份清单？）"
         );
-        // 而且索引必须**真的挂在**常驻的那份描述里——否则模型根本看不到它。
-        let catalog_tool = tools()
-            .into_iter()
-            .find(|tool| tool["name"] == verbs::MCP_CATALOG_TOOL)
-            .expect("catalog tool");
-        let description = catalog_tool["description"].as_str().unwrap_or_default();
-        for verb_id in &exposed {
+    }
+
+    /// **门（gate）**：清单里每个动词的 `annotations` 与表**逐条相等**，风险标记的集合也与表相等。
+    ///
+    /// 这是压平工具面**唯一**的理由：审批层读的就是这一格。所以"清单里的标注 == 表里的字段"
+    /// 必须机器钉住 —— 渲染器与表同源只保证今天一致，保证不了"有人又在清单里手写一条工具"。
+    ///
+    /// 负对照：把 `mcp_annotations` 换回"按最保守的报"（压平前 `call` 的写法）⇒ 这条红。
+    #[test]
+    fn every_listed_verb_reports_the_table_s_own_annotations() {
+        let listed = tools();
+        for verb in verbs::VERBS.iter().filter(|verb| verb.mcp_name.is_some()) {
+            let name = verb.mcp_name.expect("mcp_name");
+            let tool = listed
+                .iter()
+                .find(|tool| tool["name"] == name)
+                .unwrap_or_else(|| panic!("清单里少了 {name}"));
+            assert_eq!(
+                tool["annotations"]["readOnlyHint"], verb.read_only,
+                "{name} 的 readOnlyHint 与表不一致"
+            );
+            assert_eq!(
+                tool["annotations"]["destructiveHint"], verb.destructive,
+                "{name} 的 destructiveHint 与表不一致"
+            );
+            assert_eq!(
+                tool["annotations"]["idempotentHint"], verb.idempotent,
+                "{name} 的 idempotentHint 与表不一致"
+            );
+            // 标记必须在描述**首行**（位置固定、可正则）——§C 的判据。
+            let description = tool["description"].as_str().unwrap_or_default();
             assert!(
-                description.contains(verb_id),
-                "常驻描述里少了 {verb_id}（索引没挂上去，等于能力不可见）"
+                description.starts_with(&verbs::mcp_markers(verb)),
+                "{name} 的描述没有以风险标记开头（标记只在索引里有 = 门控信息又藏起来了）：{description}"
             );
         }
+        // "只读"与"不可逆"必须**能分辨**（一个工具报最保守值时这一条必然废）。
+        assert!(
+            listed
+                .iter()
+                .any(|tool| tool["annotations"]["readOnlyHint"] == true),
+            "清单里应当有只读动词"
+        );
+        assert!(
+            listed
+                .iter()
+                .any(|tool| tool["annotations"]["destructiveHint"] == true),
+            "清单里应当有不可逆动词"
+        );
+        // 集合相等：`[COST]` 筛出的那些 == 表里会花钱的那些（逐条对上，不比总数）。
+        let marked = listed
+            .iter()
+            .filter(|tool| {
+                tool["description"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .starts_with(verbs::MCP_COST_MARKER)
+            })
+            .filter_map(|tool| tool["name"].as_str())
+            .collect::<Vec<_>>();
+        let expected = verbs::VERBS
+            .iter()
+            .filter(|verb| verb.spends_credits)
+            .filter_map(|verb| verb.mcp_name)
+            .collect::<Vec<_>>();
+        for name in &expected {
+            assert!(marked.contains(name), "[COST] 集合里少了 {name}");
+        }
+        assert_eq!(
+            marked.len(),
+            expected.len(),
+            "被标 [COST] 的比表里会花钱的多：{marked:?}"
+        );
+    }
+
+    /// **常驻预算不许越线**，而且它与应用数量无关。
+    ///
+    /// 负对照：把任意一条 description 复制三遍 ⇒ 这条红（实测过）。
+    #[test]
+    fn the_resident_tool_list_stays_within_its_budget() {
+        let listed = tools();
+        let serialized = serde_json::to_string(&listed).expect("序列化应成功");
+        // 失败时要说清**是哪一半长了**（描述还是 schema）——否则下次只能靠猜。
+        let descriptions: usize = listed
+            .iter()
+            .map(|tool| tool["description"].as_str().unwrap_or_default().len())
+            .sum();
+        let schemas: usize = listed
+            .iter()
+            .map(|tool| tool["inputSchema"].to_string().len())
+            .sum();
+        assert!(
+            serialized.len() <= TOOLS_LIST_BUDGET_CHARS,
+            "常驻工具清单 {} 字符，超过预算 {}（超了要裁描述，不许动 schema）——\
+             其中描述 {}、schema {}、其余（名字/标注/JSON 骨架）{}",
+            serialized.len(),
+            TOOLS_LIST_BUDGET_CHARS,
+            descriptions,
+            schemas,
+            serialized.len() - descriptions - schemas
+        );
+        assert!(
+            serialized.len() > 5_000,
+            "清单只有 {} 字符，不像渲染出了每个动词一个工具（是不是漏了？）",
+            serialized.len()
+        );
     }
 
     #[test]
@@ -715,15 +934,17 @@ mod tests {
             description.contains("image"),
             "要说清领域（图/视频），否则模型不知道这跟画图有关：{description}"
         );
-        // `call` 那边给一句短的 + 指向索引（常驻成本按字算，不重复整段）。
-        let call = tools
-            .iter()
-            .find(|tool| tool["name"] == verbs::MCP_CALL_TOOL)
-            .expect("call");
-        let call_description = call["description"].as_str().expect("description");
+        // 身份句必须**常驻**（模型没有跨轮记忆）：它现在有两个落点，两个都要在——
+        // `initialize.instructions`（协议专门放"这个 server 是干嘛的"字段）与参考工具的描述
+        // （模型只看 tools/list 时也能读到）。
+        let always_on = instructions();
         assert!(
-            call_description.contains("AIGC"),
-            "调用口也要有一句身份（模型可能先读它）：{call_description}"
+            always_on.contains("RenderLoft") && always_on.contains("Use it when"),
+            "instructions 必须同时说清「这是什么」与「什么时候该用它」：{always_on}"
+        );
+        assert!(
+            always_on.contains("image"),
+            "要说清领域（图/视频），否则模型不知道这跟画图有关：{always_on}"
         );
     }
 
@@ -789,13 +1010,30 @@ mod tests {
         .unwrap();
         let tools = response["result"]["tools"].as_array().unwrap();
         // 数量**钉死**：形状是刻意的（渐进式披露），改它必须是自觉的决定，不能是漂移。
-        assert_eq!(tools.len(), 2, "对外只有索引 + 调用口两个工具");
+        // 工具数按**表**算，不写死数字（写死的会过期：13 → 14 → 16 已经漂过三次）。
+        let expected = verbs::VERBS
+            .iter()
+            .filter(|verb| verb.mcp_name.is_some())
+            .count()
+            + 1; // + 参考工具
+        assert_eq!(
+            tools.len(),
+            expected,
+            "对外是「表里开放的动词」+ 一个参考工具"
+        );
         let names: Vec<&str> = tools
             .iter()
             .map(|tool| tool["name"].as_str().unwrap_or_default())
             .collect();
         assert!(names.contains(&verbs::MCP_CATALOG_TOOL));
-        assert!(names.contains(&verbs::MCP_CALL_TOOL));
+        assert!(
+            !names.contains(&verbs::MCP_CALL_TOOL),
+            "旧调用口已经从清单里撤掉（仍然认得，但不再列出）"
+        );
+        assert!(
+            names.contains(&"renderloft_run_recipe"),
+            "每个动词一个原生工具"
+        );
     }
 
     /// **工具列表是本地常量**：与表逐字相等，且**不含任何 per-app 工具**。
@@ -830,6 +1068,57 @@ mod tests {
     }
 
     /// 文本里的工具名（`renderloft_*`）：只吃 `[a-z_]` 那一段，不引正则依赖。
+    /// 文本里出现的**动词 id**（`operation.get` / `recipe.list-workflow` 这种）。
+    ///
+    /// 为什么压平之后需要它：跨动词的流程搬进了 `instructions`，而那些句子是**手写的散文**，
+    /// 里面写错一个动词 id（`operation.gett`）没有任何编译期检查 —— 调用方照着做就是"查一个
+    /// 不存在的动词"。所以按"表里有的 id 全扫一遍"来判：**扫到的必须都在表里**。
+    fn verb_ids_in(text: &str) -> Vec<String> {
+        let table_ids = verbs::VERBS.iter().map(|verb| verb.id).collect::<Vec<_>>();
+        let mut found = Vec::new();
+        for id in table_ids {
+            if text.contains(id) {
+                found.push(id.to_string());
+            }
+        }
+        // 表里没有的"像动词 id 的东西"也要能被抓住：按 `group.action` 的形状扫一遍，
+        // 再看它在不在表里（否则拼错的那个永远扫不到 —— 上面那圈只认表里已有的）。
+        let bytes = text.as_bytes();
+        let mut index = 0usize;
+        while index < bytes.len() {
+            let is_start = bytes[index].is_ascii_lowercase()
+                && (index == 0 || !bytes[index - 1].is_ascii_alphanumeric());
+            if is_start {
+                let mut end = index;
+                while end < bytes.len()
+                    && (bytes[end].is_ascii_lowercase()
+                        || bytes[end] == b'.'
+                        || bytes[end] == b'-'
+                        || bytes[end].is_ascii_digit())
+                {
+                    end += 1;
+                }
+                let candidate = &text[index..end];
+                if candidate.contains('.')
+                    && !candidate.ends_with('.')
+                    && candidate.split('.').count() == 2
+                {
+                    let (group, action) = candidate.split_once('.').expect("split");
+                    if !group.is_empty()
+                        && !action.is_empty()
+                        && !found.iter().any(|id| id == candidate)
+                    {
+                        found.push(candidate.to_string());
+                    }
+                }
+                index = end.max(index + 1);
+            } else {
+                index += 1;
+            }
+        }
+        found
+    }
+
     fn tool_names_in(text: &str) -> Vec<String> {
         const PREFIX: &str = "renderloft_";
         let mut names = Vec::new();
@@ -898,18 +1187,18 @@ mod tests {
         );
     }
 
-    /// **不可见 = 不存在**的可执行形式：被服务的文本里点名的工具，必须真的在 `tools/list` 里。
+    /// **不可见 = 不存在**的可执行形式：被服务的文本里点名的东西，必须真的够得到。
     ///
-    /// 为什么必须机器扫：漂移不是一两个名字，而是**散在描述里的 8 个**（`renderloft_describe_recipe`
-    /// 这一批），而清单里当时只有 `catalog` + `call` 两个 —— 守规矩的调用方只调被列出的工具，
-    /// 于是描述里那句"先调 X"要么被跳过、要么让人困惑。
+    /// 压平之后"被服务的文本"多了两处，判据也跟着扩：
+    /// * `tools/list` 的每条描述 + `instructions`：里面出现的 `renderloft_*` 名字必须**在清单里**
+    ///   （压平后每条动词描述都**不再点名别的工具**，所以这一半现在是"零命中即绿"——
+    ///   它拦的是"有人又把跨动词指示写回某条描述里"）；
+    /// * 同一份文本里出现的**动词 id**（`operation.get` 这种）必须在**表里真实存在** ——
+    ///   这是压平后新增的风险面：流程写进了 `instructions`，写错一个动词 id 就没有任何编译期检查；
+    /// * `catalog(<verb>)` 的**详情**（模型真正读的那一份）：里面的工具名必须是表里存在的名字。
     ///
-    /// 范围：今天扫 `tools/list` 的文本（两条描述）⇒ 绿。`catalog(<verb>)` 的**详情**也该扫，
-    /// 但那一份今天必然是红的（它点名 8 个尚未被列出的原生工具名，比如 `renderloft_describe_recipe`）
-    /// —— 等这些动词本身变成列出来的原生工具，两个范围就都绿了。所以这里先钉住**表那一侧**：
-    /// 详情里提到的名字必须是表里真实存在的（今天就能拦住"写了个拼错的名字"）。
-    ///
-    /// 负对照：把 `call` 描述里的 `renderloft_catalog` 改成 `renderloft_typo` ⇒ 第一条红。
+    /// 负对照：① 把 `instructions` 里的 `operation.get` 改成 `operation.gett` ⇒ 第二条红；
+    /// ② 在任意一条工具描述里写一句 "call `renderloft_typo` first" ⇒ 第一条红。
     #[test]
     fn every_tool_named_in_served_text_is_listed() {
         let served = tools()
@@ -919,18 +1208,28 @@ mod tests {
         let text = tools()
             .iter()
             .map(|tool| tool["description"].as_str().unwrap_or_default().to_string())
+            .chain(std::iter::once(instructions()))
             .collect::<Vec<_>>()
             .join("\n");
-        let named = tool_names_in(&text);
-        assert!(
-            !named.is_empty(),
-            "一个工具名都没扫到 —— 这条测试在空转（描述里总该提到点什么）"
-        );
-        for name in &named {
+        for name in tool_names_in(&text) {
             assert!(
-                served.contains(name),
-                "描述里点名了 `{name}`，但它不在 tools/list 里（清单：{served:?}）—— \
+                served.contains(&name),
+                "被服务的文本里点名了 `{name}`，但它不在 tools/list 里（清单：{served:?}）—— \
                  守规矩的调用方只会调被列出的工具，于是这一步要么被跳过、要么让人困惑"
+            );
+        }
+
+        // 动词 id：文本里提到的必须在表里存在（拼错一个字母 = 教调用方去调一个不存在的东西）。
+        let table_ids = verbs::VERBS.iter().map(|verb| verb.id).collect::<Vec<_>>();
+        let mentioned = verb_ids_in(&text);
+        assert!(
+            mentioned.contains(&"operation.get".to_string()),
+            "一个动词 id 都没扫到 —— 这条测试在空转（instructions 里应当提到主路径）"
+        );
+        for id in &mentioned {
+            assert!(
+                table_ids.contains(&id.as_str()),
+                "被服务的文本里提到了动词 `{id}`，而表里没有这个 id（表里现有：{table_ids:?}）"
             );
         }
 
