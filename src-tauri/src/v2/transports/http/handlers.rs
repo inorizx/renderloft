@@ -1141,6 +1141,18 @@ fn run_response(run: &crate::v2::domain::operation::Run) -> Value {
         "connectionRevisionId": run.connection_revision_id.0,
         "status": run.status.as_str(),
         "trackingState": run.tracking_state.as_str(),
+        // 提交时用的**输入**（`inputs`）。
+        //
+        // ⚠️ 这个字段是 2026-10-18 **补上**的，不是一直都有 —— 而在此之前，服务出去的文案已经
+        // 承诺过它：`renderloft_get_operation` 的描述写着"每条 run 都带提交时的 `inputs`"
+        // （cookbook §11 的恢复建议也建立在它之上：**读 `inputs` 与 `error` 一起读，改对了再重投**）。
+        // 也就是说：调用方照文案去做，会**找不到** `inputs`，而它正处在"要不要再花一次钱"的判断里。
+        // 这是本项目一直在消灭的那类问题——**接口说了它没做的事**。实测发现（给预览框做
+        // "结果按输入分组"时，发现界面拿不到 `inputs`，回头一查是这里从来没发）。
+        //
+        // 只加在**详情**（与 `GET /api/v1/runs/{id}`）上：列表接口按设计只回摘要
+        // （`runCount` + `attention`），**不带** runs、更不带 inputs —— 那条边界没动。
+        "inputs": run.inputs,
         // 「它为什么没在动」：非终态里"在等什么"的那些给出原因 + 死线 + 下一动作
         // （见 `domain::operation::run_attention`）。正常在跑的与终态是 null。
         "attention": crate::v2::domain::operation::run_attention(run),
