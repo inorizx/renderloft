@@ -1977,6 +1977,81 @@ mod tests {
         assert_eq!(persisted.runs[0].status, RunStatus::Accepted);
     }
 
+    /// 不确定的 attempt **必须把「为什么不明」落库**（真库，不是替身）。
+    ///
+    /// 为什么这条要有：提交失败进不确定态时，这是**唯一**会留下来的证据——事件载荷只有一句
+    /// message（不含原因链），daemon 日志那一行要等到死线才写。少了它，「连接被拒」
+    /// （`details.nothingSent = true`，字节一定没出去）与「发出去后超时」（`false`，
+    /// 可能已经收下）在库里长得一模一样，而这两类能不能重投是**相反**的回答。
+    ///
+    /// 负对照：把 `complete_attempt` 的 `Uncertain` 分支改回 `None` ⇒ 这条红。
+    #[tokio::test]
+    async fn an_uncertain_attempt_keeps_the_reason_it_is_uncertain() {
+        use crate::v2::ports::repositories::AttemptResolution;
+
+        let repositories = SqliteRepositories::in_memory().unwrap();
+        {
+            let connection = repositories
+                .connection
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            seed_recipe(&connection);
+            seed_connection(&connection);
+        }
+        repositories
+            .create_operation(new_operation(actor()))
+            .await
+            .expect("创建应成功");
+        let claimed = repositories
+            .claim_next_run(
+                "scheduler-a",
+                "fencing-token-uncertain",
+                ConnectionRevisionId(1),
+                Timestamp::now(),
+            )
+            .await
+            .expect("claim 应成功")
+            .expect("应有可领取的 Run");
+
+        let evidence = SafeError {
+            code: "PROVIDER_UNREACHABLE_SUBMIT".to_string(),
+            kind: crate::v2::domain::errors::ErrorKind::Network,
+            message: "连不上 submit".to_string(),
+            retryable: true,
+            details: std::collections::BTreeMap::from([("nothingSent".to_string(), json!(true))]),
+        };
+        repositories
+            .complete_attempt(
+                claimed.run.id,
+                "fencing-token-uncertain",
+                AttemptResolution::Uncertain {
+                    remote_handle: None,
+                    error: Some(evidence.clone()),
+                },
+            )
+            .await
+            .expect("complete 应成功");
+
+        let attempt = repositories
+            .find_latest_attempt(claimed.run.id)
+            .await
+            .expect("查 attempt")
+            .expect("应当有 attempt");
+        assert_eq!(
+            attempt.status,
+            crate::v2::domain::operation::AttemptStatus::Uncertain
+        );
+        assert!(attempt.remote_handle.is_none(), "不确定态没有远端句柄");
+        let stored = attempt.error.expect("原因必须落库");
+        assert_eq!(stored.code, "PROVIDER_UNREACHABLE_SUBMIT");
+        assert_eq!(
+            stored.details.get("nothingSent"),
+            Some(&json!(true)),
+            "「字节没出去」这条证据必须一起存下来：{:?}",
+            stored.details
+        );
+    }
+
     /// 真 HTTP 投递：打到**真实的本地接收端**（不是假投递器），并**按契约验签**。
     ///
     /// 为什么这条必须有：`FakeCallbackDeliverer` 只证明"服务被调用了"，证明不了

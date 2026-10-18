@@ -218,10 +218,24 @@ pub fn map_network_error(error: &reqwest::Error, operation: &str) -> SafeError {
     details.insert("operation".to_string(), serde_json::json!(operation));
     // 原因链（`error.to_string()` 只有最外层那句"error sending request for url …"，
     // 真正有用的"connection refused / dns error / certificate"都在 source 链里）。
+    let cause = cause_chain(error, 300);
+    // 「字节到底出没出去」：**只在这条判据说"能证明"时才写 true**，其余一律 false
+    // （"证明不了"也是一个结论，而且要能被看出来——缺字段会被读成"没查"）。
+    //
+    // 为什么必须落进 details：提交失败进不确定态时，**这是唯一会留下来的证据**
+    //（`run.submission_uncertain` 的事件载荷只有一句 message，日志那一行要等到死线才写）。
+    let nothing_sent = nothing_sent_evidence(error.is_connect(), error.is_timeout(), &cause);
     details.insert(
-        "cause".to_string(),
-        serde_json::json!(cause_chain(error, 300)),
+        "nothingSent".to_string(),
+        serde_json::json!(nothing_sent.is_some()),
     );
+    if let Some(evidence) = nothing_sent {
+        details.insert(
+            "nothingSentEvidence".to_string(),
+            serde_json::json!(evidence),
+        );
+    }
+    details.insert("cause".to_string(), serde_json::json!(cause));
     if let Some(proxy) = proxy {
         details.insert("outboundProxy".to_string(), serde_json::json!(proxy));
     }
@@ -250,6 +264,66 @@ pub fn map_network_error(error: &reqwest::Error, operation: &str) -> SafeError {
             details,
         }
     }
+}
+
+/// 这次网络失败**能不能证明「请求字节根本没出去」**？
+///
+/// 返回 `Some(原因码)` = 能证明；`None` = **证明不了**（必须当成"请求可能已经到达平台"）。
+///
+/// ## 为什么需要这条判据（实测，2026-10-17）
+///
+/// `map_network_error` 把 `is_connect() || is_request()` 都归成 Network，而
+/// `application/scheduler.rs` 把 Network / Timeout **一律**落 `SUBMISSION_UNCERTAIN` ——
+/// 于是「连接被拒」（字节一定没出去）与「发出去后超时」（字节可能出去了）在下游长得一模一样，
+/// 只能一起等到死线（默认 1 小时）。判据的意义就是**把这两类分开**。
+///
+/// ## ⚠️ 它不是"可以重投"的许可
+///
+/// 唯一能证明"重投不会重复计费"的东西是**平台侧去重**，而幂等指纹
+/// （`PreparedExecution.request_id`）从来没有发给平台（见 `domain::execution::RecoveryProof`）。
+/// 所以这里产出的是**证据**，不是结论：要接"这类自动退避重试"，先让 recovery proof 有真生产者。
+///
+/// ## 三档证据（按强度）
+///
+/// * `DNS_FAILURE` —— 名字都没解析出来，连 socket 都没建；
+/// * `CONNECTION_REFUSED` —— 对端**主动拒绝**握手；
+/// * `CONNECT_TIMEOUT` —— 握手阶段就超时（连接没建起来）。
+///
+/// 其余**一律 `None`**：发送后超时、连接被重置、响应读到一半断、TLS 建立之后失败 ——
+/// 这些的 TCP 层已经通了，请求**可能已经在对面跑起来了**。宁可说"不知道"。
+///
+/// 参数拆成 `is_connect` / `is_timeout` / `cause` 而不是收 `&reqwest::Error`：`reqwest::Error`
+/// **造不出来**（只能由一次真的失败产生），拆开之后这条判据能被穷举测试——包括
+/// "发送后超时"这种必须返回 `None` 的反向控制。
+pub fn nothing_sent_evidence(
+    is_connect: bool,
+    is_timeout: bool,
+    cause: &str,
+) -> Option<&'static str> {
+    let cause = cause.to_ascii_lowercase();
+    // DNS：英文两种写法 + Windows 的 WSAHOST_NOT_FOUND。
+    if cause.contains("dns")
+        || cause.contains("failed to lookup address information")
+        || cause.contains("name or service not known")
+        || cause.contains("nodename nor servname")
+        || cause.contains("os error 11001")
+    {
+        return Some("DNS_FAILURE");
+    }
+    // 连接被拒：英文 + Windows 的 WSAECONNREFUSED。中文那半是给中文 Windows 的
+    //（实测本机 OS 错误串是"由于目标计算机积极拒绝，无法连接。 (os error 10061)"）——
+    // 单独一个"拒绝"不够（可能来自别的句子），所以要求它与"连接"同时出现。
+    if cause.contains("connection refused")
+        || cause.contains("os error 10061")
+        || (cause.contains("拒绝") && cause.contains("连接"))
+    {
+        return Some("CONNECTION_REFUSED");
+    }
+    // 握手阶段就超时：连接根本没建起来（`is_connect()` 覆盖 TCP/TLS 握手）。
+    if is_connect && is_timeout {
+        return Some("CONNECT_TIMEOUT");
+    }
+    None
 }
 
 /// 把错误的原因链拼成一行（`a → b → c`），并按字符数截断——details 是给排查用的，
@@ -498,6 +572,157 @@ mod tests {
             cause.contains("127.0.0.1") || cause.contains("connection") || cause.contains("拒绝"),
             "主机与底层原因应当留下：{cause}"
         );
+    }
+
+    /// 「字节到底出没出去」的判据：**能证明的只有三档，其余一律"不知道"**。
+    ///
+    /// 判别点两组，缺一组都不算做对：
+    /// 1. 三档证据各自能认出来（含中文 Windows 的 OS 错误串——实测本机就是那种）；
+    /// 2. **反向控制**：TCP 层已经通了的那些（发送后超时、连接被重置、读到一半断、TLS 之后
+    ///    失败）**必须全部返回 `None`**。少了这一组，一个"只要失败就说没出去"的实现也能过第 1 组
+    ///    ——而那个实现会让"可能已经收下"的提交被重投，也就是重复扣费。
+    ///
+    /// 负对照：把最后那档 `is_connect && is_timeout` 改成 `is_timeout` ⇒ 第 2 组里
+    /// "发送后超时"那条红（那正是最危险的一种误判）。
+    #[test]
+    fn nothing_sent_is_proven_only_by_pre_send_evidence() {
+        // 1) 能证明的三档。
+        for (cause, expected) in [
+            (
+                "error sending request for url (https://api.example/v1) → client error (Connect) → dns error: failed to lookup address information: Name or service not known",
+                "DNS_FAILURE",
+            ),
+            (
+                "error sending request for url (http://127.0.0.1:9/x) → client error (Connect) → tcp connect error: 由于目标计算机积极拒绝，无法连接。 (os error 10061)",
+                "CONNECTION_REFUSED",
+            ),
+            (
+                "error sending request for url (https://api.example/v1) → client error (Connect) → connection refused",
+                "CONNECTION_REFUSED",
+            ),
+            (
+                "error sending request for url (https://api.example/v1) → operation timed out",
+                "CONNECT_TIMEOUT",
+            ),
+        ] {
+            // 最后一档要求 is_connect 为真（握手阶段超时），前两档与标志无关。
+            let connect = expected == "CONNECT_TIMEOUT";
+            assert_eq!(
+                nothing_sent_evidence(connect, connect, cause),
+                Some(expected),
+                "这条原因链应当能证明「字节没出去」：{cause}"
+            );
+        }
+
+        // 2) 反向控制：TCP 层通了的一律证明不了。
+        for (is_connect, is_timeout, cause) in [
+            // 发送之后才超时：请求**可能已经在对面跑起来了**（最常见也最危险的一种）。
+            (
+                false,
+                true,
+                "error sending request for url (https://api.example/v1) → operation timed out",
+            ),
+            // 连接被重置：对端可能已经读到请求。
+            (
+                false,
+                false,
+                "error sending request for url (https://api.example/v1) → connection reset by peer (os error 10054)",
+            ),
+            // 读到一半断。
+            (
+                false,
+                false,
+                "error decoding response body: connection closed before message completed",
+            ),
+            // 别的 TLS/协议失败（证书、HTTP2 之类）：可能已经握过手。
+            (
+                false,
+                false,
+                "error sending request for url (https://api.example/v1) → invalid peer certificate: UnknownIssuer",
+            ),
+        ] {
+            assert_eq!(
+                nothing_sent_evidence(is_connect, is_timeout, cause),
+                None,
+                "TCP 层已经通了就不能说「没出去」——那会让可能已收下的提交被重投：{cause}"
+            );
+        }
+    }
+
+    /// 真的连一次没人听的端口：这条把判据接到 `reqwest` 上，证明它认得出真实的拒绝。
+    ///
+    /// 为什么不能只测纯函数：`is_connect()` / 原因链都是 `reqwest` 给的，**判据读错了字段**
+    /// （比如把 `is_connect` 写成 `is_request`）纯函数测试照样绿。
+    #[tokio::test]
+    async fn a_real_connection_refusal_is_proven_to_have_sent_nothing() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("应能占用端口");
+        let port = listener.local_addr().expect("应能读出端口").port();
+        drop(listener);
+        let client = reqwest::Client::builder()
+            .no_proxy()
+            .build()
+            .expect("应能建客户端");
+        let error = client
+            .get(format!("http://127.0.0.1:{port}/task/openapi/create"))
+            .timeout(std::time::Duration::from_secs(5))
+            .send()
+            .await
+            .expect_err("没人听的端口应当连不上");
+
+        let mapped = map_network_error(&error, "submit");
+        assert_eq!(
+            mapped.details.get("nothingSent"),
+            Some(&serde_json::json!(true)),
+            "连接被拒 = 一个字节都没发出去，必须如实标出来：{:?}",
+            mapped.details
+        );
+        assert_eq!(
+            mapped.details.get("nothingSentEvidence"),
+            Some(&serde_json::json!("CONNECTION_REFUSED"))
+        );
+    }
+
+    /// 反向控制（真请求）：**对端收下了请求但一直不回话** ⇒ 必须说"不知道"。
+    ///
+    /// 这是判据里最要紧的一条：这种失败与"连接被拒"在下游（`SUBMISSION_UNCERTAIN`）长得一样，
+    /// 但请求**已经在对面了** —— 把它当成"没出去"就会重复提交、重复扣费。
+    #[tokio::test]
+    async fn a_sent_request_that_times_out_is_not_proven_to_have_sent_nothing() {
+        // 一个只 accept、永远不回话的服务器：连接**建起来了**，请求**发出去了**。
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("应能监听");
+        let port = listener.local_addr().expect("应能读出端口").port();
+        let held = tokio::spawn(async move {
+            let mut sockets = Vec::new();
+            while let Ok((socket, _)) = listener.accept().await {
+                sockets.push(socket); // 攥着不放，也不写任何响应
+            }
+        });
+        let client = reqwest::Client::builder()
+            .no_proxy()
+            .build()
+            .expect("应能建客户端");
+        let error = client
+            .get(format!("http://127.0.0.1:{port}/task/openapi/create"))
+            .timeout(std::time::Duration::from_millis(300))
+            .send()
+            .await
+            .expect_err("对端不回话应当超时");
+
+        let mapped = map_network_error(&error, "submit");
+        assert_eq!(
+            mapped.details.get("nothingSent"),
+            Some(&serde_json::json!(false)),
+            "请求已经发出去了，不能说「没出去」：{:?}",
+            mapped.details
+        );
+        assert!(
+            !mapped.details.contains_key("nothingSentEvidence"),
+            "证明不了就不该给证据码：{:?}",
+            mapped.details
+        );
+        held.abort();
     }
 
     /// 原因链按字符截断（details 是人看的，不该被一条超长的系统错误撑爆）。

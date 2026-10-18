@@ -1005,14 +1005,24 @@ impl OperationRepository for SqliteRepositories {
                             .map_err(|_| SafeError::storage("无法序列化错误"))?,
                     ),
                 ),
-                AttemptResolution::Uncertain { remote_handle } => (
+                AttemptResolution::Uncertain {
+                    remote_handle,
+                    error,
+                } => (
                     "UNCERTAIN".to_string(),
                     remote_handle
                         .as_ref()
                         .map(serde_json::to_string)
                         .transpose()
                         .map_err(|_| SafeError::storage("无法序列化 remote handle"))?,
-                    None,
+                    // 「为什么不明」必须落库：提交失败进不确定态时，这是**唯一**会留下来的证据
+                    //（事件载荷只有一句 message，日志那一行要等到死线才写）。少了它，
+                    //「连接被拒」与「发出去后超时」在库里长得一模一样。
+                    error
+                        .as_ref()
+                        .map(serde_json::to_string)
+                        .transpose()
+                        .map_err(|_| SafeError::storage("无法序列化错误"))?,
                 ),
             };
         transaction
