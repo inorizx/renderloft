@@ -217,6 +217,25 @@ const messages = {
     'task.fieldRunStatus': '任务状态',
     'task.noRunsRecorded': '此操作尚未记录 run。',
     'task.failureReasons': '失败原因',
+    // 「它为什么没在动」：排队 / 退避重试 / 提交结果不明，状态**都显示「进行中」**，
+    // 所以这几句是"它其实没在动"的唯一解释（原因码 → 文案，见 shared/lib/attention.ts）。
+    'attention.title': '它其实没在动',
+    'attention.uncertain': '等确认（提交结果不明）',
+    'attention.retryBackoff': '退避重试中',
+    'attention.submitting': '正在提交',
+    'attention.queued': '排队中',
+    'attention.deadline': '{time} 判失败',
+    'attention.noDeadline': '没有死线（会一直等下去）',
+    'attention.whyUncertain':
+      '提交时连接断了或超时，平台到底收没收到不知道，所以不会自动重投。到死线仍确认不了就判失败。',
+    'attention.whyUncertainNoDeadline':
+      '提交时连接断了或超时，平台到底收没收到不知道，正在对账确认。',
+    'attention.whyRetryBackoff':
+      '上一次提交没成功（平台拒了，或连接被拒这类"字节没出去"的失败），正在自动重试——不需要你做什么。',
+    'attention.whySubmitting': '正在提交：进程若在这里中断，超过恢复窗口会自动转成「等确认」。',
+    'attention.whyQueued':
+      '排队中：这条连接同时只跑一个（与平台账号的实际并发一致），前面还有没结束的任务。',
+    'task.confirmRetry': '重试会新建一个任务（沿用原任务的参数），并且会再计费一次。要继续吗？',
 
     'common.create': '创建',
     'common.creating': '创建中…',
@@ -1038,6 +1057,27 @@ const messages = {
     'task.fieldRunStatus': 'Run status',
     'task.noRunsRecorded': 'No runs recorded for this operation.',
     'task.failureReasons': 'Failure reasons',
+    // See the Chinese block: queued / retry-backoff / submission-uncertain all *look* like
+    // "in progress", so these lines are the only explanation that it is not actually moving.
+    'attention.title': 'It is not actually moving',
+    'attention.uncertain': 'Waiting for confirmation (submission outcome unknown)',
+    'attention.retryBackoff': 'Waiting to retry',
+    'attention.submitting': 'Submitting',
+    'attention.queued': 'Queued',
+    'attention.deadline': 'gives up at {time}',
+    'attention.noDeadline': 'no deadline (it keeps waiting)',
+    'attention.whyUncertain':
+      'The connection dropped or timed out while submitting, so we do NOT know whether the platform received it — which is why it is never re-submitted automatically. If it is still unconfirmed at the deadline, it is marked failed.',
+    'attention.whyUncertainNoDeadline':
+      'The connection dropped or timed out while submitting; we do not know whether the platform received it and are reconciling.',
+    'attention.whyRetryBackoff':
+      'The last submission did not go through (the platform refused it, or the failure proved that no bytes left this machine). It is retrying automatically — nothing for you to do.',
+    'attention.whySubmitting':
+      'Submitting now: if the process is interrupted here, it becomes "waiting for confirmation" once the recovery window passes.',
+    'attention.whyQueued':
+      'Queued: this connection runs one task at a time (matching the account’s real concurrency) and an earlier run has not finished.',
+    'task.confirmRetry':
+      'Retrying creates a NEW task (reusing this task’s parameters) and charges your account again. Continue?',
 
     'common.create': 'Create',
     'common.creating': 'Creating…',

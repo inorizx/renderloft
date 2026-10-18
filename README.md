@@ -23,11 +23,11 @@
 **平台是可插拔的**：daemon 只认「驱动」不认品牌——接一家新的就是加一个驱动，而参数化、批量、
 任务恢复、产物管理这些能力不随平台变（接缝写在 [ARCHITECTURE.md](ARCHITECTURE.md)）。
 
-| 能力来源 | 怎么接 | 现在能做什么 |
-|---|---|---|
-| **RunningHub**（国内站 / 国际站） | 平台 API Key | 粘链接或 ID 导入平台上的**应用**与**工作流**，参数化成表单再跑 |
+| 能力来源                                                     | 怎么接                                           | 现在能做什么                                                    |
+| ------------------------------------------------------------ | ------------------------------------------------ | --------------------------------------------------------------- |
+| **RunningHub**（国内站 / 国际站）                            | 平台 API Key                                     | 粘链接或 ID 导入平台上的**应用**与**工作流**，参数化成表单再跑  |
 | **ComfyUI**（本机 / 云端，含跑在 RunningHub 云端的代理地址） | 服务地址；云端那档复用一条 RunningHub 连接的 Key | 导入 ComfyUI「保存(API 格式)」的 JSON，再勾选要暴露成表单的字段 |
-| **OpenAI 兼容的图像 / 模型 API** | 平台地址 + Key | 拉取平台声明的模型清单，勾选这条连接要跑的模型 |
+| **OpenAI 兼容的图像 / 模型 API**                             | 平台地址 + Key                                   | 拉取平台声明的模型清单，勾选这条连接要跑的模型                  |
 
 > 下面各节里会出现很多 RunningHub 的具体字样（Key 在哪、去哪注册、字段为什么长那样）——
 > 那是**拿它当例子**讲清楚一条连接怎么配通，不是这个产品只认它。
@@ -147,7 +147,11 @@ RenderLoft 自带一个 MCP 服务器（stdio），把本机 daemon 的能力暴
 在你的 MCP 客户端配置里指向 `renderloft-mcp.exe` 即可——**它和界面是同一个安装包里的同一个目录**（安装版默认在 `%LOCALAPPDATA%\RenderLoft`），不需要单独下载；免安装 zip 与 Linux 便携包里就是解压目录里的那个（Linux 无 `.exe` 后缀）：
 
 ```json
-{ "mcpServers": { "renderloft": { "command": "C:\\Users\\<你>\\AppData\\Local\\RenderLoft\\renderloft-mcp.exe" } } }
+{
+  "mcpServers": {
+    "renderloft": { "command": "C:\\Users\\<你>\\AppData\\Local\\RenderLoft\\renderloft-mcp.exe" }
+  }
+}
 ```
 
 > `renderloft-mcp.exe` 是 **stdio 服务**：由 MCP 客户端按需拉起，不用常驻；自己编译的话路径是 `<仓库路径>\src-tauri\target\release\renderloft-mcp.exe`。它连的 daemon 如果没在跑，**它会自己把旁边的 `renderloft.exe` 拉起来**（CLI 也一样）——所以不必先打开界面。
@@ -213,11 +217,12 @@ GUI（Vue + Tauri）/ CLI / MCP —— 都是客户端
 **提交时连不上平台**：分两种，**都按实际情况处理，不用你判断**——「连接被拒 / DNS 解析失败 / 握手就超时」这类**一个字节都没发出去**（平台什么都没收到），所以**30 秒后自动重试**，不会重复计费；「发出去之后才超时 / 连接被重置」这类**可能平台已经收下了**，所以它落到「等确认」，等到对账确认或 1 小时死线判失败——**绝不自动重投**（重投就是再花一次钱）。
 
 **任务一直显示「进行中」，但它其实没在动**：排队、退避重试、提交结果不明这几种，状态**都是「进行中」**。
-用 `renderloft-cli operation list`（列表里就有）或 `operation get --operation <id>` 看那条 `attention`：
-它给出**原因码 + 一句人话 + 死线 + 到点会怎样 + 现在能做什么**；`attention` 是 `null` 才代表真的在跑
-（MCP 那侧是同名的 `renderloft_list_operations` / `renderloft_get_operation`）。
-要放弃重来就用 `operation retry`——它是**新建一个任务**（会再计费一次），批量里只失败了几条时记得加
-`--run <id>`，否则成功的那几条会被再提交一遍。（界面暂时还没有这一栏，命令行 / MCP 先有。）
+界面里任务卡片上会直接写出来（「它其实没在动 · 等确认 · 15:52 判失败」），点开详情还有一句解释；
+命令行 / MCP 那侧用 `renderloft-cli operation list`（列表里就有）或 `operation get --operation <id>`
+看那条 `attention`：它给出**原因码 + 一句人话 + 死线 + 到点会怎样 + 现在能做什么**；
+`attention` 是 `null` 才代表真的在跑（MCP 那侧是同名的 `renderloft_list_operations` / `renderloft_get_operation`）。
+要放弃重来就用 `operation retry`（界面上的「重新运行」也是它）——它是**新建一个任务**（会再计费一次，
+所以界面会先问你一句），批量里只失败了几条时记得加 `--run <id>`，否则成功的那几条会被再提交一遍。
 
 **截图/日志里能不能出现密钥**：不能。密钥只在系统凭据库里，界面只显示尾号，daemon 从不回传它。
 

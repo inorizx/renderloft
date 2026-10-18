@@ -12,6 +12,7 @@ import {
   RefreshCw,
   RotateCcw,
   Send,
+  TriangleAlert,
   X
 } from '@lucide/vue'
 import { useRouter } from 'vue-router'
@@ -32,6 +33,7 @@ import { useTaskCenterStore } from '@/shared/stores/task-center'
 import { TASKCENTER_OVERLAY_MAX_WIDTH } from '@/shared/config/layout'
 import { useLocale } from '@/shared/composables/useLocale'
 import { taskStatusLabel, taskStatusTone } from '@/shared/lib/taskStatus'
+import { attentionExplanation, attentionReasonLabel, attentionTone } from '@/shared/lib/attention'
 import { formatSeconds } from '@/shared/lib/duration'
 import { formatRelativeTime, timestampOf } from '@/shared/lib/relativeTime'
 
@@ -816,6 +818,8 @@ const markViewed = () => {
 }
 
 const retryOperation = async (operation: OperationDetail) => {
+  // ⚠️ 先问一句：重试的语义是**新建一个任务**（会再计费一次），不是"把这一次接着跑完"。
+  if (!window.confirm(t('task.confirmRetry'))) return
   detailTask.value = undefined
   try {
     await v2.retryOperation(operation.operationId)
@@ -1294,6 +1298,32 @@ onBeforeUnmount(() => {
           <p class="mt-5 text-xs font-semibold text-muted-foreground">
             {{ detailTask.runs.length }} {{ t('task.runs') }}
           </p>
+          <!--
+            「它其实没在动」：这一块是**唯一**能把"进行中"与"真的在跑"分开的东西。
+            文案由界面按**原因码**取（后端那两句是中文原文，给 CLI/MCP/Agent 用的），
+            所以英文界面里不会蹦出中文。
+          -->
+          <div
+            v-if="detailTask.attention"
+            class="mt-4 space-y-1.5 rounded-md border border-amber-500/40 bg-amber-500/10 px-3 py-2 text-xs"
+          >
+            <p class="flex items-center gap-1.5 font-semibold text-amber-700 dark:text-amber-400">
+              <TriangleAlert class="size-3.5 shrink-0" aria-hidden="true" />
+              {{ t('attention.title') }} · {{ attentionReasonLabel(detailTask.attention.reason) }}
+            </p>
+            <p class="text-amber-800/90 dark:text-amber-200/90">
+              {{
+                attentionExplanation(detailTask.attention.reason, !!detailTask.attention.deadline)
+              }}
+            </p>
+            <p class="text-amber-800/80 dark:text-amber-200/80">
+              {{
+                detailTask.attention.deadline
+                  ? t('attention.deadline', { time: detailTime(detailTask.attention.deadline) })
+                  : t('attention.noDeadline')
+              }}
+            </p>
+          </div>
           <div v-if="detailTask.runs.length" class="mt-2 space-y-1.5">
             <div
               v-for="run in detailTask.runs"
@@ -1306,6 +1336,10 @@ onBeforeUnmount(() => {
               <span class="shrink-0 text-muted-foreground">{{
                 runTrackingLabel(run.trackingState)
               }}</span>
+              <!-- 哪一条 run 在等（批量里可能只有第 3 条不确定，其余都正常）。 -->
+              <StatusBadge v-if="run.attention" :status="attentionTone(run.attention.reason)">{{
+                attentionReasonLabel(run.attention.reason)
+              }}</StatusBadge>
               <StatusBadge :status="statusTone(run.status)">{{
                 statusLabel(run.status)
               }}</StatusBadge>

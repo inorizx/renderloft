@@ -118,6 +118,18 @@
               <p class="mt-1 truncate text-xs text-muted-foreground">
                 #{{ task.operationId }} · {{ task.runs.length }} {{ t('task.runs') }}
               </p>
+              <!--
+                「它其实没在动」：排队 / 退避重试 / 等确认这几种，状态**都显示「进行中」**，
+                所以这里必须自己说一句——否则用户看到的就是一个永远转圈的任务
+                （实测吃过一次 40 分钟误报：对外报"预计 10 分钟出片"）。
+              -->
+              <p
+                v-if="task.attention"
+                class="mt-1 flex items-center gap-1.5 text-xs text-amber-600 dark:text-amber-500"
+              >
+                <TriangleAlert class="size-3.5 shrink-0" aria-hidden="true" />
+                <span class="truncate">{{ attentionLine(task.attention) }}</span>
+              </p>
               <div class="mt-4 flex items-center justify-between">
                 <time class="text-xs text-muted-foreground">{{ formatDate(task.createdAt) }}</time>
                 <!--
@@ -213,7 +225,8 @@ import {
   Play,
   RotateCcw,
   Search,
-  Trash2
+  Trash2,
+  TriangleAlert
 } from '@lucide/vue'
 import PageContainer from '@/components/layout/PageContainer.vue'
 import PageHeader from '@/components/PageHeader.vue'
@@ -227,6 +240,7 @@ import { useV2WorkspaceStore } from '@/features/v2/stores/workspace'
 import { useAppStore } from '@/shared/stores/app'
 import { useLocale } from '@/shared/composables/useLocale'
 import { taskStatusLabel, taskStatusTone } from '@/shared/lib/taskStatus'
+import { attentionReasonLabel } from '@/shared/lib/attention'
 import { formatUsage } from '@/shared/lib/runUsage'
 import type { TaskResult } from '@/shared/types/runninghub'
 
@@ -520,8 +534,21 @@ const previewGallery = computed(() =>
 )
 const previewIndex = ref(0)
 const retryingId = ref<number>()
+/**
+ * 「它其实没在动 · 等确认 · 14:32 判失败」——一句话说清"在等什么、等到什么时候"。
+ *
+ * 没有死线的档位（排队、退避重试）**只说原因**：说"到点判失败"会让人去等一个不会发生的事件
+ * （后端为这句话专门改过一次 `deadlineEffect`）。
+ */
+const attentionLine = (attention: { reason: string; deadline?: string | null }) => {
+  const reason = attentionReasonLabel(attention.reason)
+  const deadline = attention.deadline ? formatDate(attention.deadline) : ''
+  return deadline ? `${reason} · ${t('attention.deadline', { time: deadline })}` : reason
+}
 const retry = async (task: OperationDetail) => {
   if (retryingId.value !== undefined) return
+  // ⚠️ 先问一句：重试的语义是**新建一个任务**（会再计费一次），不是"把这一次接着跑完"。
+  if (!window.confirm(t('task.confirmRetry'))) return
   retryingId.value = task.operationId
   try {
     await v2.retryOperation(task.operationId)
