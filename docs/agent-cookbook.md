@@ -479,11 +479,15 @@ renderloft_call { "verb": "operation.retry",  "args": { "operationId": 70, "runI
    想重试，先确认你要放弃的是哪一个（这也是"先 cancel"的意义：它让"旧的还算不算数"没有歧义）。
 
 `cancel` 的返回分四类：`cancelled`（已在本机结束）、`alreadyTerminal`（本来就是终态）、
-`pending`（本机没能结束它）、`remoteMayContinue`（**有远端句柄、但远端没确认取消** ⇒ 远端可能还在跑）。
+`pending`（本机没能结束它）、`remoteMayContinue`（**远端可能还在跑** —— 包括"有句柄但远端没确认
+取消"与"**根本没有句柄**"两种）。
 
-> ⚠️ 一个**没有远端句柄**的 run（典型就是「等确认」的那些）只会落进 `cancelled`：本机确实结束了，
-> 但**远端那一份（如果真发出去了）我们既取消不了、也看不见**。别把 `cancelled` 读成
-> 「平台上一定没有残留」。
+> ⚠️ **`cancelled` 与 `remoteMayContinue` 可以同时出现**，而且这正是最需要看清的一种：
+> 「等确认」（`SUBMISSION_UNCERTAIN`）与「提交中」（`SUBMITTING`）这两档**没有**远端句柄
+> （句柄只有拿到平台回执时才有），所以本机确实取消了（进 `cancelled`），但**远端那一份可能正在跑、
+> 并会照常计费**（同时进 `remoteMayContinue`）。别把 `cancelled` 单独读成「平台上一定没有残留」。
+>
+> 还没提交的 `QUEUED` run 则**只**进 `cancelled`：它一定没到平台。
 
 ---
 

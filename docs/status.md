@@ -110,6 +110,10 @@
   证明不了的那一类（发送后超时、连接被重置）**照旧等死线、绝不自动重投**——那才是"可能已经收下"。
   判据只有一处（`submission_is_unknown`）：**落状态与 tick 的计数同源**（写这条时实测抓到过一处
   分歧：只改落状态那处，run 进了 `RETRY_BACKOFF` 而计数仍报 uncertain）。
+- **取消时如实说"远端可能还在跑"**：`operation cancel` 的 `remoteMayContinue` 现在**也包含
+  没有远端句柄的 run**（`SUBMISSION_UNCERTAIN` / `SUBMITTING` —— 句柄只有拿到平台回执时才有，
+  所以恰恰是这两档没有）。此前它们只进 `cancelled`，用户会读成"平台上一定没有残留"，
+  而平台上那一份可能正在跑并照常计费。还没提交的 `QUEUED` 仍然只进 `cancelled`。
 - **等待确认的 run 不再占住连接唯一的执行位**：一个 `SUBMISSION_UNCERTAIN` 的 run 此前会占满
   这条连接唯一的执行位（默认并发 1）**直到死线（默认 1 小时）**，后面的 run 全排队 —— 而平台上
   可能一个都没在跑。现在占位只算 `ACCEPTED` / `RUNNING`（真的在平台上跑的）；撞上平台上限时

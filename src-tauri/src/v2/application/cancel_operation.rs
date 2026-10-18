@@ -50,6 +50,19 @@ impl CancelOperation {
                 if let CancelOutcome::RemoteMayContinue = self.remote_cancel(&run, &handle).await? {
                     result.remote_may_continue.push(run.id);
                 }
+            } else if matches!(
+                run.status,
+                crate::v2::domain::operation::RunStatus::Submitting
+                    | crate::v2::domain::operation::RunStatus::SubmissionUncertain
+            ) {
+                // ⚠️ **没有远端句柄 ≠ 远端没有这个任务**（2026-10-18 修）。
+                //
+                // 这两个状态的含义正是"提交发出去了但结果不明"（`SUBMITTING` 是租约还在，
+                // `SUBMISSION_UNCERTAIN` 是已经确认不了），而句柄只有在**拿到平台回执**时才有
+                // ——所以恰恰是这两种情况**没有**句柄。此前它们什么都不报，于是：
+                // `cancelled` 里躺着一条，用户读成"平台上一定没有残留"，而平台上那份可能正在跑
+                // 并会照常计费。取消不了就如实说取消不了（与"有句柄但远端没确认"同桶）。
+                result.remote_may_continue.push(run.id);
             }
             // Fencing：先把非终态 attempt 标记 CANCELLED，scheduler 在途的
             // complete_attempt 会因终态检查短路，不再把已取消任务标为 SUCCEEDED。
@@ -544,5 +557,71 @@ mod tests {
         let result = service.execute(operation_id).await.expect("再次取消应成功");
         assert!(result.cancelled.is_empty());
         assert_eq!(result.already_terminal.len(), 1);
+    }
+
+    /// **没有远端句柄的不确定 run 也必须进 `remoteMayContinue`**（2026-10-18 修）。
+    ///
+    /// 为什么（这是钱）：`SUBMITTING` / `SUBMISSION_UNCERTAIN` 的含义正是"提交发出去了但结果不明"
+    /// ——而远端句柄只有**拿到平台回执**时才会有，所以恰恰是这两种情况**没有**句柄。此前它们什么
+    /// 都不报，于是 `cancelled` 里躺着一条，用户读成"平台上一定没有残留"，而平台上那份可能正在跑、
+    /// 并会照常计费。取消不了就如实说取消不了（与"有句柄但远端没确认"同一个桶）。
+    ///
+    /// 判别点三条：
+    /// 1. 不确定的 run（无句柄）⇒ **同时**出现在 `cancelled`（本机确实结束了）与
+    ///    `remoteMayContinue`（远端可能还在跑）——两个桶重叠是有意的，见
+    ///    `accepted_run_without_cancel_capability_reports_remote_may_continue` 的先例；
+    /// 2. **反向控制**：还没提交的 `QUEUED` run **不该**进 `remoteMayContinue`
+    ///    （它一定没到平台，见 `cancels_queued_run_locally`）；
+    /// 3. 有句柄的那条路照旧（`accepted_run_without_cancel_capability_...`）。
+    ///
+    /// 负对照：把那个 `else if matches!(...)` 分支删掉 ⇒ 第 1 条红。
+    #[tokio::test]
+    async fn uncertain_run_without_a_handle_reports_that_the_remote_may_continue() {
+        let repositories = InMemoryRepositories::new();
+        seed_environment(&repositories);
+        let operation_id = create_operation(&repositories).await;
+        // 先让它落"等确认"：网络类失败 + **没有**"字节没出去"的证据。
+        let scheduler_driver = driver(vec![]);
+        scheduler_driver.push_submit_error(SafeError::network("SUBMIT_TIMEOUT", "提交超时"));
+        {
+            let mut registry = DriverRegistry::new();
+            registry.register(driver_key("openai", "openai-images"), scheduler_driver);
+            let scheduler = crate::v2::application::scheduler::SchedulerService {
+                owner: "test-scheduler".to_string(),
+                repositories: Arc::new(repositories.clone()),
+                leases: Arc::new(repositories.clone()),
+                connections: Arc::new(repositories.clone()),
+                assets: Arc::new(repositories.clone()),
+                artifacts: Arc::new(repositories.clone()),
+                drivers: Arc::new(registry),
+            };
+            scheduler.tick().await.expect("调度应成功");
+        }
+        let persisted = repositories
+            .find_operation(operation_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            persisted.runs[0].status,
+            RunStatus::SubmissionUncertain,
+            "前提：这一条要先落不确定态"
+        );
+
+        let service = cancel_service(repositories.clone(), driver(vec![]));
+        let result = service.execute(operation_id).await.expect("取消应成功");
+        // 1) 本机结束了，但**远端可能还在跑**——必须同时说这两件事。
+        assert_eq!(result.cancelled.len(), 1, "本机应当确实取消掉了");
+        assert_eq!(
+            result.remote_may_continue.len(),
+            1,
+            "没有句柄的不确定 run 也可能正在平台上跑，不能只报 cancelled：{result:?}"
+        );
+        let persisted = repositories
+            .find_operation(operation_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(persisted.runs[0].status, RunStatus::Cancelled);
     }
 }
