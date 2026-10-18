@@ -336,6 +336,148 @@ renderloft-cli artifact list                          # 产物（byteSize 0 = �
 > `callback clear-secret` · `recipe remove` · `recipe restore` · `artifact download`。
 > 它们碰的是「谁能跑什么」这条授权边界本身，或者往磁盘任意路径写文件——而 AI 正受这条边界约束。
 
+## 11. 任务卡住怎么查、怎么恢复
+
+「卡住」几乎总是这四种之一：**在排队**、**在退避重试**、**等确认（提交结果不明）**、**在提交**。
+它们的共同点是 op 级状态**都显示 `RUNNING`** —— 所以别用状态判断它有没有在动，看 `attention`：
+
+```powershell
+renderloft-cli operation list --limit 20      # 摘要里就有：attention {reason, deadline}
+renderloft-cli operation get --operation 70   # 原因码 + 人话 + 死线 + 到点会怎样 + 现在能做什么
+```
+
+```text
+renderloft_call { "verb": "operation.list", "args": { "limit": 20 } }
+renderloft_call { "verb": "operation.get",  "args": { "operationId": 70 } }
+```
+
+原因码只有四种（严重度从高到低）：
+
+| reason | 在等什么 | 死线 |
+|---|---|---|
+| `SUBMISSION_UNCERTAIN` | 提交时连接断了或超时，**平台到底收没收到不知道** | 有（默认 1 小时）→ 到点判失败 |
+| `RETRY_BACKOFF` | 上一次提交被平台拒了（如队列满），**每 30 秒自动重试一次**，不用人管 | 无（一直重试到你取消） |
+| `SUBMITTING` | 正在提交（已落库租约） | 无；超过恢复窗口会转成「等确认」 |
+| `QUEUED` | 排队：这条连接同时只跑一个（与平台账号的实际并发一致） | 无 |
+
+> **`attention: null` 才是「正常在动」**（`ACCEPTED` / `RUNNING`，或已进终态）。
+> `RUNNING` + `null` 没问题；`RUNNING` + 有 `attention` 就是**它其实没在动** ——
+> 这时别对外报「预计 N 分钟出片」（这条正是本项目吃过的那次 40 分钟误报）。
+
+### 11a. 死线语义（最容易被误读的一条）
+
+- 默认 **1 小时**；连接的高级项里可配 `trackingDeadlineSeconds`（60 秒 ~ 24 小时，越界夹到边界）；
+- 到点**判失败**，**不会自动重投** —— 因为"可能已经花了钱"的提交再投一次就是再花一次钱
+  （见 `AGENTS.md` 的铁律二）。到点判失败不是"白等了"：它把**不确定**变成**确定的失败**，
+  这时重试才是安全的下一步；
+- 死线是**按"这一次提交"**算的：提交成功那一刻写定，之后的迁移不会把它往后推
+  （否则你在连接上配的上限永远不生效）。
+
+### 11b. 日志：位置、哪一份是活的、grep 什么
+
+```powershell
+renderloft-cli daemon status     # data.workspace 与 data.logFile 就是那两个路径
+```
+
+- 目录：`%LOCALAPPDATA%\renderloft-workspace`（`daemon status` 的 `workspace` 字段）；
+- `daemon.log` = **正在写的**那一份；`daemon.log.1` = 上一次轮转下来的
+  （5 MB 轮转，只留一份）——**崩溃现场往往正好在 `.1` 里**，别只看 `daemon.log`；
+- **「哪个才是活的」看最后写入时间**：活着的 daemon 即使空转也**每分钟**写一行心跳
+  `[renderloft-reconcile] tick active_runs=0`。文件几分钟没动 = 那个 daemon 不在了，
+  或者它的输出压根没落到这个文件（daemon 是被**别人**启动的：外壳 / CLI / MCP / 手工，
+  输出也可能被重定向到别处——所以"目录里有个 daemon.log"本身不是"它在跑"的证据）。
+- 出事时写的是**固定形状**的一行，可以直接按错误码 grep：
+  `[renderloft] run run=<runId> op=<operationId> <CODE> | <说明>`。卡住相关的是：
+  `TRACKING_UNRESOLVED`（提交状态无法确认且无对账句柄）、
+  `TRACKING_EXHAUSTED`（远端任务在对账期限内未进入终态）。
+
+### 11c. 事件流：`run.submission_uncertain` 就在里面
+
+每个 operation 都有事件流：`GET /api/v1/operations/{id}/events?after=0`
+（`?stream=1` 是 SSE；每条是 `{eventId, eventType, runId, createdAt, payload}`）：
+
+| eventType | 意思 |
+|---|---|
+| `run.submission_uncertain` | 提交结果不明（`payload.reason` 是原因）——**这就是"它为什么没在动"的原始记录** |
+| `run.retry_wait` | 被平台拒了 / 可重试地失败，已排退避重试 |
+| `run.tracking_unresolved` | 到死线仍确认不了，已判失败（`payload.error` 是结构化错误） |
+| `run.created` / `run.accepted` / `run.succeeded` / `run.failed` | 正常路径 |
+
+> ⚠️ 事件流**没有对应的 CLI / MCP 动词**（它是界面实时刷新用的通道，要 token）。
+> Agent 该看的是 `operation get` 的 `attention`；事件流是给"要看原始时间线"的人或工具用的。
+
+### 11d. 「它到底到没到平台」——今天查不出来，只能承认「不知道」
+
+这条最要紧，因为**猜错的代价是重复扣费**。库里每个 run 的每一次提交尝试是 `v2_run_attempts`
+一行（`number` 递增，最新那条就是当前这次）：
+
+| 列 | 说明 |
+|---|---|
+| `status` | `SUBMITTING` / `ACCEPTED` / `SUCCEEDED` / `FAILED` / `UNCERTAIN` / `CANCELLED` |
+| `remote_handle_json` | 远端任务句柄；**不确定态的 attempt 一定是 `NULL`** |
+| `error_json` | 结构化错误（`cause` 是原因链）——⚠️ **不确定态的 attempt 也是 `NULL`**（见下） |
+
+**先把现状说清楚（这是已知缺口，不是你看漏了）**：
+
+| 想知道的 | 今天在哪 | 有吗 |
+|---|---|---|
+| 这次提交的远端句柄 | `v2_run_attempts.remote_handle_json` | 不确定时是 `NULL` |
+| 失败**原因链**（`connection refused` / `dns error` / `timed out`） | `v2_run_attempts.error_json` | 不确定时**没有** |
+| 那句人话原因 | 事件流 `run.submission_uncertain` 的 `payload.reason` | 有（**只有一句话，不含原因链**） |
+| daemon 日志 | —— | 走到死线判失败时才有（`TRACKING_UNRESOLVED`） |
+
+所以 **`remote_handle_json = NULL` 不是「没到平台」的证据**：它的意思是**我们连一个可以拿去问
+平台的远端 id 都没拿到**（拿到了就不会停在不确定态）⇒ 对账循环没有句柄可查，只能等死线。
+而"到底出没出去"要看的是**原因链**，它现在没有被记下来 —— 所以对不确定的 run，
+**诚实的答案就是「不知道」**，这也是它必须等到死线才能判失败的原因。
+
+判据本身是清楚的（等它落地后照这个读）：
+
+- **能证明「字节没出去」**：连接被拒（`connection refused`）、DNS 解析失败、连接握手阶段就超时；
+- **证明不了**：发送之后才超时、连接被重置、响应读到一半断 —— 请求**可能已经到达平台**。
+
+> 这正是本项目**不做「提交失败就自动重投」**的原因：没有服务端去重时，"可能已经收下"的那一类
+> 再投一次就是再花一次钱（`AGENTS.md` 铁律二）。"先能证明，再谈重投"是唯一不重复扣费的路。
+
+要在库里看 attempt（**只读**；`operation get` 目前只到 run 级）：
+
+```powershell
+sqlite3 "$env:LOCALAPPDATA\renderloft-workspace\v2-workspace.db" `
+  "SELECT number,status,remote_handle_json,error_json FROM v2_run_attempts WHERE run_id=<runId> ORDER BY number DESC LIMIT 3;"
+```
+
+### 11e. 恢复：先决定放不放弃旧的，再 `retry`
+
+```powershell
+renderloft-cli operation cancel --operation 70                 # ① 明确结束旧的（可选，但推荐）
+renderloft-cli operation retry  --operation 70                 # ② 新建一个同样的任务
+renderloft-cli operation retry  --operation 70 --run 1234      # ②' 只重试批量里失败的那一条
+```
+
+```text
+renderloft_call { "verb": "operation.cancel", "args": { "operationId": 70 } }
+renderloft_call { "verb": "operation.retry",  "args": { "operationId": 70 } }
+renderloft_call { "verb": "operation.retry",  "args": { "operationId": 70, "runId": 1234 } }
+```
+
+三条必须记住的：
+
+1. **`retry` 返回的是新 operationId**（它新建一个任务、复用原 run 的配方修订与输入），
+   旧的那个原样留着 —— **要改盯新的那个**，别再轮询旧的；
+2. **每个重试的 run 都会再计费一次**；批量里只失败了几条时**一定加 `--run`**，
+   否则已经成功的那几条会被**再提交一次**（也就是再花一次钱）；
+3. **`retry` 不要求源任务已经结束** —— 对一个还在跑的 operation 调它，就是**把同一批活再提交一遍**。
+   想重试，先确认你要放弃的是哪一个（这也是"先 cancel"的意义：它让"旧的还算不算数"没有歧义）。
+
+`cancel` 的返回分四类：`cancelled`（已在本机结束）、`alreadyTerminal`（本来就是终态）、
+`pending`（本机没能结束它）、`remoteMayContinue`（**有远端句柄、但远端没确认取消** ⇒ 远端可能还在跑）。
+
+> ⚠️ 一个**没有远端句柄**的 run（典型就是「等确认」的那些）只会落进 `cancelled`：本机确实结束了，
+> 但**远端那一份（如果真发出去了）我们既取消不了、也看不见**。别把 `cancelled` 读成
+> 「平台上一定没有残留」。
+
+---
+
 ## 12. 迁移到另一台机器
 
 **第一步永远是备份**，而且**不要自己拷工作区目录**：
