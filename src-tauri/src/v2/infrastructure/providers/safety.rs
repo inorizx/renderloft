@@ -364,6 +364,33 @@ pub fn map_http_error(status: u16, fallback: &str) -> SafeError {
     }
 }
 
+/// **提交请求**收到的 HTTP 错误 → `SafeError`。与 `map_http_error` 只差一件事：
+/// **5xx 会被标成"提交结果不明"**（`SUBMISSION_UNKNOWN_DETAIL`）。
+///
+/// 为什么必须区别对待（这是钱，2026-10-18 定的取舍）：5xx 是"平台回了话"，但 500 可能是
+/// **网关 / 内部错误发生在受理之后** ⇒ 平台**可能已经收下**这个任务并照常计费。
+/// 盲投 = 平台上可能有两个任务、扣两次钱。按铁律二，这类"可能已经收下"的提交**不许自动重投**：
+/// 要么先确认（能回查的平台，如 ComfyUI 用我们自己定的 `prompt_id`），要么等死线让人决定。
+///
+/// 代价说清楚：RunningHub **没有任何接口**能回查"我那条任务在不在"，所以那边遇到 5xx 会等到
+/// 死线（默认 1 小时）再人工决定。换来的是**永远不会悄悄扣两次**。
+///
+/// 4xx（尤其 429 限流）**不受影响**：那是平台的**明确拒绝**，一个字节的活都没接 ⇒ 照旧可重试。
+///
+/// ⚠️ 这条判据**只在提交路径上成立**。查询 / 取消 / 队列快照收到 5xx 只是"这次请求失败"，
+/// 与"提交结果不明"毫无关系 —— 那些地方继续用 `map_http_error`（否则会把一次查询失败
+/// 升级成"可能已经收下"，那是另一种谎）。
+pub fn map_submit_http_error(status: u16, fallback: &str) -> SafeError {
+    let mut error = map_http_error(status, fallback);
+    if status >= 500 {
+        error.details.insert(
+            crate::v2::domain::errors::SUBMISSION_UNKNOWN_DETAIL.to_string(),
+            serde_json::json!(true),
+        );
+    }
+    error
+}
+
 /// 流式读取响应字节，限制大小。
 pub async fn read_limited(response: reqwest::Response, limit: usize) -> Result<Vec<u8>, SafeError> {
     if response

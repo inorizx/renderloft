@@ -16,8 +16,8 @@ use crate::v2::ports::provider::{
 use crate::v2::ports::stores::SecretStore;
 
 use super::safety::{
-    join_path, map_http_error, map_network_error, read_limited, validate_base_url,
-    validate_resolved_url, NetworkPolicy, MAX_RESPONSE_BYTES,
+    join_path, map_http_error, map_network_error, map_submit_http_error, read_limited,
+    validate_base_url, validate_resolved_url, NetworkPolicy, MAX_RESPONSE_BYTES,
 };
 
 /// 通用异步任务协议（介质无关）。
@@ -420,7 +420,11 @@ impl ProviderDriver for AsyncTaskDriver {
             .await
             .map_err(|error| map_network_error(&error, "async_task_submit"))?;
         if !response.status().is_success() {
-            return Err(map_http_error(response.status().as_u16(), "任务提交失败"));
+            // ⚠️ 提交路径专用：5xx 标成"提交结果不明"（平台可能已经收下）⇒ 不盲投。
+            return Err(map_submit_http_error(
+                response.status().as_u16(),
+                "任务提交失败",
+            ));
         }
         let parsed: Value = serde_json::from_slice(
             &read_limited(response, MAX_RESPONSE_BYTES).await?,

@@ -17,8 +17,9 @@ use crate::v2::ports::provider::{
 use crate::v2::ports::stores::SecretStore;
 
 use super::safety::{
-    join_path, map_http_error, map_network_error, read_limited, validate_base_url,
-    validate_resolved_url, validate_same_origin, NetworkPolicy, MAX_RESULT_BYTES,
+    join_path, map_http_error, map_network_error, map_submit_http_error, read_limited,
+    validate_base_url, validate_resolved_url, validate_same_origin, NetworkPolicy,
+    MAX_RESULT_BYTES,
 };
 
 /// 把一个节点类名编进 URL 路径。
@@ -674,6 +675,19 @@ impl ComfyUiDriver {
 /// 只放**形状**，不放内容（可能很长、也可能是平台的错误文案）：顶层键的名字就够判断了——
 /// 是 `{"KSampler": {…}}`（对）、还是 `{"code":…,"msg":…}`（平台的错误信封）、
 /// 还是 `{"detail":"Not Found"}`（网关的 404 文案）。
+/// **提交结果不明**（发送后超时/断连，或 5xx）⇒ 用**我们自己定的 `prompt_id`** 报一个
+/// "不确定 + 可按 id 回查"。
+///
+/// 为什么两条路共用这一个函数：网络失败与 5xx 在这里的**处理必须一模一样** ——
+/// 都是"平台可能已经收下"，都该去问同一个 `prompt_id`。各写一份的话，早晚只改一处
+/// （这个仓库已经因为"判据各写一份"踩过一次：库里的状态与计数各说各话）。
+fn uncertain_with_lookup(error: &SafeError, request_id: &str) -> SubmitOutcome {
+    SubmitOutcome::Uncertain(UncertainSubmission {
+        reason: error.message.clone(),
+        recovery: RecoveryProof::LookupByRequestId(request_id.to_string()),
+    })
+}
+
 fn describe_shape(parsed: &Value, wanted: &str) -> String {
     match parsed.as_object() {
         Some(object) if object.is_empty() => "响应是个空对象".to_string(),
@@ -958,10 +972,7 @@ impl ProviderDriver for ComfyUiDriver {
                 // ⚠️ 这是 `RecoveryProof::LookupByRequestId` 在**生产代码里的第一个生产者**
                 // （此前只有测试在造 `SubmitOutcome::Uncertain`，所以 scheduler 里那条
                 // `ToRetryWait` 分支不可达）。
-                return Ok(SubmitOutcome::Uncertain(UncertainSubmission {
-                    reason: mapped.message.clone(),
-                    recovery: RecoveryProof::LookupByRequestId(execution.request_id.clone()),
-                }));
+                return Ok(uncertain_with_lookup(&mapped, &execution.request_id));
             }
         };
         if response.url() != &url {
@@ -971,10 +982,15 @@ impl ProviderDriver for ComfyUiDriver {
             ));
         }
         if !response.status().is_success() {
-            return Err(map_http_error(
-                response.status().as_u16(),
-                "ComfyUI 提交失败",
-            ));
+            // ⚠️ 提交路径专用：**5xx 是"平台可能已经收下"**（500 可能是网关/内部错误发生在
+            // 受理之后）⇒ 与上面那条网络失败**同一条处理**：用我们自己定的 `prompt_id`
+            // 报"不确定 + 可按 id 回查"，查得到就正常收尾（几秒），查不到才等到死线。
+            // 4xx 不受影响（明确拒绝 ⇒ 交回去重试）。
+            let mapped = map_submit_http_error(response.status().as_u16(), "ComfyUI 提交失败");
+            if !mapped.submission_is_unknown() {
+                return Err(mapped);
+            }
+            return Ok(uncertain_with_lookup(&mapped, &execution.request_id));
         }
         let parsed: Value = serde_json::from_slice(&read_limited(response, 1024 * 1024).await?)
             .map_err(|_| {
@@ -1511,6 +1527,61 @@ mod tests {
             .expect("prepare 应成功");
         let job_id = prepared.request_id.clone();
         let outcome = driver.submit(prepared).await.expect("应当是 Ok(Uncertain)");
+        match outcome {
+            SubmitOutcome::Uncertain(submission) => {
+                assert_eq!(
+                    submission.recovery,
+                    RecoveryProof::LookupByRequestId(job_id),
+                    "回查用的必须是我们自己定的那个 job id"
+                );
+            }
+            other => panic!("期望 Uncertain(LookupByRequestId)，得到 {other:?}"),
+        }
+    }
+
+    /// 提交时平台回 **5xx** 的服务（只答 `/prompt`，一律 503）。
+    async fn five_hundred_server() -> String {
+        let app = Router::new().route(
+            "/prompt",
+            post(|| async {
+                (
+                    axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                    "platform blew up",
+                )
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("应能监听");
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        format!("http://127.0.0.1:{}", address.port())
+    }
+
+    /// **提交时平台回 5xx** ⇒ 与"响应丢了"**同一条处理**：报"不确定 + 可按 id 回查"。
+    ///
+    /// 为什么（这是钱，2026-10-18 定的取舍）：500 可能是**网关 / 内部错误发生在受理之后**
+    /// ⇒ 平台**可能已经收下**并照常计费。盲投 = 平台上可能有两个任务、扣两次钱。
+    /// ComfyUI 的抓手是**我们自己定的 `prompt_id`**，所以它通常**几秒内就能查清**
+    /// （查得到就正常收尾），不像 RunningHub 只能等到死线。
+    ///
+    /// 负对照：把 `submit` 里那段 5xx 分支改回 `return Err(map_submit_http_error(..))` ⇒ 这条红
+    /// （会退化成"交回去重试"，也就是盲投）。
+    #[tokio::test]
+    async fn a_five_hundred_on_submit_becomes_a_lookup_by_our_own_job_id() {
+        let base = five_hundred_server().await;
+        let driver = ComfyUiDriver::new(Box::new(NoSecrets));
+        let prepared = driver
+            .prepare(request(connection(base), workflow_fixture()))
+            .await
+            .expect("prepare 应成功");
+        let job_id = prepared.request_id.clone();
+        let outcome = driver
+            .submit(prepared)
+            .await
+            .expect("5xx 不该把错误直接抛回去（那会退化成盲投）");
         match outcome {
             SubmitOutcome::Uncertain(submission) => {
                 assert_eq!(
