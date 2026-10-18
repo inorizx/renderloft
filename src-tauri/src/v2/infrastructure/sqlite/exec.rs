@@ -1227,13 +1227,23 @@ impl OperationRepository for SqliteRepositories {
         let connection = self.connection.lock().unwrap_or_else(|e| e.into_inner());
         let count: i64 = connection
             .query_row(
-                // 与 `list_active_runs` 同一判据：这些状态才是**真的占着 provider 执行位**。
-                // 用 IN 列出活跃态而不是 NOT IN 终态——这里反过来：多算一个状态会让调度器
-                // **少提交**（偏保守），少算会让它**多提交**（被平台拒，就是本 bug）。
-                // 保守方向是刻意的。
+                // ⚠️ **`SUBMISSION_UNCERTAIN` 刻意不算占位**（2026-10-17 改）。
+                //
+                // 它占的是"我们不知道平台收没收到"这个**疑问**，不是平台的执行位：把它算成占位，
+                // 一个不确定的 run 会把这条连接唯一的执行位**占满到死线（默认 1 小时）**，
+                // 后面所有 run 全排队——而真正在平台上跑的可能一个都没有。
+                //
+                // 为什么让它不占位是安全的（实测依据）：平台侧真被占满时**会拒**，而
+                // RunningHub 的拒绝（`TASK_QUEUE_MAXED`）在 `rejection_error` 里是
+                // `retryable: true`、且实测"拒了一分钱没花"⇒ 退避 30 秒后自动重试。
+                // 所以"多提交一次被拒"的代价是一次退避，而不是"我们自己造成的任务失败"。
+                //
+                // 方向仍然保守：`ACCEPTED` / `RUNNING` 照旧占位（那是真的在平台上跑）。
+                // 对账队列（`list_active_runs`）**必须继续包含** `SUBMISSION_UNCERTAIN`
+                // ——那是它被捞出来确认的唯一途径，改那里等于放弃对账。
                 "SELECT COUNT(*) FROM v2_runs
                  WHERE connection_revision_id = ?1
-                   AND status IN ('ACCEPTED', 'RUNNING', 'SUBMISSION_UNCERTAIN')
+                   AND status IN ('ACCEPTED', 'RUNNING')
                    AND tracking_state = 'active'",
                 params![connection_revision_id.0],
                 |row| row.get(0),
