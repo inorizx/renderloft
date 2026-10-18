@@ -1926,7 +1926,12 @@ pub async fn execute(
         }
         "artifact.list" => {
             client
-                .list_artifacts(args.opt_u64("limit")?, args.opt_u64("after")?)
+                .list_artifacts(
+                    args.opt_u64("limit")?,
+                    args.opt_u64("after")?,
+                    args.opt_u64("before")?,
+                    args.opt_text("order")?,
+                )
                 .await
         }
         "artifact.get" => client.get_artifact(args.u64("artifactId")?).await,

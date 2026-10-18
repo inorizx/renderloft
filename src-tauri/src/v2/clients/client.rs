@@ -508,10 +508,18 @@ impl V2Client {
     /// ⚠️ 此前这里**一个参数都不带**：daemon 那边本来支持 `limit`（默认 50、上限 200）与 `after`，
     /// 但动词层没透出来 ⇒ 模型既不能缩小（回执白占上下文）也不能翻页（看不到第 51 条之后）。
     /// 现在两者都能给。
+    /// 产物列表。`order` / `before` 是**反方向**（最新在前）—— 见动词表里 `artifact.list` 的说明。
+    ///
+    /// ⚠️ 这个函数是**手写查询串**，与动词表里的参数**没有编译期联系**。实测踩过一次
+    /// （2026-10-18）：表里加了 `order` / `before`（CLI 于是认得这两个旗标），但这里没转发 ——
+    /// `artifact list --order desc` 于是**静默地按升序返回**：有数据、格式也对，看起来"能用"，
+    /// 只是内容是**最旧**的一批。现在有 `artifact_list_forwards_the_direction_flags` 钉住它。
     pub async fn list_artifacts(
         &self,
         limit: Option<u64>,
         after: Option<u64>,
+        before: Option<u64>,
+        order: Option<String>,
     ) -> Result<Value, ClientError> {
         let mut query = Vec::new();
         if let Some(limit) = limit {
@@ -519,6 +527,12 @@ impl V2Client {
         }
         if let Some(after) = after {
             query.push(format!("after={after}"));
+        }
+        if let Some(before) = before {
+            query.push(format!("before={before}"));
+        }
+        if let Some(order) = order {
+            query.push(format!("order={order}"));
         }
         let suffix = if query.is_empty() {
             String::new()
@@ -667,6 +681,8 @@ mod tests {
         authorization: Arc<Mutex<Option<String>>>,
         driver: Arc<Mutex<Option<String>>>,
         operation_polls: Arc<Mutex<usize>>,
+        /// 产物列表那次请求**实际带上的查询串**（用来钉住"旗标真的发出去了"）。
+        artifact_query: Arc<Mutex<Option<String>>>,
     }
 
     async fn mock_app() -> (String, MockState) {
@@ -764,12 +780,47 @@ mod tests {
         }))
     }
 
-    async fn list_artifacts() -> axum::Json<Value> {
+    async fn list_artifacts(
+        State(state): State<MockState>,
+        uri: axum::http::Uri,
+    ) -> axum::Json<Value> {
+        // 把**实际收到的查询串**记下来：客户端那侧是手写拼接，漏转发时这里才看得出来。
+        *state.artifact_query.lock().unwrap() = uri.query().map(str::to_string);
         axum::Json(json!({
             "contractVersion": "1",
             "ok": true,
             "data": { "items": [], "nextCursor": null, "hasMore": false }
         }))
+    }
+
+    /// **方向旗标必须真的发出去**（`--order desc` / `--before`）。
+    ///
+    /// ⚠️ 为什么值得单独测（2026-10-18 实测踩到）：动词表里加了参数（CLI 于是认得旗标），
+    /// 而客户端的查询串是**手写拼接**、与表**没有编译期联系** —— 漏转发时
+    /// `artifact list --order desc` 会**静默按升序返回**：有数据、格式也对，看起来"能用"，
+    /// 只是内容是**最旧**的一批（正是「结果」视角最不想要的那一批）。
+    ///
+    /// 端到端那条链是"CLI 旗标 → 查询串 → 服务端行为"：服务端那半已有契约测试，
+    /// **中间这一段只有这里能钉住**。同类风险适用于**任何**手写查询串/请求体的动词。
+    ///
+    /// 负对照：把 `list_artifacts` 里 `order` / `before` 那两段删掉 ⇒ 这条红。
+    #[tokio::test]
+    async fn artifact_list_forwards_the_direction_flags() {
+        let (base, state) = mock_app().await;
+        let client = V2Client::new(base, "token".to_string());
+        client
+            .list_artifacts(Some(5), None, Some(42), Some("desc".to_string()))
+            .await
+            .expect("列举应成功");
+        let query = state
+            .artifact_query
+            .lock()
+            .unwrap()
+            .clone()
+            .unwrap_or_default();
+        assert!(query.contains("limit=5"), "limit 要发出去：{query}");
+        assert!(query.contains("order=desc"), "方向要发出去：{query}");
+        assert!(query.contains("before=42"), "反向游标要发出去：{query}");
     }
 
     /// 自报身份必须**真的发出去了**——整个花钱闸门都挂在它上面。
