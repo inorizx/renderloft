@@ -136,6 +136,36 @@ pub fn daemon_log_path() -> Result<PathBuf, String> {
     Ok(crate::v2::daemon::v2_data_dir()?.join("daemon.log"))
 }
 
+/// 日志轮转阈值：超过它就把当前那份挪成 `daemon.log.1`。
+///
+/// ⚠️ **与桌面外壳同值**（`desktop/src/main.rs` 的 `daemon_log_file`）。两份实现都在
+/// （外壳在另一个 crate 里，见模块头），所以这个数字由 `scripts/check-layers.mjs` 跨文件守门
+/// ——**别只改一处**：改了这边，从外壳启动的 daemon 与从 CLI / MCP 启动的 daemon 就会用两个
+/// 阈值，而"日志多长"取决于谁先把它拉起来，没人能预期。
+const LOG_ROTATE_BYTES: u64 = 5 * 1024 * 1024;
+
+/// 打开 daemon 日志：超过阈值先把当前那份挪成 `daemon.log.1`（**保留上一份**——崩溃现场
+/// 往往正好在被轮转掉的那份里），再追加。
+///
+/// 为什么必须有它（实测）：这条路径此前**只 append、从不轮转**，于是"谁拉起 daemon"决定了
+/// 日志会不会无限长——外壳拉起的那份到 5 MB 就轮转，CLI / MCP 拉起的那份永远长下去。
+/// 这不是磁盘空间问题：日志是排查的唯一线索，而一份几百 MB 的文件连打开都费劲。
+/// 而 CLI / MCP 恰好是最常拉起 daemon 的那两条路（MCP 会话、任务计划）。
+///
+/// 轮转失败**不影响启动**（挪不动就继续往旧文件里追加）：宁可日志长一点，也不能因为
+/// "日志挪不动"让 daemon 起不来。
+fn open_daemon_log(path: &Path) -> Result<std::fs::File, String> {
+    if std::fs::metadata(path).map(|meta| meta.len()).unwrap_or(0) > LOG_ROTATE_BYTES {
+        // `daemon.log` → `daemon.log.1`（`with_extension` 替换最后一个点之后的部分）。
+        let _ = std::fs::rename(path, path.with_extension("log.1"));
+    }
+    std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .map_err(|error| format!("无法打开日志 {}：{error}", path.display()))
+}
+
 /// daemon 现在在跑吗——**只回答，不做任何启动动作**。
 ///
 /// `daemon status` 用它：那个动词必须在 daemon 没跑时也能回答"没在跑"。
@@ -260,11 +290,7 @@ fn spawn_daemon() -> Result<(), String> {
     if let Some(parent) = log.parent() {
         std::fs::create_dir_all(parent).map_err(|error| error.to_string())?;
     }
-    let stdout = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&log)
-        .map_err(|error| format!("无法打开日志 {}：{error}", log.display()))?;
+    let stdout = open_daemon_log(&log)?;
     let stderr = stdout
         .try_clone()
         .map_err(|error| format!("无法复制日志句柄：{error}"))?;
@@ -431,6 +457,71 @@ mod tests {
 
     fn network_error() -> crate::v2::clients::client::ClientError {
         crate::v2::clients::client::ClientError::network("无法连接 daemon")
+    }
+
+    /// daemon 日志**超过阈值要轮转**，且**保留上一份**。
+    ///
+    /// 为什么必须有它（实测）：CLI / MCP 这条启动路径此前只 append、从不轮转，而桌面外壳那条
+    /// 到 5 MB 就轮转 ⇒ "日志会不会无限长"取决于**谁先把 daemon 拉起来**，没人能预期。
+    /// 而 CLI / MCP 恰好是最常拉起 daemon 的那两条路。
+    ///
+    /// 判别点四条，缺一条都不算做对：
+    /// 1. 没到阈值：**不**轮转（否则每次启动都把上一份顶掉，等于只留最后一段日志）；
+    /// 2. 超过阈值：轮转成 `daemon.log.1`，且**上一份一个字节都不少**（崩溃现场常在那份里）；
+    /// 3. 轮转后新文件从零开始（不是接着往旧的里写）；
+    /// 4. 只留一份 `.1`：再来一次就覆盖它（不是无限堆 `.2` `.3`）。
+    ///
+    /// 负对照：把 `open_daemon_log` 里那段轮转改成 `if false && …`（能编译）⇒ 第 2、3 条红。
+    #[test]
+    fn the_daemon_log_rotates_once_and_keeps_the_previous_file() {
+        let dir = std::env::temp_dir().join(format!(
+            "renderloft-log-rotate-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(&dir).expect("创建临时目录应成功");
+        let path = dir.join("daemon.log");
+        let rotated = dir.join("daemon.log.1");
+
+        // 1) 没到阈值：原样追加，不轮转。
+        std::fs::write(&path, b"first run\n").expect("写日志");
+        drop(open_daemon_log(&path).expect("打开日志"));
+        assert!(!rotated.exists(), "没到阈值不该轮转：{rotated:?}");
+
+        // 2) 超过阈值：轮转，且上一份完整保留。
+        //    用 `set_len` 造一个稀疏的大文件——不必真的写 5 MB。
+        let big = std::fs::File::create(&path).expect("造大文件");
+        big.set_len(LOG_ROTATE_BYTES + 1).expect("设长度");
+        drop(big);
+        drop(open_daemon_log(&path).expect("打开日志"));
+        assert_eq!(
+            std::fs::metadata(&rotated)
+                .expect("轮转后的文件应当存在")
+                .len(),
+            LOG_ROTATE_BYTES + 1,
+            "上一份必须一个字节都不少（崩溃现场常在被轮转掉的那份里）"
+        );
+        // 3) 新文件从零开始。
+        assert_eq!(
+            std::fs::metadata(&path).expect("新日志").len(),
+            0,
+            "轮转后应当从零开始写"
+        );
+
+        // 4) 只留一份 `.1`。
+        let big = std::fs::File::create(&path).expect("再造大文件");
+        big.set_len(LOG_ROTATE_BYTES + 1).expect("设长度");
+        drop(big);
+        drop(open_daemon_log(&path).expect("打开日志"));
+        assert!(
+            !dir.join("daemon.log.2").exists(),
+            "只保留上一份，不该堆出 .2"
+        );
+        assert_eq!(
+            std::fs::metadata(&rotated).expect("上一份仍在").len(),
+            LOG_ROTATE_BYTES + 1
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// 启动失败 + 连不上 ⇒ 必须把启动失败的原因说出来。
