@@ -761,6 +761,57 @@ mod tests {
         assert_eq!(detail["data"]["runs"][0]["clientRunId"], "image-1");
     }
 
+    /// **详情接口必须真的带上每条 run 的 `inputs`** —— 因为服务出去的文案早就承诺了它。
+    ///
+    /// `renderloft_get_operation` 的描述写着"每条 run 都带提交时的 `inputs`"（cookbook §11 的恢复
+    /// 建议也建立在它之上：读 `inputs` 与 `error` 一起读、改对了再重投），而 `run_response` **从来
+    /// 没发过这个字段**（2026-10-18 实测发现：给预览框做"结果按输入分组"时界面拿不到 inputs，
+    /// 回头一查是这里漏了）。调用方照文案去做会**找不到** `inputs`，而它正处在"要不要再花一次钱"
+    /// 的判断里 —— 这正是本项目一直在消灭的那类问题：**接口说了它没做的事**。
+    ///
+    /// 判别点两条（一正一反）：
+    /// 1. 详情里每条 run 的 `inputs` 与**提交时那份逐字相等**（不是空对象、不是改名）；
+    /// 2. **列表接口仍然只回摘要**：列表按设计不带 runs（`runCount` + `attention`），
+    ///    所以也不该出现 `inputs` —— 加字段最容易顺手越过的一条边界。
+    ///
+    /// 负对照：把 `run_response` 里的 `"inputs"` 删掉 ⇒ 第 1 条红。
+    #[tokio::test]
+    async fn operation_detail_carries_each_runs_submitted_inputs() {
+        let (app, repositories) = test_app();
+        let token = issue_token(&repositories, &["operations:execute", "operations:read"]).await;
+        let (status, body) = post_json(
+            &app,
+            "/api/v1/operations",
+            &token,
+            create_operation_body("http-key-inputs"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let operation_id = body["data"]["operationId"].as_u64().unwrap();
+        let (status, detail) =
+            get_json(&app, &format!("/api/v1/operations/{operation_id}"), &token).await;
+        assert_eq!(status, StatusCode::OK, "{detail}");
+        assert_eq!(
+            detail["data"]["runs"][0]["inputs"]["prompt"], "a red house",
+            "详情必须带上提交时那份 inputs：{detail}"
+        );
+        // 单条 run 的端点走同一个 `run_response`，所以也必须有。
+        let run_id = detail["data"]["runs"][0]["runId"].as_u64().unwrap();
+        let (status, one) = get_json(&app, &format!("/api/v1/runs/{run_id}"), &token).await;
+        assert_eq!(status, StatusCode::OK, "{one}");
+        assert_eq!(one["data"]["inputs"]["prompt"], "a red house", "{one}");
+
+        // ② 列表仍然只是摘要：不带 runs、更不带 inputs。
+        let (status, list) = get_json(&app, "/api/v1/operations?limit=10", &token).await;
+        assert_eq!(status, StatusCode::OK, "{list}");
+        let item = &list["data"]["items"][0];
+        assert!(item["runCount"].is_number(), "{list}");
+        assert!(
+            item.get("runs").is_none() && item.get("inputs").is_none(),
+            "列表按设计只回摘要，不许把 inputs 泄进去：{list}"
+        );
+    }
+
     #[tokio::test]
     async fn idempotent_replay_returns_same_operation() {
         let (app, repositories) = test_app();
