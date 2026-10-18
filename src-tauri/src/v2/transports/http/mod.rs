@@ -812,6 +812,67 @@ mod tests {
         );
     }
 
+    /// **"用这套参数再跑一次"所需的两件事**：每条 run 的 `recipeId` 与它的 `assets`。
+    ///
+    /// 为什么是这两件（产品愿景「批量是核心能力」里"保存参数、复用历史"那一级的实现前提）：
+    /// 界面要跳到 `/library/:recipeId` 并把那次提交的参数**预填**回表单。只有
+    /// `recipeRevisionId` 是跳不过去的（路由按应用 id）；而图生图少了 `assets` 就是**静默丢图**
+    /// ——用户会以为"用的还是上次那张"，实际提交的是另一次。两者都属于"界面说了它没做"的邻居。
+    ///
+    /// 判别点四条：
+    /// 1. `recipeId` 是**这条 run 自己的**应用（由它自己的修订反查，不是"第一个 run 的"）；
+    /// 2. `assets` 的形状与 `POST /operations/validate` 的解析结果**一致**
+    ///    （`{fieldKey, assetId, checksum}`）——同一个概念在两条读路径上只有一种形状；
+    /// 3. `checksum` 必须在（少了它，重投会被 `create` 的校验挡下："wrong-checksum" 是明确拒绝的）；
+    /// 4. 负对照见下：删掉 `assets` 那段 ⇒ 第 2 条红。
+    #[tokio::test]
+    async fn operation_detail_carries_recipe_id_and_assets_for_reuse() {
+        let (app, repositories) = test_app();
+        seed_media_recipe(&repositories, true);
+        seed_media_asset(&repositories, 7, "sum-person");
+        let token = issue_token(&repositories, &["operations:execute", "operations:read"]).await;
+        let (status, body) = post_json(
+            &app,
+            "/api/v1/operations",
+            &token,
+            json!({
+                "idempotencyKey": "http-key-reuse",
+                "runs": [{
+                    "clientRunId": "look-1",
+                    "recipeRevisionId": 2,
+                    "inputs": { "prompt": "a red house" },
+                    "assets": { "475::image": { "assetId": 7, "checksum": "sum-person" } }
+                }]
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let operation_id = body["data"]["operationId"].as_u64().unwrap();
+        let (status, detail) =
+            get_json(&app, &format!("/api/v1/operations/{operation_id}"), &token).await;
+        assert_eq!(status, StatusCode::OK, "{detail}");
+        let run = &detail["data"]["runs"][0];
+        assert_eq!(run["recipeRevisionId"], 2, "{detail}");
+        assert_eq!(
+            run["recipeId"], 1,
+            "必须给出这条 run 自己的应用 id（界面靠它跳到表单）：{detail}"
+        );
+        assert_eq!(run["assets"][0]["fieldKey"], "475::image", "{detail}");
+        assert_eq!(run["assets"][0]["assetId"], 7, "{detail}");
+        assert_eq!(
+            run["assets"][0]["checksum"], "sum-person",
+            "checksum 少了，重投会被 create 的校验挡下：{detail}"
+        );
+        // 列表仍然只是摘要：没有 runs，也就没有 recipeId/assets 可泄。
+        let (status, list) = get_json(&app, "/api/v1/operations?limit=10", &token).await;
+        assert_eq!(status, StatusCode::OK, "{list}");
+        let item = &list["data"]["items"][0];
+        assert!(
+            item.get("runs").is_none() && item.get("recipeId").is_none(),
+            "列表按设计只回摘要：{list}"
+        );
+    }
+
     #[tokio::test]
     async fn idempotent_replay_returns_same_operation() {
         let (app, repositories) = test_app();
