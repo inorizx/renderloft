@@ -1361,6 +1361,81 @@ mod tests {
             .is_autocommit());
     }
 
+    /// **产物列表的两个方向**（sqlite 侧 —— 这是**真实现**，不是替身）。
+    ///
+    /// ⚠️ 为什么必须在这里再测一遍：HTTP 那条契约测试（`artifact_list_supports_newest_first_paging`）
+    /// 跑的是 `fakes::InMemoryRepositories`，它**碰不到这条 SQL**。实测过：把 `Before` 的
+    /// `ORDER BY id DESC` 改成 `ASC`，HTTP 那条**照样绿**（替身自己排得对）—— 也就是说
+    /// "最新在前"在**生产实现**上坏了也无人报警。判据得落在真实现上，替身只负责与它对齐。
+    ///
+    /// 判别点三条：`After` 升序、`Before` 降序、两个游标都**排他**（翻页不许原地打转）。
+    ///
+    /// 负对照：把 `Before` 的 `ORDER BY id DESC` 改回 `ASC` ⇒ 这条红。
+    #[tokio::test]
+    async fn artifact_list_pages_in_both_directions() {
+        use crate::v2::domain::ids::ArtifactId;
+        use crate::v2::ports::repositories::{ArtifactCursor, ArtifactRepository};
+
+        let repositories = SqliteRepositories::in_memory().expect("内存数据库初始化应成功");
+        for id in 1..=3u64 {
+            repositories
+                .connection
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .execute(
+                    "INSERT INTO v2_assets(id, kind, run_id, filename, mime_type, byte_size,
+                                           checksum, storage_key, created_at)
+                     VALUES (?1, 'artifact', 1, ?2, 'image/png', 4, ?3, ?4, '1000')",
+                    params![
+                        id,
+                        format!("out-{id}.png"),
+                        format!("sum-{id}"),
+                        format!("k/{id}")
+                    ],
+                )
+                .expect("种产物");
+        }
+
+        let ids = |summaries: Vec<crate::v2::ports::repositories::ArtifactSummary>| {
+            summaries
+                .into_iter()
+                .map(|item| item.id.0)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            ids(repositories
+                .list(10, ArtifactCursor::After(None))
+                .await
+                .expect("升序列表")),
+            vec![1, 2, 3],
+            "`After` 必须升序（既有语义）"
+        );
+        assert_eq!(
+            ids(repositories
+                .list(10, ArtifactCursor::Before(None))
+                .await
+                .expect("降序列表")),
+            vec![3, 2, 1],
+            "`Before` 必须**降序**（最新在前）—— 这是「结果」视角要的那个方向"
+        );
+        assert_eq!(
+            ids(repositories
+                .list(10, ArtifactCursor::Before(Some(ArtifactId(3))))
+                .await
+                .expect("降序翻页")),
+            vec![2, 1],
+            "游标必须**排他**：给 3 就只回比它更旧的"
+        );
+        assert_eq!(
+            ids(repositories
+                .list(10, ArtifactCursor::After(Some(ArtifactId(1))))
+                .await
+                .expect("升序翻页")),
+            vec![2, 3],
+            "升序方向同样排他"
+        );
+    }
+
     /// 移除 / 恢复的**仓库层契约**（sqlite 侧）。
     ///
     /// ⚠️ 为什么必须在这里、用**真 sqlite** 测：这套语义以前只在替身

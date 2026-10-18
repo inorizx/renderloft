@@ -208,8 +208,26 @@ pub trait ArtifactRepository: Send + Sync {
     async fn list(
         &self,
         limit: usize,
-        after: Option<crate::v2::domain::ids::ArtifactId>,
+        cursor: ArtifactCursor,
     ) -> DomainResult<Vec<ArtifactSummary>>;
+}
+
+/// 产物列表**往哪个方向翻**。
+///
+/// 为什么要有两个方向（2026-10-18 加）：两个消费者要的是**相反**的顺序，而它们都对 ——
+/// * 脚本 / MCP 那侧按 id 递增翻（"从最早开始，一页一页往后"），既有语义，`After` 保持不动；
+/// * 界面上的「结果」视角要**最新在前**（"我刚生成的那张在哪"），而 `After` 的第一页给的是
+///   **最旧**的 N 条 —— 那个视角根本拿不到最近的产物。让它把整个列表翻完再倒序，是拿流量换顺序，
+///   产物一多就废。
+///
+/// 所以方向是**查询的一部分**，不是调用方的后处理：`Before` 一次查询就给出"比这个 id 更旧的
+/// 那些，按 id 降序"。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ArtifactCursor {
+    /// 只要 id **大于**它的（`None` = 从头），按 id **升序**返回。
+    After(Option<crate::v2::domain::ids::ArtifactId>),
+    /// 只要 id **小于**它的（`None` = 从最新开始），按 id **降序**返回。
+    Before(Option<crate::v2::domain::ids::ArtifactId>),
 }
 
 #[derive(Debug, Clone, Default)]
@@ -764,9 +782,9 @@ impl ArtifactRepository for Arc<dyn ArtifactRepository> {
     async fn list(
         &self,
         limit: usize,
-        after: Option<crate::v2::domain::ids::ArtifactId>,
+        cursor: ArtifactCursor,
     ) -> DomainResult<Vec<ArtifactSummary>> {
-        self.as_ref().list(limit, after).await
+        self.as_ref().list(limit, cursor).await
     }
 }
 

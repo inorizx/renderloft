@@ -838,7 +838,9 @@ pub static VERBS: &[Verb] = &[
         mcp_description: Some(
             "List generated artifacts. Some providers store results as a remote URL only, so a \
              missing or zero byteSize does NOT mean it is empty. Paged: `limit` (default 50, max \
-             200) and `after` an id.",
+             200) plus a direction — default is oldest first with `after <id>`; `order=desc` gives \
+             newest first (`before <id>` continues with older ones), which is what you want for \
+             \"where is the image I just made\". Mixing the two directions is an error.",
         ),
         read_only: true,
         destructive: false,
@@ -852,6 +854,16 @@ pub static VERBS: &[Verb] = &[
             Param {
                 help: "游标：只看这个产物 id 之前的（上一页最后一条的 id）",
                 ..opt("after", Kind::Id)
+            },
+            Param {
+                help: "游标（只在 `order=desc` 下有意义）：只看比这个 id **更旧**的",
+                ..opt("before", Kind::Id)
+            },
+            Param {
+                help: "方向：`desc` = **最新在前**（「我刚生成的那张在哪」用它）。\
+                        与游标配对：`desc` 配 `before`；不给 order（升序）配 `after`。\
+                        配错了会明确报 CURSOR_CONFLICT，不会默默挑一个",
+                ..opt("order", Kind::Text)
             },
         ],
     },
@@ -2782,7 +2794,9 @@ mod tests {
             // 的 nextActions 早就把 `operation.retry` 写成了"下一步能做什么"——
             // 名字必须真的够得到。`--run` 是可选的：只重试批量里失败的那几条。
             ("operation.retry", &["operation", "run"]),
-            ("artifact.list", &["limit", "after"]),
+            // `before` / `order` 是后加的**反方向**（最新在前）—— 界面的「结果」视角要它，
+            // CLI/MCP 也就跟着有了（表是唯一真相，加参数只改这里）。
+            ("artifact.list", &["limit", "after", "before", "order"]),
             ("artifact.get", &["artifact"]),
             // 后加的：把产物字节下载到本地文件（CLI 专属，不给 AI）。
             (

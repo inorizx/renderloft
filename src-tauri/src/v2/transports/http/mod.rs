@@ -2984,6 +2984,85 @@ mod tests {
     //   （RunningHub / ComfyUI / LLM 端点），要么造假要么跳过，属"要不要做集成测试"的决策；
     // - /settings/open-download-dir：会**真的在用户机器上打开资源管理器**，测试不该有这种副作用。
 
+    /// **产物列表的第二个方向**：`before` = "比这个 id 更旧的，最新在前"。
+    ///
+    /// 为什么必须由服务端给（2026-10-18 加）：`after` 的第一页是**最旧**的一批，而界面上的
+    /// 「结果」视角要"我刚生成的那张在哪" —— 用它根本拿不到最近的产物，除非把整个列表翻完再倒序
+    /// （拿流量换顺序，产物一多就废）。所以方向是查询的一部分。
+    ///
+    /// 判别点四条：
+    /// 1. `?before=`（无游标）⇒ **降序**（最新在前），与既有 `?after=` 的升序**相反**；
+    /// 2. `?before=<id>` ⇒ **严格更旧**的那些（不含它自己），否则翻页会原地打转；
+    /// 3. `?after=` 的既有语义**一个字都没变**（升序、从最早开始）——改别人的东西要证明没改坏；
+    /// 4. 两个游标同时给 ⇒ `CURSOR_CONFLICT`（相反方向，**不许默默挑一个**：挑错了会给出
+    ///    "看起来对、其实是最旧的一批"的结果，而调用方不会发现）。
+    ///
+    /// 负对照：把 `Before` 那条 SQL 的 `ORDER BY id DESC` 改回 `ASC` ⇒ 第 1 条红。
+    #[tokio::test]
+    async fn artifact_list_supports_newest_first_paging() {
+        use crate::v2::domain::ids::ArtifactId;
+        use crate::v2::ports::stores::{ArtifactObject, ArtifactStore};
+
+        let (app, repositories) = test_app();
+        let token = issue_token(&repositories, &["artifacts:read"]).await;
+        for id in 1..=3u64 {
+            ArtifactStore::store(
+                &repositories,
+                ArtifactObject {
+                    id: ArtifactId(id),
+                    run_id: Some(1),
+                    filename: format!("out-{id}.png"),
+                    mime_type: "image/png".to_string(),
+                    byte_size: 4,
+                    checksum: format!("sum-{id}"),
+                    storage_key: format!("artifacts/{id}"),
+                    url: None,
+                    bytes: vec![1, 2, 3, 4],
+                },
+            )
+            .await
+            .expect("种产物");
+        }
+
+        // ① 降序：最新在前。
+        let (status, body) = get_json(&app, "/api/v1/artifacts?order=desc", &token).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let ids: Vec<u64> = body["data"]["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|item| item["artifactId"].as_u64().unwrap())
+            .collect();
+        assert_eq!(ids, vec![3, 2, 1], "`before` 必须最新在前：{body}");
+
+        // ② 严格更旧：给 3 就只回 2、1（不含 3 自己）。
+        let (status, body) = get_json(&app, "/api/v1/artifacts?order=desc&before=3", &token).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let ids: Vec<u64> = body["data"]["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|item| item["artifactId"].as_u64().unwrap())
+            .collect();
+        assert_eq!(ids, vec![2, 1], "游标必须是**排他**的：{body}");
+
+        // ③ 既有方向一个字没变。
+        let (status, body) = get_json(&app, "/api/v1/artifacts", &token).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let ids: Vec<u64> = body["data"]["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|item| item["artifactId"].as_u64().unwrap())
+            .collect();
+        assert_eq!(ids, vec![1, 2, 3], "`after` 的升序语义不许变：{body}");
+
+        // ④ 两个游标同时给 ⇒ 明确报错。
+        let (status, body) = get_json(&app, "/api/v1/artifacts?order=desc&after=1", &token).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert_eq!(body["error"]["code"], "CURSOR_CONFLICT", "{body}");
+    }
+
     #[tokio::test]
     async fn artifact_endpoints_empty_list_and_unknown_id_is_404() {
         let (app, repositories) = test_app();

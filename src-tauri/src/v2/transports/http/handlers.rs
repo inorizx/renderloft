@@ -33,7 +33,7 @@ use crate::v2::domain::ids::{
 };
 use crate::v2::domain::media::AssetRef;
 use crate::v2::domain::model::{Recipe, RecipeBinding};
-use crate::v2::ports::repositories::ActorTokenRecord;
+use crate::v2::ports::repositories::{ActorTokenRecord, ArtifactCursor};
 use crate::v2::ports::safety::SafeHttpClient;
 
 use super::dto::{
@@ -1627,7 +1627,35 @@ pub async fn list_artifacts(
 ) -> HttpResult {
     require_scope(&actor, Scope::ArtifactsRead)?;
     let limit = query.limit.unwrap_or(50).min(200);
-    // ?runId= 过滤（按 Run 查询产物）；否则全局分页列表
+    // 方向与游标必须**配得上**，配不上就明确报错，不许默默挑一个：
+    // 挑错了会给出"看起来对、其实是最旧的一批"的结果，而调用方不会发现。
+    let newest_first = match query.order.as_deref() {
+        Some("desc") => true,
+        Some("asc") | None => false,
+        Some(other) => {
+            return Err(error::validation(
+                "ORDER_INVALID",
+                format!("`order` 只认 `asc` / `desc`，收到：{other}"),
+            ))
+        }
+    };
+    if newest_first && query.after.is_some() {
+        return Err(error::validation(
+            "CURSOR_CONFLICT",
+            "`order=desc`（最新在前）配的是 `before=<id>`（比它更旧）；`after` 是升序方向的游标",
+        ));
+    }
+    if !newest_first && query.before.is_some() {
+        return Err(error::validation(
+            "CURSOR_CONFLICT",
+            "`before` 只在 `order=desc`（最新在前）下有意义；升序方向用 `after`",
+        ));
+    }
+    let cursor = match (newest_first, query.before) {
+        (true, before) => ArtifactCursor::Before(before.map(crate::v2::domain::ids::ArtifactId)),
+        (false, _) => ArtifactCursor::After(query.after.map(crate::v2::domain::ids::ArtifactId)),
+    };
+    // ?runId= 过滤（按 Run 查询产物）；否则分页列表（方向见 `cursor`）。
     let summaries = match query.run_id {
         Some(run_id) => state
             .artifacts_repo
@@ -1636,10 +1664,7 @@ pub async fn list_artifacts(
             .map_err(domain_error)?,
         None => state
             .artifacts_repo
-            .list(
-                limit + 1,
-                query.after.map(crate::v2::domain::ids::ArtifactId),
-            )
+            .list(limit + 1, cursor)
             .await
             .map_err(domain_error)?,
     };
