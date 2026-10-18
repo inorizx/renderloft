@@ -82,19 +82,21 @@
 
 | | ≈ token | 占 128k 上下文 |
 |---|---|---|
-| **现状常驻**：`instructions` 246 ＋ 两个工具 889 | **≈1 135** | 0.89% |
-| 若把这 16 个动词平铺成原生工具（常驻） | ≈4 562 | 3.56% |
-| **省下** | **≈3 427** | — |
-| 索引本身（按需取，**不进常驻**） | ≈4 572 | — |
+| **现状常驻**：`instructions` 528 ＋ 17 个工具 2 507 | **≈3 035** | 2.37% |
+| 其中：描述 4 142 字符 / schema 5 422 字符 / 名字与标注 463 字符 | — | — |
+| 索引本身（按需取，**不进常驻**） | ≈3 197 | — |
+| 逐条取详情（16 个动词合计，按需） | ≈3 188 | — |
 
-> 上面这组是**每次改描述之后重跑脚本**量的。两次实测记录：
-> ① 加 `operation.retry`（第 16 个动词）并给 `operation.list` 补了一句"摘要里带 `attention`"：
-> 平铺 4 049 → 4 478；② 给 `operation.cancel` 补了一句"`remoteMayContinue` 也包含**没有句柄**的
-> 那些 run"：平铺 4 478 → **4 562**（+84）。**常驻始终没动**（1 135：两个工具，与动词数无关）
-> ——这正是这个形状要的性质。
+> **这张表在 2026-10-18 变了性质**：A＋B 落地之前，常驻是两个元工具（1 135），"平铺"只是假设
+> （4 562）；现在**现状就是平铺**，所以"省下多少"这个对比没有了（量具里也删了）。
+> 三次实测记录：① 加 `operation.retry` 与 `list` 的 `attention` 句：平铺 4 049 → 4 478；
+> ② 给 `cancel` 补"没有句柄的 run 也在 `remoteMayContinue` 里"：4 478 → 4 562；
+> ③ **A＋B**：常驻 1 135 → **3 035**（描述被裁到"只留调用前必须知道的事实"之后的结果），
+> 按需的索引 4 572 → 3 197（逐动词详情跟着变短了）。
 >
 > ⚠️ **改了描述或标记之后必须重跑那个脚本**——手抄的数字会漂，实测过。
-> 它同时是"索引常驻、schema 按需"这条决定的**可证伪账单**：数字变坏就是形状变坏了。
+> 它同时是"逐动作标注必须在常驻地板上"这条决定的**可证伪账单**：常驻涨了就是代价，涨到不可接受
+> 就该回去谈形状（唯一不撒谎的杠杆是 schema，见 §5.A 判据 5）。
 
 ---
 
@@ -185,38 +187,49 @@
 
 ## 5. 要做什么（A–G，每条带判据）
 
-### A. 14 个动词还原成原生 MCP tool（主刀）
+### A. 16 个动词还原成原生 MCP tool（主刀）—— ✅ 已落地（2026-10-18）
 
 **机械搬运**：三件套已在手（`mcp_verb_detail`），只改渲染形状。
 
 | 字段 | 来源 | 状态 |
 |---|---|---|
-| `name` | `verb.mcp_name` | 现成（`renderloft_run_recipe` 这套，表里有） |
-| `description` | 逐动词描述（`mcp_verb_detail()` 的 `description`） | 现成 —— **但要按下面判据 5 裁短** |
-| `inputSchema` | `mcp_input_schema()` | 现成 |
-| `annotations` | `mcp_annotations()` | 现成 —— 正是修掉 §3.1 的那一格 |
+| `name` | `verb.mcp_name` | ✅ 现成（`renderloft_run_recipe` 这套，表里有） |
+| `description` | 逐动词描述（`mcp_description`） | ✅ **已按判据 5 裁短**：16 条共 3 191 字符（平均 ~200），只留"调用它之前必须知道的事实"；跨动词的流程搬进了 `instructions`（§D） |
+| `inputSchema` | `mcp_input_schema()` | ✅ 现成 |
+| `annotations` | `mcp_annotations()` | ✅ 现成 —— 正是修掉 §3.1 的那一格 |
 
-**判据**
+**判据**（全部有测试钉着，见 §6）
 
-1. `tools/list` 的条数 **= 表里 `mcp_name` 非空的条数**（今天 14；**不许写死数字**）；
-2. 每个动词的 `annotations` 与表里 `read_only` / `destructive` / `idempotent` **逐条相等**；
-3. `recipe.list` 的 `readOnlyHint` 与 `operation.cancel` 的 `destructiveHint` **能分辨**；
-4. 有参数的动词 schema 里参数齐全、`required` 与表一致；**无参数动词渲染成 `properties: {}` 是对的**（上一版写"每条 `inputSchema` 非空"是错的：`connection.list` 就是 `params: &[]`）；
-5. **预算（新增）**：`tools/list` 序列化后 ≤ **8 000 字符**，且与 recipe 数无关。按现状原样搬运是 ~7.8k ⇒ **等于没有余量**，所以 A 必须同时把逐动词 description 裁到留出余量（目标 ≤ 6k）。**超预算就裁 description，不许动 schema。**
+1. `tools/list` 的条数 **= 表里 `mcp_name` 非空的条数 + 1**（参考工具；**不许写死数字**）✅；
+2. 每个动词的 `annotations` 与表里 `read_only` / `destructive` / `idempotent` **逐条相等** ✅；
+3. `recipe.list` 的 `readOnlyHint` 与 `operation.cancel` 的 `destructiveHint` **能分辨** ✅；
+4. 有参数的动词 schema 里参数齐全、`required` 与表一致；无参数动词渲染成 `properties: {}` 是对的 ✅；
+5. **预算**：`tools/list` 序列化后 ≤ 常数，且与 recipe 数无关。
+   ⚠️ **实测推翻了本条的估算**：压平后是 **12 534 字符**（描述 4 142 + schema 5 422 +
+   名字与标注 463 + JSON 骨架），不是这里原先写的 ~7.8k。所以上限按**实测 + 5%** 定在 13 200，
+   写在 `mcp::tests::TOOLS_LIST_BUDGET_CHARS` 里（失败信息会打印三块各占多少）。
+   **再往下压只有一条不撒谎的路**：裁描述（已经到"只留必须知道的事实"了）或动 schema
+   （= 动词的参数面，那是另一件事）。
 
 > 为什么要预算判据：没有它，A 会把"每动词散文"变成 O(复杂度) 常驻 —— 老问题换个门进来。
 
-### B. 撤掉 `renderloft_call` 作为调用路径
+### B. 撤掉 `renderloft_call` 作为调用路径 —— ✅ 已落地（2026-10-18）
 
 - 它是 I4 的载体，与 A3 不相容；
 - 它的长描述（1 234 字符 / ~300 token）**大部分是跨动词的规矩** —— 那属于 `instructions`；
-- `renderloft_catalog` **可以保留**，但降级为**按需查阅的参考工具**（只读、可缓存），**不许在别处被当入口点名**。
+- `renderloft_catalog` **保留**，降级为**按需查阅的参考工具**（只读、可缓存），**不许在别处被当入口点名**。
 
 **判据**：`renderloft_call` 不再出现在 `tools/list`；没有任何描述再出现 "call `renderloft_catalog` first"。
+✅ 两条都有测试钉着（`the_deprecated_call_tool_is_still_accepted_but_no_longer_listed`、
+`every_tool_named_in_served_text_is_listed`）。
 
-**兼容性**：A 是**纯增量**（14 个名字本来就在分发路径里，`invoke()` 的分发路径）；破坏性只在 B —— 任何缓存过旧清单、或写死 `renderloft_call` 的调用方会断。所以 B 最后做，并留一个弃用窗口。
+**兼容性**：A 是**纯增量**；破坏性只在 B —— 任何缓存过旧清单、或写死 `renderloft_call` 的调用方会断。
+所以 B 最后做，并留一个**弃用窗口**。窗口的实现方式就是这条判据的形状：
+**从清单里撤掉，但仍然认得**（`invoke()` 里那条兼容路径照旧；有测试钉住"撤了但还认"）。
+另外压平之后**索引也不再嵌在参考工具的描述里**（那曾经是常驻账单里最大的一笔，
+而且"索引常驻"本身就会把它变成入口）——它改成调用时返回。
 
-### C. 成本与不可逆：改成**首行、固定、可见**的标记
+### C. 成本与不可逆：改成**首行、固定、可见**的标记 —— ✅ 已落地
 
 在"位置不够机械"之上再补一条更硬的：**拼写不许靠零宽字符区分**（§3.4）。
 
@@ -227,14 +240,21 @@
 - 粒度必须在地板上：`runs` 是数组 ⇒ **一次调用可能触发 N 次计费**（N ≤ 100），这句话要写进去，同时按 §3.3 落成 `maxItems`。
 
 **判据**：两条正则各筛出一组，**条数与表里的"会花钱 / destructive"逐条对上**，且 `^\[COST\]` 与 `^\[IRREVERSIBLE\]` 互不冒充。
+✅ 已落地并扩到**工具描述**：`every_listed_verb_reports_the_table_s_own_annotations` 断言每条工具描述
+**以它自己的标记开头**、且 `[COST]` 集合与表逐条相等。
 
-### D. 跨动词叙事归 `instructions`，逐动词细节归 `description`
+### D. 跨动词叙事归 `instructions`，逐动词细节归 `description` —— ✅ 已落地（2026-10-18）
 
-`instructions` 已接好（`mcp.rs` 的 `initialize` / `server/discover` 两个分支），现在只放 `MCP_IDENTITY`。搬过去的应当是：典型流程（`recipe.list → recipe.describe → recipe.run`）、⚠ 花的是用户自己的额度、长任务（提交即返回；`operation.get` 是廉价只读主路径）、失败后先看 `inputs` ＋ `error` 再重试、**自主调用方并发 ≤ 4**。
+`instructions` 已接好（`mcp.rs` 的 `initialize` / `server/discover` 两个分支）。
+搬过去的是：典型流程（挑应用 → 读 schema → 提交 → 用廉价的只读 `operation.get` 跟进）、
+花的是用户自己的额度（且**重投会再花一次**）、长任务（提交即返回；`wait` / `callbackUrl` 是加成）、
+失败后先读 `inputs` ＋ `error` 再重试、**自主调用方并发 ≤ 4**、以及"`RUNNING` 不等于在动，看 `attention`"。
 
 **分工一句话：`instructions` 说流程，`description` 说这一个动词。**
 
 **判据**：`instructions` 里能读到完整流程、付费警告**与并发上限的数字**；每条 `description` 里不再出现"先调别的工具"这类跨动词指示。
+✅ 有测试钉着（`instructions_carry_the_cross_verb_rules`：流程/付费/两个上限数字/`attention` 都在，
+且没有一条工具描述在教"先调哪个工具"）；**16 条描述里的 `renderloft_` 出现次数为 0**。
 
 ### E. 异步路径：只用 request/response 就能表达完整
 
@@ -268,18 +288,19 @@
 ## 6. 守门：三条性质测试（替换两条形状测试）
 
 形状测试钉的是数字，数字会过期（§1.2 就是例子）。改成钉**物理性质**。
-（进度：第 2 条的前半与第 3 条的"表那一侧"**已落地**；第 1 条与第 2 条后半等 A。）
+**进度（2026-10-18）：三条全部落地**，两条旧的形状测试（`the_meta_tools_are_annotated_conservatively`
+里的"恰好两个"、`the_index_and_the_table_agree_in_both_directions`）已按本节替换。
 
-1. **预算（待 A）**：`tools/list` 序列化后 ≤ B 字符（常数），且不随 recipe 数变化。
-   *负对照*：把某条 description 复制三遍 ⇒ 必须红。
+1. **预算**：`tools/list` 序列化后 ≤ `TOOLS_LIST_BUDGET_CHARS`（常数，实测 12 534 ⇒ 上限 13 200），
+   且不随 recipe 数变化。`the_resident_tool_list_stays_within_its_budget`。
+   *负对照（已验）*：给参考工具的描述加 3 000 个字符 ⇒ 红（失败信息会打印"描述 / schema / 其余"三块各占多少）。
 2. **门**：清单里每个动词的 `annotations` 与表里 `read_only` / `destructive` / `idempotent` 逐条相等；`^\[COST\]` 筛出的集合 = 表里会花钱的集合。
-   - **标记那一半已落地**：`cost_and_irreversibility_marks_are_mechanical_and_match_the_table`（`[COST]` / `[IRREVERSIBLE]` 集合与表逐条相同；被服务文本里不许再有 `⚠` / U+FE0F）。
-   - *负对照（已验）*：把 `mcp_markers()` 改成永远返回空串 ⇒ `cost_and_irreversibility_marks_...` 与 `run_recipe_schema_and_implementation_agree` 变红。
-   - annotations 那一半等 A（`mcp_annotations()` 换回压平的那一组 ⇒ 必须红）。
-3. **不可见即不存在（A2 的可执行形式）**：**被服务的文本**里出现的工具名（正则 `renderloft_[a-z_]+`）必须都在 `tools/list` 里。"被服务的文本"要含 `catalog(<verb>)` 的 detail —— 那正是模型真正读的那一份。
-   - **已落地**：`every_tool_named_in_served_text_is_listed` 扫 `tools/list` 的文本（今天只提到 `renderloft_catalog`，是列出来的 ⇒ 绿），**并额外钉住表那一侧**：详情里点到的名字必须是表里真实存在的工具名（今天就能拦住"写了个拼错的名字"）。
-   - 仍待 A：把扫描范围扩到 detail（它点名的 8 个 native 名今天一个也不在 `tools/list` 里 ⇒ 那一版现在必然是红的）。
-   - *负对照（已验）*：把 `call` 描述里的 `renderloft_catalog` 改成 `renderloft_typo` ⇒ 变红。
+   - 标记那一半：`cost_and_irreversibility_marks_are_mechanical_and_match_the_table`（`[COST]` / `[IRREVERSIBLE]` 集合与表逐条相同；被服务文本里不许再有 `⚠` / U+FE0F）。
+   - annotations 那一半：`every_listed_verb_reports_the_table_s_own_annotations`（逐动词三条标注相等 + 描述以标记开头 + 只读与不可逆**能分辨**）。
+   - *负对照（已验）*：把 `mcp_annotations()` 的 `read_only` 写死成 `false` ⇒ 红。
+3. **不可见即不存在（A2 的可执行形式）**：**被服务的文本**里出现的工具名（正则 `renderloft_[a-z_]+`）必须都在 `tools/list` 里；同一份文本里出现的**动词 id** 必须在**表**里存在。"被服务的文本"含 `tools/list`、`instructions` 与 `catalog(<verb>)` 的 detail。
+   - `every_tool_named_in_served_text_is_listed` 现在扫三处。压平后每条动词描述都**不再点名别的工具**，所以"工具名"那一半是零命中即绿（它拦的是"有人又把跨动词指示写回某条描述"）；真正在干活的是新增的**动词 id** 那一半 —— 流程搬进 `instructions` 之后，写错一个 id 没有任何编译期检查。
+   - *负对照（已验）*：① 把 `instructions` 里的 `operation.get` 改成 `operation.gett` ⇒ 红（报错里列出表里全部 25 个 id）；② 在工具描述里写 `renderloft_typo` ⇒ 红。
 
 ---
 
@@ -288,6 +309,8 @@
 1. **不做分层。** 不加 `deferByDefault` 之类的自家字段去"建议"调用方怎么披露。可以预留，但描述里不许依赖（A5）。
 2. **不做审批语义。** 不声明"这个需要确认"。闸门在调用方 —— `ARCHITECTURE.md` 的"自主调用方必须设闸"那条本来就是这个立场，保持。
 3. **别给元层再加功能。** 这轮是把它从**承重**降成**可选**，不是给它扩面。
+   ✅ 已按这条做：参考工具只保留"索引 + 单个动词的完整语义"，**索引不再嵌在常驻描述里**，
+   也没有给它加任何新能力。
 
 ---
 
@@ -305,6 +328,20 @@
 
 **答不出哪一条，就是哪一块藏了东西。**
 
+> **① 的结果（2026-10-18，A＋B 之后，用仓库产物实测）**：五条都**能从 `tools/list` ＋
+> `instructions` 直接读出来**，不需要任何额外说明：
+>
+> | 问题 | 答案来自 | 实测答案 |
+> |---|---|---|
+> | 能不能生成视频？ | 身份句 ＋ 工具名 | 能：`renderloft_run_recipe`，身份句写了 image/video |
+> | 要花谁的钱？ | `instructions` 的 Money 段 | 用户自己的平台额度（`USER'S OWN platform credits`） |
+> | 哪些动作会花钱？ | 描述首行的 `[COST]` | `renderloft_run_recipe`、`renderloft_retry_operation`（`[IRREVERSIBLE]`：`renderloft_cancel_operation`） |
+> | 哪些只读、哪些不可逆？ | 逐动作 `annotations` | 11 个 `readOnlyHint: true`；`destructiveHint: true` 只有 `renderloft_cancel_operation` |
+> | `runs` 传 10 条会怎样？ | schema `maxItems` ＋ `instructions` 的 Limits 段 | 上限 100；**每一条单独计费**；同时最多 4 个 operation 在飞 |
+>
+> ⚠️ 这是我（实现方）按"只读 tools/list"的口径自测的，**不是**一个独立 agent 的盲测 ——
+> 那一条只有真挂一个 agent 才算数（见下）。
+
 ### ② 交叉测试 —— 挂到一个从没听说过 `renderloft_catalog` 的通用 agent
 
 跑一次 recipe，数它浪费的轮数。
@@ -316,18 +353,27 @@
 >
 > **先跑基线再改。** 现在跑一次并记下轮数，否则改完没有对照，"漏没漏"只能靠感觉。
 
+> ⚠️ **② 还没跑**（2026-10-18）：它要一个真挂上来的通用 agent ＋ **一次真实计费的任务**，
+> 两者都只能由人来跑。压平之后"静态参数"这一侧的信息已经全在工具 schema 里
+> （不再需要先 `catalog` 再猜），所以这一条的**预期**是轮数下降；但预期不是证据，
+> 跑之前别把它写成"已验收"。
+
 ---
 
 ## 9. 顺序
 
 | 步 | 内容 | 成本 | 收益 |
 |---|---|---|---|
-| 0 | **决定本身** —— 元层是否从"自动化入口"降为"按需参考"（§G） | 决策，不是工时 | 先定这个，后面才不是返工 |
+| 0 | ✅ **已定（2026-10-18）**：元层从"自动化入口"降为"按需参考"（§G）—— 维护者拍板 A＋B 同批 | 决策，不是工时 | 先定这个，后面才不是返工 |
 | 1 | ✅ **已做**：漂移测试 `every_tool_named_in_served_text_is_listed`（扫 `tools/list` ＋ 表那一侧）＋ 标记码点统一（`mcp_markers()`） | 极低 | 把"人比对"变成"机器拦"；A 的世界里名字漂移自动消解 |
 | 2 | ✅ **已做**：`runs` 的 `maxItems`（`MAX_RUNS_PER_OPERATION`）＋ `instructions()` 报三档上限（数字 import 强执行方，不手抄） | 极低 | 不新增权力，只公开边界；**不用等 A** |
-| 3 | **A** ＋ **G** 同批三处（守门测试按 §6 重写） | 低（三件套现成；要把 description 裁进预算） | 修掉 §3.1 与 §3.2 两个真问题 |
-| 4 | **D** 叙事归 `instructions`（三档上限已经在里面了，剩下的只是流程 / 重试那几句） | 低（字段已接好） | 防重复：O(N) → O(1) |
-| 5 | **B** 撤 `renderloft_call` | 中（要留弃用窗口） | 收口 |
+| 3 | ✅ **已做（2026-10-18）**：**A** ＋ **G** 同批三处（守门测试按 §6 重写；`AGENTS.md` 的"自动化入口"那句与那个不存在的测试名都改了） | 低（三件套现成；description 裁到 16 条共 3 191 字符） | 修掉 §3.1 与 §3.2 两个真问题 |
+| 4 | ✅ **已做（2026-10-18）**：**D** 叙事归 `instructions`（流程 / 付费 / 长任务 / 失败重试 / `attention`；三档上限本来就在） | 低（字段已接好） | 防重复：O(N) → O(1)（16 条描述里 `renderloft_` 出现 0 次） |
+| 5 | ✅ **已做（2026-10-18）**：**B** 撤 `renderloft_call`（从清单里撤掉，**仍然认得** = 弃用窗口） | 中（要留弃用窗口） | 收口 |
+
+> **A＋B 落地后的账单（实测，2026-10-18）**：常驻 1 135 → **3 035** token（0.89% → 2.37%），
+> 按需索引 4 572 → **3 197**。这是"逐动作标注必须在常驻地板上"的代价，**不是**省钱的改动——
+> 它买的是审批层能分辨"只读 / 会花钱 / 不可逆"（压平前这三类在清单里长得一模一样）。
 
 > 第 0 步是**唯一真正的岔路**。若不打算动元层，那么 §3.1 与 §3.2 这两个代价仍然存在，但至少要**明确记在案**（写进 `status.md` 或本节）—— 它们是"调用方无法差异化治理"与"无意的规模变成账单"的成因，不该是一处无人知道的隐性取舍。
 

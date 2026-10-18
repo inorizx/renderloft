@@ -142,7 +142,7 @@ pnpm smoke:linux   # （可选）从解压包全链路自检：CLI → daemon �
 
 ## 用 AI 驱动它（可选）
 
-RenderLoft 自带一个 MCP 服务器（stdio），把本机 daemon 的能力暴露给任何 MCP 客户端。**它对外只有两个工具**：`renderloft_catalog`（看能做什么：给一个 verb id 就返回那个动词的完整 schema 与语义）与 `renderloft_call`（调用，`{"verb": "operation.run", "args": {...}}`）。
+RenderLoft 自带一个 MCP 服务器（stdio），把本机 daemon 的能力暴露给任何 MCP 客户端。**每个动词就是一个工具**（`renderloft_run_recipe`、`renderloft_get_operation`、`renderloft_cancel_operation`…），每个工具自带它的参数 schema 与**逐动作标注**（只读 / 不可逆 / 是否花钱）——所以客户端与审批层**不必先查一次**才知道某个动作能不能做、要不要花钱。另有一个只读的 `renderloft_catalog` 作按需查阅（给一个 verb id 就返回那个动词的完整语义；不给参数就返回索引）。
 
 在你的 MCP 客户端配置里指向 `renderloft-mcp.exe` 即可——**它和界面是同一个安装包里的同一个目录**（安装版默认在 `%LOCALAPPDATA%\RenderLoft`），不需要单独下载；免安装 zip 与 Linux 便携包里就是解压目录里的那个（Linux 无 `.exe` 后缀）：
 
@@ -156,12 +156,12 @@ RenderLoft 自带一个 MCP 服务器（stdio），把本机 daemon 的能力暴
 
 > `renderloft-mcp.exe` 是 **stdio 服务**：由 MCP 客户端按需拉起，不用常驻；自己编译的话路径是 `<仓库路径>\src-tauri\target\release\renderloft-mcp.exe`。它连的 daemon 如果没在跑，**它会自己把旁边的 `renderloft.exe` 拉起来**（CLI 也一样）——所以不必先打开界面。
 
-然后就能直接说「用 Krea2-turbo 画一只在草地上的猫，等它完成，把图给我」——它背后走的是 `catalog → call(recipe.list) → call(recipe.describe) → call(operation.run)`，**不需要你解释字段是什么意思**，因为备注名已经写在 schema 里了。
+然后就能直接说「用 Krea2-turbo 画一只在草地上的猫，等它完成，把图给我」——它背后走的是 `renderloft_list_recipes → renderloft_describe_recipe → renderloft_run_recipe → renderloft_get_operation`，**不需要你解释字段是什么意思**，因为备注名已经写在 schema 里了。
 
-**刻意不给 AI 的动词不在索引里，也调不到**（元层会拒绝）：写密钥、写备注名、建/删连接、关 daemon、往磁盘写文件——它们属于人的动作，改的是「谁能跑什么」这条授权边界本身。
+**刻意不给 AI 的动词不在工具清单里，也调不到**：写密钥、写备注名、建/删连接、关 daemon、往磁盘写文件——它们属于人的动作，改的是「谁能跑什么」这条授权边界本身。
 
 > **带图提交、批量、回调、dry-run、分页与常见坑**：[`docs/agent-cookbook.md`](docs/agent-cookbook.md)。
-> **这套工具面的完整推导**（公理 → 设计律 → 物理边界 → 可证伪的判据、常驻 token 账单，以及"元层该不该继续当自动化入口"这个**尚未决定**的岔路）：[`docs/mcp-surface.md`](docs/mcp-surface.md)。
+> **这套工具面的完整推导**（公理 → 设计律 → 物理边界 → 可证伪的判据、常驻 token 账单，以及"为什么压平成原生工具"这个**已经定下来**的岔路）：[`docs/mcp-surface.md`](docs/mcp-surface.md)。
 
 ## 产物怎么拿到手
 
