@@ -618,7 +618,9 @@ impl ProviderDriver for RunningHubDriver {
             .await
             .map_err(|error| super::safety::map_network_error(&error, "runninghub_submit"))?;
         if !response.status().is_success() {
-            return Err(super::safety::map_http_error(
+            // ⚠️ 提交路径专用：5xx 会被标成"提交结果不明"（平台可能已经收下），
+            // 于是**不会**盲投 —— 见 `safety::map_submit_http_error`。
+            return Err(super::safety::map_submit_http_error(
                 response.status().as_u16(),
                 "RunningHub 提交失败",
             ));

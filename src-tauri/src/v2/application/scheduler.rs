@@ -436,6 +436,13 @@ impl SchedulerService {
         // 以及驱动侧"要不要报可按 id 回查的不确定提交"，必须给出同一个答案。
         let unknown = error.submission_is_unknown();
         if unknown {
+            // ⚠️ run 上也要留原因（2026-10-18 补）：只写进 attempt 的话，调用方在 run 级看到的是
+            // `error: null` —— 而它正处在"要不要再花一次钱"的判断里，最需要知道的是**为什么不确定**
+            // （连接断了？还是平台 500？后者意味着平台**可能已经收下**）。
+            // cookbook §11 那句"读 run 的 `inputs` 与 `error` 一起读"也依赖这一列真的非空。
+            self.repositories
+                .set_run_error(run_id, Some(error.clone()))
+                .await?;
             self.repositories
                 .complete_attempt(
                     run_id,
@@ -1445,6 +1452,117 @@ mod tests {
             !error.retryable,
             "这条错误必须是**不可重试**的，否则下一拍又被排回 RETRY_WAIT（死循环）"
         );
+    }
+
+    /// **HTTP 5xx 是"提交结果不明"**：落「等确认」，**不许盲投**（2026-10-18 定的取舍）。
+    ///
+    /// 为什么（这是钱）：5xx 是"平台回了话"，但 500 可能是**网关 / 内部错误发生在受理之后**
+    /// ⇒ 平台**可能已经收下**并照常计费。盲投 = 平台上可能有两个任务、扣两次钱。
+    /// 按铁律二，这类提交与"发出去之后超时"同类，只能等对账或死线。
+    ///
+    /// 代价（已写进 `status.md` 与 README）：RunningHub **没有任何接口**能回查"我那条任务在不在"，
+    /// 所以那边遇到 5xx 会等到死线再人工决定。换来的是**永远不会悄悄扣两次**。
+    ///
+    /// 判别点三条：
+    /// 1. 5xx ⇒ `SUBMISSION_UNCERTAIN`（不是 `RETRY_WAIT`），且 tick 的计数也报 `uncertain`
+    ///    （落点与计数必须一致——这个仓库因为两处各写一份判据踩过一次）；
+    /// 2. **反向控制**：同样走"平台拒绝"的 **429** 仍然退避重试（明确拒绝 ⇒ 一个字节的活都没接
+    ///    ⇒ 重试不可能重复计费）——少了这条，"把所有错都判成不确定"也能过第 1 条；
+    /// 3. 错误里带着"结果不明"的标记（排查时能看出是哪条判据起的作用）。
+    ///
+    /// ⚠️ 测试**直接用生产那个映射函数**（`safety::map_submit_http_error`）造错误，而不是手搓一个
+    /// 带标记的 `SafeError`：手搓的话，映射函数改了（比如哪天不标 5xx 了）测试照样绿 ——
+    /// 那样测的就不是生产行为。
+    ///
+    /// 负对照：把 `map_submit_http_error` 里打标记那几行删掉 ⇒ 第 1 条红（run 会去退避重试）。
+    #[tokio::test]
+    async fn a_five_hundred_on_submit_waits_for_confirmation_instead_of_blind_retry() {
+        let repositories = InMemoryRepositories::new();
+        seed_environment(&repositories);
+        create_operation(&repositories).await;
+        let driver = Arc::new(FakeProviderDriver::new(ProviderDescriptor {
+            vendor_id: "openai".to_string(),
+            protocol_id: "openai-images".to_string(),
+            display_name: "OpenAI Images".to_string(),
+            business_capabilities: vec!["text-to-image".to_string()],
+            lifecycle_features: LifecycleFeatures::default(),
+            security_requirements: Default::default(),
+            connection_schema: json!({}),
+            binding_schema: json!({}),
+        }));
+        driver.push_submit_error(
+            crate::v2::infrastructure::providers::safety::map_submit_http_error(
+                503,
+                "Provider 返回 HTTP 503",
+            ),
+        );
+        let mut registry = DriverRegistry::new();
+        registry.register(driver_key("openai", "openai-images"), driver.clone());
+        let scheduler = SchedulerService {
+            owner: "test-scheduler".to_string(),
+            repositories: Arc::new(repositories.clone()),
+            leases: Arc::new(repositories.clone()),
+            connections: Arc::new(repositories.clone()),
+            assets: Arc::new(repositories.clone()),
+            artifacts: Arc::new(repositories.clone()),
+            drivers: Arc::new(registry),
+        };
+        let result = scheduler.tick().await.expect("调度应成功");
+        assert_eq!(
+            result.uncertain, 1,
+            "5xx 必须计入「等确认」：落点与计数各说各话是这个仓库踩过的坑"
+        );
+        assert_eq!(result.retry_wait, 0, "5xx **不许**进退避重试（那就是盲投）");
+        let persisted = repositories
+            .find_operation(OperationId(1))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(persisted.runs[0].status, RunStatus::SubmissionUncertain);
+        let error = persisted.runs[0].error.clone().expect("要留下原因");
+        assert!(
+            error
+                .details
+                .get(crate::v2::domain::errors::SUBMISSION_UNKNOWN_DETAIL)
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false),
+            "要带着「结果不明」的标记，排查时才知道是哪条判据起的作用"
+        );
+
+        // ② 反向控制：429 是**明确拒绝**，仍然退避重试。
+        let repositories = InMemoryRepositories::new();
+        seed_environment(&repositories);
+        create_operation_with_key(&repositories, "second-key").await;
+        let driver = Arc::new(FakeProviderDriver::new(ProviderDescriptor {
+            vendor_id: "openai".to_string(),
+            protocol_id: "openai-images".to_string(),
+            display_name: "OpenAI Images".to_string(),
+            business_capabilities: vec!["text-to-image".to_string()],
+            lifecycle_features: LifecycleFeatures::default(),
+            security_requirements: Default::default(),
+            connection_schema: json!({}),
+            binding_schema: json!({}),
+        }));
+        driver.push_submit_error(
+            crate::v2::infrastructure::providers::safety::map_submit_http_error(
+                429,
+                "Provider 返回 HTTP 429",
+            ),
+        );
+        let mut registry = DriverRegistry::new();
+        registry.register(driver_key("openai", "openai-images"), driver.clone());
+        let scheduler = SchedulerService {
+            owner: "test-scheduler".to_string(),
+            repositories: Arc::new(repositories.clone()),
+            leases: Arc::new(repositories.clone()),
+            connections: Arc::new(repositories.clone()),
+            assets: Arc::new(repositories.clone()),
+            artifacts: Arc::new(repositories.clone()),
+            drivers: Arc::new(registry),
+        };
+        let second = scheduler.tick().await.expect("调度应成功");
+        assert_eq!(second.retry_wait, 1, "429 是明确拒绝，该退避重试");
+        assert_eq!(second.uncertain, 0);
     }
 
     /// **能证明「字节没出去」**的提交失败 ⇒ 直接退避重试，不落「等确认」。

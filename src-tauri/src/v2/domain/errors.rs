@@ -141,7 +141,8 @@ impl SafeError {
             .unwrap_or(false)
     }
 
-    /// **提交结果不明**吗？= 网络/超时类失败**且我们证明不了字节没出去**。
+    /// **提交结果不明**吗？= 网络/超时类失败**且我们证明不了字节没出去**，**或者**被显式标成
+    /// "提交结果不明"（`SUBMISSION_UNKNOWN_DETAIL`，见下）。
     ///
     /// ⚠️ 这条判据决定钱，而且**只能有一处**：`ErrorKind::Network` 把两件事混在一起——
     /// 「连接被拒」（对端**主动拒绝**握手 ⇒ 一个字节都没发出去 ⇒ 平台什么都没收到）与
@@ -154,7 +155,20 @@ impl SafeError {
     ///
     /// 此前这两处**各写了一份**判据，实测踩到过：只改一处 ⇒ run 进了 `RETRY_WAIT` 而 tick 的计数
     /// 报 `uncertain`（库里的状态与计数各说各话）。所以判据放在这里，谁都不许再抄一份。
+    ///
+    /// ⚠️ 第二个来源（2026-10-18 补）：**HTTP 5xx 也是"结果不明"**。它是"平台回了话"，
+    /// 但 500 可能是**网关/内部错误发生在受理之后** ⇒ 平台可能已经收下并计费。
+    /// 按铁律二它和"发出去后超时"同类，所以**不许盲投**。标记由提交路径上的
+    /// `infrastructure::providers::safety::map_submit_http_error` 打（4xx 不打：那是明确拒绝）。
     pub fn submission_is_unknown(&self) -> bool {
+        if self
+            .details
+            .get(SUBMISSION_UNKNOWN_DETAIL)
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+        {
+            return true;
+        }
         matches!(self.kind, ErrorKind::Network | ErrorKind::Timeout)
             && !self.proves_nothing_was_sent()
     }
@@ -164,6 +178,14 @@ impl SafeError {
 /// `infrastructure::providers::safety::map_network_error`，消费者是
 /// `SafeError::proves_nothing_was_sent`）。
 pub const NOTHING_SENT_DETAIL: &str = "nothingSent";
+
+/// `details` 里"**这次提交的结果不明**"那个键的**唯一**定义处（生产者在
+/// `infrastructure::providers::safety::map_submit_http_error` —— 只给 HTTP 5xx 打，
+/// 消费者是 `SafeError::submission_is_unknown`）。
+///
+/// 与 `NOTHING_SENT_DETAIL` 是**两个相反的证据**，别混：那个说"一个字节都没出去"（⇒ 可以放心重试），
+/// 这个说"**可能已经收下了**"（⇒ 不许自动重投）。
+pub const SUBMISSION_UNKNOWN_DETAIL: &str = "submissionUnknown";
 
 impl std::fmt::Display for SafeError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
