@@ -106,3 +106,46 @@ if (dataDirProblems.length > 0) {
   process.exit(1)
 }
 console.log(`数据目录名守门通过：${DATA_DIR_OWNER} 与其余 ${DATA_DIR_CONSUMERS.length} 个消费者一致（${ownerNames[0]}）`)
+
+// 日志轮转阈值同源守门：`daemon.log` 多长算长，**只能有一个答案**。
+//
+// 为什么需要机器守：这个约定有**两份实现**，而且在两个 crate 里（`src-tauri` 的
+// `clients/daemon_boot.rs` 是 CLI / MCP 拉起 daemon 那条路，`desktop` 的 `main.rs` 是外壳
+// 那条），彼此没有编译期联系。漂了的后果不是报错，而是"日志会不会无限长取决于谁先把 daemon
+// 拉起来"——CLI / MCP 那条路此前正是只 append、从不轮转，实测本机那份长到 12 MB 还在长。
+//
+// ⚠️ 外壳里还有**第二个** `const LIMIT`（`shell.log` 的 1 MB，另一份文件、另一个约定），
+// 所以这里按**函数体**切，不按"文件里第一个 LIMIT"——那会在有人调整函数顺序时静默取错值。
+const DAEMON_LOG_LIMIT_OWNER = 'src-tauri/src/v2/clients/daemon_boot.rs'
+const desktopMain = read('desktop/src/main.rs')
+const shellDaemonLogFn = desktopMain.slice(desktopMain.indexOf('fn daemon_log_file'))
+const logLimitSources = [
+  {
+    file: DAEMON_LOG_LIMIT_OWNER,
+    value: read(DAEMON_LOG_LIMIT_OWNER).match(/const LOG_ROTATE_BYTES: u64 = ([^;]+);/)?.[1],
+  },
+  {
+    file: 'desktop/src/main.rs',
+    value: shellDaemonLogFn.match(/const LIMIT: u64 = ([^;]+);/)?.[1],
+  },
+].map(({ file, value }) => ({ file, value: value?.replace(/\s+/g, '') ?? null }))
+
+const logLimitProblems = []
+for (const { file, value } of logLimitSources) {
+  if (value === null) {
+    logLimitProblems.push(`${file}: 没找到轮转阈值常量（改名/挪走了？守门要跟着改，别静默放过）`)
+  }
+}
+if (logLimitProblems.length === 0 && new Set(logLimitSources.map((s) => s.value)).size !== 1) {
+  logLimitProblems.push(
+    `两处阈值不一致：${logLimitSources.map((s) => `${s.file} = ${s.value}`).join(' / ')}` +
+      '——daemon.log 的轮转点必须同值，否则取决于谁先拉起 daemon',
+  )
+}
+
+if (logLimitProblems.length > 0) {
+  console.error('日志轮转阈值不一致：daemon.log 的轮转点必须同源')
+  logLimitProblems.forEach((problem) => console.error('  ' + problem))
+  process.exit(1)
+}
+console.log(`日志轮转阈值守门通过：两处一致（${logLimitSources[0].value}）`)
