@@ -226,7 +226,7 @@ pub fn map_network_error(error: &reqwest::Error, operation: &str) -> SafeError {
     //（`run.submission_uncertain` 的事件载荷只有一句 message，日志那一行要等到死线才写）。
     let nothing_sent = nothing_sent_evidence(error.is_connect(), error.is_timeout(), &cause);
     details.insert(
-        "nothingSent".to_string(),
+        crate::v2::domain::errors::NOTHING_SENT_DETAIL.to_string(),
         serde_json::json!(nothing_sent.is_some()),
     );
     if let Some(evidence) = nothing_sent {
@@ -676,6 +676,15 @@ mod tests {
             "连接被拒 = 一个字节都没发出去，必须如实标出来：{:?}",
             mapped.details
         );
+        // ⚠️ 这个键名是**对外可见**的（`operation get` / 库里 / cookbook §11d 都按它读），
+        // 所以上面那条按字面量钉住它；下面这条钉住**生产者与消费者用的是同一个键**
+        // ——`scheduler` 就是靠 `proves_nothing_was_sent()` 决定"直接重试"还是"等死线"的，
+        // 两边各写一个字符串就是重复扣费。
+        assert!(
+            mapped.proves_nothing_was_sent(),
+            "证据写进去了，但 `SafeError::proves_nothing_was_sent()` 读不到：{:?}",
+            mapped.details
+        );
         assert_eq!(
             mapped.details.get("nothingSentEvidence"),
             Some(&serde_json::json!("CONNECTION_REFUSED"))
@@ -715,6 +724,11 @@ mod tests {
             mapped.details.get("nothingSent"),
             Some(&serde_json::json!(false)),
             "请求已经发出去了，不能说「没出去」：{:?}",
+            mapped.details
+        );
+        assert!(
+            !mapped.proves_nothing_was_sent(),
+            "读回来也必须是「证明不了」——它决定要不要自动重投：{:?}",
             mapped.details
         );
         assert!(

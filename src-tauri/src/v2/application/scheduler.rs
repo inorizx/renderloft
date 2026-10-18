@@ -375,7 +375,8 @@ impl SchedulerService {
         error: &SafeError,
     ) -> DomainResult<()> {
         let run_id = claimed.run.id;
-        let unknown = matches!(error.kind, ErrorKind::Network | ErrorKind::Timeout);
+        // 判据只有一处（`submission_is_unknown`）：落状态与报计数必须给出同一个答案。
+        let unknown = submission_is_unknown(error);
         if unknown {
             self.repositories
                 .complete_attempt(
@@ -473,14 +474,43 @@ enum ExecuteOutcome {
     Cancelled,
 }
 
+/// 这次提交失败算哪一类结局？**只在这里判一次。**
+///
+/// 为什么必须单源（实测踩到）：落状态（`resolve_submit_error`）与报计数（`execute_claimed` 的
+/// `Err` 分支返回 `error_outcome`）此前**各写了一份**判据。加"字节没出去 ⇒ 直接重试"这条时
+/// 只改了落状态那一处 ⇒ run 进了 `RETRY_WAIT`，而 tick 记的是 `uncertain`：
+/// **库里的状态与计数各说各话**，而两边单独看都"没错"。这类分歧不会报错，只会让人看着
+/// 日志排查一个不存在的问题。
 fn error_outcome(error: &SafeError) -> ExecuteOutcome {
-    if matches!(error.kind, ErrorKind::Network | ErrorKind::Timeout) {
+    if submission_is_unknown(error) {
         ExecuteOutcome::Uncertain
     } else if error.retryable {
         ExecuteOutcome::RetryWait
     } else {
         ExecuteOutcome::Failed
     }
+}
+
+/// 「提交结果不明」= 网络/超时类失败**且我们证明不了字节没出去**。
+///
+/// ⚠️ 后半句决定钱：`ErrorKind::Network` 把两件事混在一起——「连接被拒」（对端**主动拒绝**
+/// 握手 ⇒ 一个字节都没发出去 ⇒ 平台什么都没收到）与「发出去后超时」（请求可能已经在平台上
+/// 跑起来了）。前者重投**不可能**重复扣费，后者重投就是再花一次钱（`AGENTS.md` 铁律二）。
+/// 证据由 provider 层落进 `error.details`（`nothing_sent_evidence`：只认连接被拒 / DNS 失败 /
+/// 握手超时三档）。
+///
+/// * 证明不了 ⇒ `SUBMISSION_UNCERTAIN`：等对账/死线，**绝不自动重投**；
+/// * 证明得了 ⇒ 走**已有的**可重试路径（`RETRY_WAIT`，退避 30 秒），不再为一个"对面根本没收到"
+///   的提交空转到死线（默认 1 小时）。
+///
+/// 为什么证明得了也用 `RETRY_WAIT` 而不新造一种"有上限的重试"：它与平台拒绝
+/// （`TASK_QUEUE_MAXED`）、限流、5xx 那一类**是同一种语义**——"现在不行，等一会儿自己再来"。
+/// 给这一档单独加次数上限，等于同一个状态有两种含义；要限次数就该四类一起限，那是另一件事。
+/// 代价说清楚：网络一直不通时它会**每 30 秒一直重试**（不会自己判失败），要放弃就
+/// `operation cancel`；`attention` 会如实说"正在退避重试，不需要人做任何事"。
+fn submission_is_unknown(error: &SafeError) -> bool {
+    matches!(error.kind, ErrorKind::Network | ErrorKind::Timeout)
+        && !error.proves_nothing_was_sent()
 }
 
 #[cfg(test)]
@@ -1218,6 +1248,99 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(persisted.runs[0].status, RunStatus::RetryWait);
+    }
+
+    /// **能证明「字节没出去」**的提交失败 ⇒ 直接退避重试，不落「等确认」。
+    ///
+    /// 为什么这条要紧（钱与时间）：`SUBMISSION_UNCERTAIN` 会一直等到死线（默认 1 小时）才判失败。
+    /// 而"连接被拒"意味着对端**主动拒绝**了握手、平台什么都没收到 —— 让用户为这种提交等一小时
+    /// 毫无意义，而且它**不可能**重复扣费（重投的前提是"可能已经收下"，这里证明不成立）。
+    ///
+    /// 判别点三条：
+    /// 1. 带证据（`details.nothingSent = true`）的网络失败 ⇒ run 落 `RETRY_WAIT`，
+    ///    且那次 attempt 记下原因（排查与后续判断都靠它）；
+    /// 2. **退避真的设了**（`next_poll_at` 在未来）——少了这条，一个"立刻重投"的实现也能过第 1 条，
+    ///    而它会在 30 秒内把平台刷爆；
+    /// 3. 反向控制见 `network_error_marks_run_submission_uncertain`：**同样**的网络失败
+    ///    **不带证据**时仍然落 `SUBMISSION_UNCERTAIN`（那才是"可能已经收下"）。
+    ///
+    /// 这条测试同时钉住一处**真实的分歧**（写它的时候抓到的）：`resolve_submit_error`（落状态）
+    /// 与 `error_outcome`（报计数）原本各写了一份判据，只改一处时 run 进了 `RETRY_WAIT`
+    /// 而 tick 记的是 `uncertain` —— 库里状态与计数各说各话。现在两处都调
+    /// `submission_is_unknown`，所以"计数"与"落点"必须一致（本测试两个都断言）。
+    ///
+    /// 负对照：把 `submission_is_unknown` 里的 `&& !error.proves_nothing_was_sent()` 删掉 ⇒ 这条红。
+    #[tokio::test]
+    async fn a_provably_unsent_submission_retries_instead_of_waiting_for_the_deadline() {
+        use crate::v2::domain::model::Timestamp;
+
+        let repositories = InMemoryRepositories::new();
+        seed_environment(&repositories);
+        create_operation(&repositories).await;
+        let driver = Arc::new(FakeProviderDriver::new(ProviderDescriptor {
+            vendor_id: "openai".to_string(),
+            protocol_id: "openai-images".to_string(),
+            display_name: "OpenAI Images".to_string(),
+            business_capabilities: vec!["text-to-image".to_string()],
+            lifecycle_features: LifecycleFeatures::default(),
+            security_requirements: Default::default(),
+            connection_schema: json!({}),
+            binding_schema: json!({}),
+        }));
+        // 与 `map_network_error` 落下来的形状一致：网络类 + 可重试 + "字节没出去"的证据。
+        let mut evidence = BTreeMap::new();
+        evidence.insert(
+            crate::v2::domain::errors::NOTHING_SENT_DETAIL.to_string(),
+            json!(true),
+        );
+        driver.push_submit_error(
+            SafeError::network("PROVIDER_UNREACHABLE_SUBMIT", "连不上 submit")
+                .with_details(evidence),
+        );
+        let mut registry = DriverRegistry::new();
+        registry.register(driver_key("openai", "openai-images"), driver);
+        let scheduler = SchedulerService {
+            owner: "test-scheduler".to_string(),
+            repositories: Arc::new(repositories.clone()),
+            leases: Arc::new(repositories.clone()),
+            connections: Arc::new(repositories.clone()),
+            assets: Arc::new(repositories.clone()),
+            artifacts: Arc::new(repositories.clone()),
+            drivers: Arc::new(registry),
+        };
+        let result = scheduler.tick().await.expect("调度应成功");
+        assert_eq!(
+            (result.retry_wait, result.uncertain),
+            (1, 0),
+            "证明得了「没出去」就该退避重试，而不是等死线"
+        );
+        let persisted = repositories
+            .find_operation(OperationId(1))
+            .await
+            .unwrap()
+            .unwrap();
+        let run = &persisted.runs[0];
+        assert_eq!(run.status, RunStatus::RetryWait);
+        // 2) 退避时间必须在未来。
+        assert!(
+            run.next_poll_at
+                .as_ref()
+                .is_some_and(|next| next.millis() > Timestamp::now_millis()),
+            "必须设退避时间，否则下一拍就重投：{:?}",
+            run.next_poll_at
+        );
+        // 1) 原因留在 attempt 上（这一档是 FAILED：我们知道它没成功，也知道没发出去）。
+        let attempt = repositories
+            .find_latest_attempt(run.id)
+            .await
+            .expect("查 attempt")
+            .expect("应当有 attempt");
+        let stored = attempt.error.expect("原因必须留下");
+        assert!(
+            stored.proves_nothing_was_sent(),
+            "「字节没出去」的证据要跟着原因一起留下来：{:?}",
+            stored.details
+        );
     }
 
     #[tokio::test]
