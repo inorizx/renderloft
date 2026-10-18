@@ -459,6 +459,29 @@ export const v2 = {
     return this.get(`/api/v1/artifacts?runId=${runId}`)
   },
   /**
+   * 全局产物列表，**最新在前**（「结果」视角用它）。
+   *
+   * 为什么不能用 `listArtifacts` 那套：它的第一页是**最旧**的一批（升序游标），而"我刚生成的那张
+   * 在哪"要的是反方向 —— 把整个列表翻完再倒序是拿流量换顺序。所以服务端多了一个方向：
+   * `order=desc` 配 `before`（比它更旧）。
+   */
+  listArtifactsNewest(
+    limit: number,
+    before?: number
+  ): Promise<
+    Page<{
+      artifactId: number
+      runId: number
+      filename: string
+      mimeType: string
+      byteSize: number
+      checksum: string
+    }>
+  > {
+    const cursor = before === undefined ? '' : `&before=${before}`
+    return this.get(`/api/v1/artifacts?order=desc&limit=${limit}${cursor}`)
+  },
+  /**
    * 取**原始字节**。artifact 与 asset 的 `/bytes` 端点共用（这类响应不是 JSON 信封）。
    * 返回 Blob 而不碰 DOM —— object URL 的创建与回收属视图职责。
    */

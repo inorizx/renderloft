@@ -254,6 +254,19 @@ const messages = {
     // 素材名字取不到时的**如实**说法（不编一个文件名）。
     'task.assetFallbackName': '素材 #{id}',
     // 表单草稿会**活过重启**（见 `runner-sessions` 的 drafts），所以要有出口与说明。
+    // 「结果」视角：产物自己的入口（不必先找到任务）。愿景把"结果"列为四个产品名词之一。
+    'nav.results': '结果',
+    'results.eyebrow': '结果',
+    'results.title': '生成结果',
+    'results.description': '这里是你生成过的全部产物，最新在前。点开可以左右翻看、下载。',
+    'results.reload': '刷新',
+    'results.loadMore': '加载更多',
+    'results.loading': '加载中…',
+    'results.emptyTitle': '还没有结果',
+    'results.emptyDescription': '跑一个应用，产物就会出现在这里。',
+    'results.sizeUnknown': '大小未知',
+    'results.downloaded': '已保存 {filename} 到 {path}',
+    'results.downloadFailed': '保存失败：{message}',
     'runner.clearForm': '清空表单',
     'runner.clearFormTitle': '清空这张表？',
     'runner.clearFormDescription':
@@ -1112,6 +1125,19 @@ const messages = {
     'task.reuseFailed': 'Could not open that app’s form. Please try again.',
     'task.reuseFailedDetail': 'Could not open that app’s form: {message}',
     'task.assetFallbackName': 'asset #{id}',
+    'nav.results': 'Results',
+    'results.eyebrow': 'Results',
+    'results.title': 'Generated results',
+    'results.description':
+      'Everything you have generated, newest first. Open one to flip through and download.',
+    'results.reload': 'Refresh',
+    'results.loadMore': 'Load more',
+    'results.loading': 'Loading…',
+    'results.emptyTitle': 'No results yet',
+    'results.emptyDescription': 'Run an app and its outputs will show up here.',
+    'results.sizeUnknown': 'size unknown',
+    'results.downloaded': 'Saved {filename} to {path}',
+    'results.downloadFailed': 'Could not save: {message}',
     'runner.clearForm': 'Clear form',
     'runner.clearFormTitle': 'Clear this form?',
     'runner.clearFormDescription':

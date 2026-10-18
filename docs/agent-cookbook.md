@@ -191,6 +191,9 @@ renderloft_call { "verb": "operation.run", "args": {
   怎么拿更多"——**绝不悄悄丢**（悄悄截断比不截断更坏：模型会以为看到的就是全部）。
   要翻页就传 `limit` / `after`：`operation.list` 与 `artifact.list` 都支持（CLI 上就是
   `operation list` / `artifact list` 的 `--limit` / `--after`）。
+  ⚠️ **`artifact.list` 另有一个反方向**：`order=desc`（最新在前）+ `before <id>`（比它更旧）。
+  默认方向是**升序**，也就是第一页给的是**最旧**的一批 —— 想找"我刚生成的那张"必须用
+  `order=desc`。两个方向混着传会报 `CURSOR_CONFLICT`，不会默默挑一个。
 - 更细的协议细节（错误信封、分页、截断）见 [`mcp-surface.md`](mcp-surface.md)；
   回调与验签见 [`callbacks.md`](callbacks.md)；CLI 的完整旗标表见 §10
   （MCP 那侧用 `renderloft_catalog` 取每个动词的完整 schema）。
@@ -297,7 +300,7 @@ schtasks /create /tn RenderLoft收图 /sc minute /mo 10 ^
 | `operation wait` | `--operation <id>` · `[--interval <1-60 秒>]`（缺省 5）· `[--timeout <秒>]`（缺省 0 = 一直等） |
 | `operation cancel` | `--operation <id>` |
 | `operation retry` | `--operation <id>` · `[--run <id>]`（只重试这一条；不给就重跑该任务的全部 run——已成功的那几条会**再计费一次**） |
-| `artifact list` | `[--limit <1-200>]`（缺省 50）· `[--after <id>]` |
+| `artifact list` | `[--limit <1-200>]`（缺省 50）· `[--after <id>]`（升序翻页）· `[--before <id>]` + `[--order desc]`（**最新在前**） |
 | `artifact get` | `--artifact <id>` |
 | `artifact download` | `--artifact <id>` · `[--to <文件或目录>]` · `[--on-conflict rename\|skip\|overwrite]`（缺省 rename）· `[--name-template <模板>]` |
 | `asset upload` | `--file <本机文件>` · `[--filename <名字>]` · `[--mime-type <类型>]` |

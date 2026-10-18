@@ -167,6 +167,7 @@ import TaskCenter from '@/components/TaskCenter.vue'
 import {
   CircleAlert,
   Clock3,
+  Images,
   Link2,
   LibraryBig,
   Moon,
@@ -225,6 +226,8 @@ const navigation = computed(() => [
   { to: '/', label: t('nav.workspace'), icon: Sparkles },
   { to: '/library', label: t('nav.library'), icon: LibraryBig },
   { to: '/tasks', label: t('nav.tasks'), icon: Clock3 },
+  // 「结果」：产物自己的入口（愿景里四个产品名词之一：连接 / 应用 / 任务 / **结果**）。
+  { to: '/results', label: t('nav.results'), icon: Images },
   { to: '/connections', label: t('nav.connections'), icon: Link2 }
 ])
 const isNavigationActive = (to: string) =>
