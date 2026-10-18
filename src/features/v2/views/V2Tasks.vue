@@ -242,6 +242,7 @@ import { useLocale } from '@/shared/composables/useLocale'
 import { taskStatusLabel, taskStatusTone } from '@/shared/lib/taskStatus'
 import { attentionReasonLabel } from '@/shared/lib/attention'
 import { formatUsage } from '@/shared/lib/runUsage'
+import { runGroupLabel } from '@/shared/lib/runLabel'
 import type { TaskResult } from '@/shared/types/runninghub'
 
 const workspace = useV2WorkspaceStore()
@@ -441,17 +442,30 @@ const artifactKind = (artifact: { mimeType: string; filename: string }) =>
 const previewableArtifacts = (operationId: number) =>
   (artifactItems.value[operationId] ?? []).filter(isPreviewableArtifact)
 
-const previewResults = (task: OperationDetail): TaskResult[] =>
+/**
+ * 预览项：结果 + **它来自哪条输入**（愿景里"结果按输入分组查看"）。
+ *
+ * 标签判据在 `shared/lib/runLabel.ts` —— 与任务中心共用**同一份**，不在这里再写一遍：
+ * 两处各写一份的下场就是同一批任务在两个界面上有两种说法（本仓库真实发生过）。
+ *
+ * ⚠️ `previewResults` 从这里派生，别各写一份：两者一旦分叉，就会"数出来 3 项、点开只有 2 项"。
+ */
+const previewItems = (task: OperationDetail): { result: TaskResult; label: string }[] =>
   previewableArtifacts(task.operationId)
-    .map(
-      (artifact) =>
-        ({
+    .filter((artifact) => Boolean(artifactUrls.value[artifact.artifactId]))
+    .map((artifact) => {
+      const run = task.runs.find((candidate) => candidate.runId === artifact.runId)
+      return {
+        result: {
           url: artifactUrls.value[artifact.artifactId],
           outputType: artifact.mimeType,
           nodeId: String(artifact.artifactId)
-        }) as TaskResult
-    )
-    .filter((result) => Boolean(result.url))
+        } as TaskResult,
+        label: run ? `${operationLabel(task)} · ${runGroupLabel(run)}` : operationLabel(task)
+      }
+    })
+const previewResults = (task: OperationDetail): TaskResult[] =>
+  previewItems(task).map((item) => item.result)
 const galleryPreview = (task: OperationDetail) => {
   const first = previewableArtifacts(task.operationId).find(
     (artifact) => artifactUrls.value[artifact.artifactId]
@@ -529,7 +543,7 @@ const previewGallery = computed(() =>
   filteredTasks.value
     .filter((task) => !isActive(task))
     .flatMap((task) =>
-      previewResults(task).map((result) => ({ result, label: operationLabel(task) }))
+      previewItems(task).map((item) => ({ result: item.result, label: item.label }))
     )
 )
 const previewIndex = ref(0)
