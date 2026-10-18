@@ -1998,18 +1998,31 @@ impl crate::v2::ports::repositories::ArtifactRepository for SqliteRepositories {
     async fn list(
         &self,
         limit: usize,
-        after: Option<ArtifactId>,
+        cursor: crate::v2::ports::repositories::ArtifactCursor,
     ) -> DomainResult<Vec<crate::v2::ports::repositories::ArtifactSummary>> {
-        let connection = self.connection.lock().unwrap_or_else(|e| e.into_inner());
-        let mut statement = connection
-            .prepare(
+        use crate::v2::ports::repositories::ArtifactCursor;
+        // 两个方向各一条 SQL（不是"同一句加个 ORDER BY 变量"）：比较符、排序、游标含义**三者
+        // 必须一起变**，拆开写反而容易配错（比如 `id > ?` 配 `ORDER BY id DESC` 会给出最旧的一批）。
+        let (sql, bound) = match cursor {
+            ArtifactCursor::After(after) => (
                 "SELECT id, run_id, filename, mime_type, byte_size, checksum, created_at
                  FROM v2_assets WHERE kind = 'artifact' AND (?1 IS NULL OR id > ?1)
                  ORDER BY id ASC LIMIT ?2",
-            )
+                after,
+            ),
+            ArtifactCursor::Before(before) => (
+                "SELECT id, run_id, filename, mime_type, byte_size, checksum, created_at
+                 FROM v2_assets WHERE kind = 'artifact' AND (?1 IS NULL OR id < ?1)
+                 ORDER BY id DESC LIMIT ?2",
+                before,
+            ),
+        };
+        let connection = self.connection.lock().unwrap_or_else(|e| e.into_inner());
+        let mut statement = connection
+            .prepare(sql)
             .map_err(|_| SafeError::storage("无法读取 Artifacts"))?;
         let rows = statement
-            .query_map(params![after.map(|id| id.0 as i64), limit as i64], |row| {
+            .query_map(params![bound.map(|id| id.0 as i64), limit as i64], |row| {
                 Ok((
                     row.get::<_, i64>(0)?,
                     row.get::<_, Option<i64>>(1)?,

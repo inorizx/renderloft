@@ -71,7 +71,23 @@ pub fn error_json(error: &SafeError) -> axum::Json<Value> {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct PaginationQuery {
     pub limit: Option<usize>,
+    /// 游标：只看 id **大于**它的（**升序**，从最早往后翻）。
     pub after: Option<u64>,
+    /// 游标（**只在 `order=desc` 下有意义**）：只看 id **小于**它的，即"比这个更旧的"。
+    #[serde(default)]
+    pub before: Option<u64>,
+    /// 方向：`desc` = **最新在前**（界面上的「结果」视角要它）。
+    ///
+    /// 为什么方向要显式给（2026-10-18 加）：`after` 的第一页是**最旧**的一批，而"我刚生成的那张
+    /// 在哪"用它根本拿不到 —— 除非把整个列表翻完再倒序（拿流量换顺序，产物一多就废）。
+    /// 而"没有游标、最新在前"这件事**必须能表达**：空值的 `before=` 解析不成数字（400），
+    /// 所以方向不能靠"用哪个游标"隐含，得有一个显式的开关。
+    ///
+    /// 合法的两种组合：`order=desc`（最新在前）与 `order=desc&before=<id>`（比它更旧）。
+    /// 其余组合（`desc` 配 `after`、`before` 不给 `desc`）**明确报错**，不默默挑一个 ——
+    /// 挑错了会给出"看起来对、其实是最旧的一批"的结果，而调用方不会发现。
+    #[serde(default)]
+    pub order: Option<String>,
     #[serde(default)]
     pub run_id: Option<u64>,
     #[serde(default)]

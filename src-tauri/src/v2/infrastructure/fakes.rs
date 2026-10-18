@@ -1604,13 +1604,17 @@ impl crate::v2::ports::repositories::ArtifactRepository for InMemoryRepositories
     async fn list(
         &self,
         limit: usize,
-        after: Option<crate::v2::domain::ids::ArtifactId>,
+        cursor: crate::v2::ports::repositories::ArtifactCursor,
     ) -> DomainResult<Vec<crate::v2::ports::repositories::ArtifactSummary>> {
+        use crate::v2::ports::repositories::ArtifactCursor;
         let state = self.state.lock().unwrap();
         let mut summaries: Vec<_> = state
             .artifacts
             .values()
-            .filter(|artifact| after.is_none_or(|after| artifact.id > after))
+            .filter(|artifact| match cursor {
+                ArtifactCursor::After(after) => after.is_none_or(|after| artifact.id > after),
+                ArtifactCursor::Before(before) => before.is_none_or(|before| artifact.id < before),
+            })
             .map(|artifact| crate::v2::ports::repositories::ArtifactSummary {
                 id: artifact.id,
                 run_id: RunId(artifact.run_id.unwrap_or_default()),
@@ -1621,7 +1625,14 @@ impl crate::v2::ports::repositories::ArtifactRepository for InMemoryRepositories
                 created_at: Timestamp::now(),
             })
             .collect();
-        summaries.sort_by_key(|summary| summary.id);
+        // 方向必须与 sqlite 对齐（替身与真实现不一致 = 测试测的不是真行为）：
+        // `After` 升序、`Before` **降序**，两者都取**前 limit 条**。
+        match cursor {
+            ArtifactCursor::After(_) => summaries.sort_by_key(|summary| summary.id),
+            ArtifactCursor::Before(_) => {
+                summaries.sort_by_key(|summary| std::cmp::Reverse(summary.id))
+            }
+        }
         summaries.truncate(limit);
         Ok(summaries)
     }
