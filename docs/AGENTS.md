@@ -9,7 +9,9 @@
 Tauri 壳 + CLI + MCP）。它使用用户自己的平台连接和 API Key，把 RunningHub 创作者
 开放的应用与工作流、ComfyUI API Prompt、模型 API 包装成可复用 Recipe，提供参数化、
 单次与批量执行、任务恢复、对账和产物管理。界面、CLI、MCP 都是同一个 daemon 的客户端；
-自动化入口是 **MCP 元层（`catalog` + `call`）与 CLI**。
+自动化入口是 **CLI 与 MCP 的原生工具**（每个动词一个工具，逐动作的只读/破坏性/花钱标注都在
+`tools/list` 里 —— 审批层读的就是那一格）。MCP 另留一个只读的 `renderloft_catalog` 作**按需查阅**
+（索引 + 单个动词的完整 schema 与语义），它不是入口，也不需要先调。
 
 ## 三条架构铁律（违反即回退评审）
 
@@ -86,7 +88,9 @@ cargo clippy --offline --manifest-path src-tauri/Cargo.toml --all-targets -- -D 
   `v2/clients/verbs.rs` 的**一张表**里——CLI 由它渲染 clap 子命令、MCP 由它渲染工具 schema、
   分发（动词 → client 调用）也只写一次。某个动词"MCP 不支持"写在 `mcp_name: None`，
   不靠人比对两个文件。在 `cli.rs`/`mcp.rs` 里手写动词会被
-  `the_index_and_the_table_agree_in_both_directions` 与 CLI 覆盖测试打回。
+  `the_listed_tools_are_the_table_s_verbs_plus_the_reference_tool`、
+  `every_listed_verb_reports_the_table_s_own_annotations` 与 CLI 覆盖测试打回
+  （工具数按表算，**不写死数字**；清单里每个动词的标注必须与表逐条相等）。
   ⚠️ **客户端的路径与方法必须打真实路由**：`clients/client.rs` 里的路径是手写字符串，
   与 axum Router **没有编译期联系**。实测有一次把"取消"写成 GET 而服务端注册的是 POST
   ⇒ 那条动词**一直是坏的**（拿到的是 405，而不是任何有意义的错误），而单元测试全绿。
