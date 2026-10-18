@@ -126,6 +126,13 @@ export interface RunRef {
   connectionRevisionId: number
   status: string
   trackingState: string
+  /**
+   * 提交时用的输入。**后端一直在发**，这里此前只是没声明。
+   *
+   * 界面用它给结果贴「这条来自哪条输入」的标签（见 `shared/lib/runLabel.ts`）——
+   * 批量里"哪几张图对应哪条提示词"要靠它回答。
+   */
+  inputs?: Record<string, unknown>
   /** 「它为什么没在动」；正常在跑与终态是 `null`。 */
   attention?: RunAttention | null
   /**

@@ -26,6 +26,7 @@ import SectionHeader from '@/components/shared/SectionHeader.vue'
 import StatusIndicator from '@/components/shared/StatusIndicator.vue'
 import ResultPreviewDialog from '@/components/shared/ResultPreviewDialog.vue'
 import { isTerminalStatus, v2, type OperationDetail } from '@/shared/api/v2'
+import { runGroupLabel } from '@/shared/lib/runLabel'
 import type { TaskResult } from '@/shared/types/runninghub'
 import { useV2WorkspaceStore } from '@/features/v2/stores/workspace'
 import { useAppStore } from '@/shared/stores/app'
@@ -122,17 +123,36 @@ const previewableArtifacts = (operationId: number) =>
 const EAGER_ARTIFACT_LIMIT = 3
 const eagerArtifacts = (operationId: number) =>
   previewableArtifacts(operationId).slice(0, EAGER_ARTIFACT_LIMIT)
-const previewResults = (operation: OperationDetail): TaskResult[] =>
+/**
+ * 预览项：结果 + **它来自哪条输入**。
+ *
+ * 愿景里那句"结果按输入分组查看"：产物本来就按 run 取（`listArtifacts(runId)`），摊平的顺序
+ * 也已经是 run 顺序 —— 分组一直在，缺的只是标签（此前每项都贴任务名，于是"12 张里哪 3 张来自
+ * 第 2 条提示词"没法回答）。标签的判据在 `shared/lib/runLabel.ts`（两个预览框共用一份）。
+ *
+ * ⚠️ `previewResults` 从这里派生，别各写一份：两者一旦分叉，就会出现"数出来 3 项、点开只有 2 项"。
+ */
+const previewItems = (
+  operation: OperationDetail
+): { result: TaskResult; label: string; runId: number }[] =>
   previewableArtifacts(operation.operationId)
-    .map(
-      (artifact) =>
-        ({
+    .filter((artifact) => Boolean(artifactUrls.value[artifact.artifactId]))
+    .map((artifact) => {
+      const run = operation.runs.find((candidate) => candidate.runId === artifact.runId)
+      return {
+        result: {
           url: artifactUrls.value[artifact.artifactId],
           outputType: artifact.mimeType,
           nodeId: String(artifact.artifactId)
-        }) as TaskResult
-    )
-    .filter((result) => Boolean(result.url))
+        } as TaskResult,
+        label: run
+          ? `${operationLabel(operation)} · ${runGroupLabel(run)}`
+          : operationLabel(operation),
+        runId: artifact.runId
+      }
+    })
+const previewResults = (operation: OperationDetail): TaskResult[] =>
+  previewItems(operation).map((item) => item.result)
 const galleryPreview = (operation: OperationDetail) => {
   const first = previewableArtifacts(operation.operationId).find(
     (artifact) => artifactUrls.value[artifact.artifactId]
@@ -161,10 +181,13 @@ const openPreview = (operation: OperationDetail) => {
  * ⚠️ 每个任务的**全部**结果都要摊平进来。预览框在 gallery 非空时**只认 gallery**
  * （见 ResultPreviewDialog 的 previewItems），每个任务只放第 1 张的话，
  * 一次出 3 张的批量任务在预览框里就只剩 1 张，另外 2 张永远点不到。
+ *
+ * 标签用**每条 run 自己的**（而不是任务名）：预览框把它显示成标题，左右翻的时候就能看出
+ * "这张是哪条输入出的"——这就是"结果按输入分组查看"。
  */
 const previewGallery = computed(() =>
   galleryOperations.value.flatMap((operation) =>
-    previewResults(operation).map((result) => ({ result, label: operationLabel(operation) }))
+    previewItems(operation).map((item) => ({ result: item.result, label: item.label }))
   )
 )
 const previewIndex = ref(0)
