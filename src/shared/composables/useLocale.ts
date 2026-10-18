@@ -236,6 +236,14 @@ const messages = {
     'attention.whyQueued':
       '排队中：这条连接同时只跑一个（与平台账号的实际并发一致），前面还有没结束的任务。',
     'task.confirmRetry': '重试会新建一个任务（沿用原任务的参数），并且会再计费一次。要继续吗？',
+    // 批量里**只重试失败的那几条**（愿景点名的批量能力）：一次点按会建 N 个任务，所以
+    // 确认框必须把"几个任务、几次计费"说成数字 —— 含糊的确认框在花钱的动作上等于没确认。
+    'task.retryFailedRuns': '只重试失败的 {count} 条',
+    'task.retryingFailed': '正在新建任务…',
+    'task.confirmRetryFailed':
+      '会为这 {count} 条失败各新建一个任务（沿用它们原来的参数），并再计费 {count} 次。要继续吗？',
+    'task.retryFailed': '重试失败，请稍后重试。',
+    'task.retryFailedDetail': '重试失败：{message}',
 
     'common.create': '创建',
     'common.creating': '创建中…',
@@ -1078,6 +1086,12 @@ const messages = {
       'Queued: this connection runs one task at a time (matching the account’s real concurrency) and an earlier run has not finished.',
     'task.confirmRetry':
       'Retrying creates a NEW task (reusing this task’s parameters) and charges your account again. Continue?',
+    'task.retryFailedRuns': 'Retry only the {count} failed',
+    'task.retryingFailed': 'Creating tasks…',
+    'task.confirmRetryFailed':
+      'This creates one NEW task for each of the {count} failed runs (reusing their own parameters) and charges your account {count} more times. Continue?',
+    'task.retryFailed': 'Retry failed. Please try again.',
+    'task.retryFailedDetail': 'Retry failed: {message}',
 
     'common.create': 'Create',
     'common.creating': 'Creating…',

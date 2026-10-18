@@ -828,6 +828,54 @@ const retryOperation = async (operation: OperationDetail) => {
   }
   await refresh()
 }
+
+/**
+ * 这一批里**失败**的那些 run。
+ *
+ * 只算 `FAILED`：`CANCELLED` 是**人主动停的**，把它一起重跑多半不是本意（而且那是花钱的动作）。
+ */
+const failedRuns = (operation: OperationDetail) =>
+  operation.runs.filter((run) => run.status === 'FAILED')
+
+const retryingFailed = ref(false)
+const retryFailedError = ref('')
+
+/**
+ * **只重试失败的那几条**（愿景把"失败项单独重试"明确列为批量核心能力）。
+ *
+ * ⚠️ 它和「重新运行」不是一回事：`operation retry` 的语义是**新建任务**，而后端的
+ * `.../runs/{runId}/retry` 是**一次调用建一个 operation**（它按那条 run 复用已存的 inputs 与
+ * assets）。所以 N 条失败 = **N 个新任务、再计费 N 次** —— 确认框必须这么说，不能含糊。
+ *
+ * 为什么不在这里自己拼一次"多 run 的提交"：界面**拿不到** run 的 inputs/assets
+ * （`RunRef` 里没有这两项，也不该有），拼出来的东西一旦错了就是**把钱花在错参数上**。
+ * 那种错不该由界面来犯 —— 让后端用它自己存的那份。
+ */
+const retryFailedRuns = async (operation: OperationDetail) => {
+  if (retryingFailed.value) return
+  const failed = failedRuns(operation)
+  if (!failed.length) return
+  if (!window.confirm(t('task.confirmRetryFailed', { count: failed.length }))) return
+  retryingFailed.value = true
+  retryFailedError.value = ''
+  try {
+    // 逐条调用：每一条都返回**一个新的 operationId**（所以这里不需要、也不该合并成一次请求）。
+    for (const run of failed) {
+      await v2.retryRun(operation.operationId, run.runId)
+    }
+    batchDetail.value = undefined
+  } catch (error) {
+    // 不静默：用户点的是一个**会花钱**的动作，失败必须说出来（与取消那条不同——
+    // 取消失败可以靠下一轮轮询恢复，重试失败则是"什么也没发生"）。
+    retryFailedError.value =
+      error instanceof Error
+        ? t('task.retryFailedDetail', { message: error.message })
+        : t('task.retryFailed')
+  } finally {
+    retryingFailed.value = false
+  }
+  await refresh()
+}
 const detailTime = (value: string) => {
   const timestamp = timestampOf(value)
   if (Number.isNaN(timestamp)) return ''
@@ -1406,7 +1454,27 @@ onBeforeUnmount(() => {
               }}</StatusBadge>
             </div>
           </div>
+          <p v-if="retryFailedError" class="mt-3 text-xs text-destructive">
+            {{ retryFailedError }}
+          </p>
           <template #footer>
+            <!--
+              「只重试失败的 N 条」：批量里失败了几条时，**别整批重跑**——那会把已经成功的那几条
+              也再提交、再计费一遍。这条路径后端与 CLI/MCP 早就有（`operation retry --run`），
+              界面此前只有"整批重跑"这一个选择。
+            -->
+            <Button
+              v-if="failedRuns(batchDetail).length"
+              type="button"
+              variant="outline"
+              :disabled="retryingFailed"
+              @click="retryFailedRuns(batchDetail)"
+              >{{
+                retryingFailed
+                  ? t('task.retryingFailed')
+                  : t('task.retryFailedRuns', { count: failedRuns(batchDetail).length })
+              }}</Button
+            >
             <Button
               type="button"
               variant="outline"
