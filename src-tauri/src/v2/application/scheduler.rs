@@ -147,6 +147,63 @@ impl SchedulerService {
         driver: Arc<dyn crate::v2::ports::provider::ProviderDriver>,
     ) -> DomainResult<ExecuteOutcome> {
         let run_id = claimed.run.id;
+        // ⚠️ **退避重试有终点**（2026-10-18）：认领到一条带着**已过期**死线的 run，说明它上一轮
+        // 失败进了 `RETRY_WAIT`、而重试窗口已经用完 ⇒ 判失败，**不再提交**。
+        //
+        // 为什么判在"下一次重试本该发出去的那一刻"，而不是另起一个定时清扫：
+        // ① 不需要新查询、新列、新循环 —— 这条路径本来就会在 `next_poll_at` 到点时被认领；
+        // ② 它天然容忍"daemon 当时没在跑"：开机后第一次 tick 就会认领并判掉，不会漏；
+        // ③ 时机与语义完全重合：**最后一次机会用完了**。
+        //
+        // 判据用 `tracking_deadline` 区分"这条是从 `RETRY_WAIT` 来的"：刚建出来的 run（`QUEUED`）
+        // 没有死线；而被 scheduler 认领的只可能是 `QUEUED` / `RETRY_WAIT` 两种（`claim_next_run`
+        // 的 SQL 就是这两个状态），`ACCEPTED` / `RUNNING` / 不确定态都由 reconcile 管，走不到这里。
+        if claimed
+            .run
+            .tracking_deadline
+            .as_ref()
+            .is_some_and(|deadline| deadline.is_expired())
+        {
+            // 这条 run 不会再有下一次尝试：判**终态失败**（`retryable: false`，否则下一次
+            // `resolve_submit_error` 又会把它排回 `RETRY_WAIT`，死循环）。
+            let error = SafeError {
+                code: "RETRY_EXHAUSTED".to_string(),
+                kind: crate::v2::domain::errors::ErrorKind::Provider,
+                message: "退避重试到期仍未成功：平台一直没有接受这次提交（上一次失败见该 attempt 的 error）。\
+                     要再来一次用 operation retry —— 那是**新建一次提交**（是否重复计费取决于上次失败的性质：\
+                     被平台明确拒绝 / 连接被拒这类没有受理过，重试不会重复计费；5xx 这类平台内部错误要先确认）。"
+                    .to_string(),
+                retryable: false,
+                details: Default::default(),
+            };
+            crate::v2::logging::log_failure(
+                "run",
+                &format!("run={}", run_id.0),
+                &error.code,
+                &error.message,
+            );
+            // 与另一条终态失败的路一样：**run 上也要留原因**（`operation get` 读的是它；
+            // 只写进 attempt 的话，调用方在 run 级看到的是一个没有原因的失败）。
+            self.repositories
+                .set_run_error(run_id, Some(error.clone()))
+                .await?;
+            self.complete_and_transition(
+                run_id,
+                &claimed.attempt.fencing_token,
+                AttemptResolution::Failed {
+                    error: error.clone(),
+                    retryable: false,
+                },
+                Transition::ToFailed,
+                EventSpec {
+                    event_type: "run.failed".to_string(),
+                    run_id: Some(run_id),
+                    safe_payload: json!({ "reason": error.message, "error": error }),
+                },
+            )
+            .await?;
+            return Ok(ExecuteOutcome::Failed);
+        }
         let fingerprint = format!("run-{}:attempt-{}", run_id.0, claimed.attempt.number);
         // 凭据引用：提交前把"借来的密钥绑定"装到 revision 上（见 credential_reference）。
         // ⚠️ 失败要走 `resolve_submit_error`（与 prepare 失败同一条路）：那条路会按错误的
@@ -422,6 +479,27 @@ impl SchedulerService {
             .await?;
             // 退避：设置下次可认领时间，防止 scheduler 每 2 秒无限快速重试，
             // 对限流/5xx 错误加重 Provider 压力。
+            //
+            // ⚠️ 同时写下**这一档的终点**（2026-10-18）：`RETRY_WAIT` 此前**没有死线**，于是
+            // "平台一直拒"就每 30 秒重试一次、**永远不结束** —— 用户看到的是一个永远「进行中」
+            // 的任务，而 `attention` 也只能含糊地说"正在退避重试"（说"到点判失败"会是假话，
+            // 上一批正因为这个把那半句删掉了）。现在用连接上**早就存在**的那个旋钮
+            // （`trackingDeadlineSeconds`，默认 1 小时），与「等确认」同一条语义：
+            // **等这么久还没成，就判失败，让人来决定下一步。**
+            //
+            // ⚠️ 死线**只在第一次进入这一档时写**，之后每次重试都沿用同一个（认领时它就在
+            // `claimed.run` 上）：每失败一次就往后推一小时 = 等于没有死线，只是藏得更深。
+            let deadline = claimed.run.tracking_deadline.clone().unwrap_or_else(|| {
+                Timestamp::from_millis(
+                    Timestamp::now_millis()
+                        + crate::v2::domain::connection_options::configured_tracking_deadline_millis(
+                            &claimed.connection_revision.config,
+                        )
+                        .unwrap_or(
+                            crate::v2::domain::connection_options::DEFAULT_TRACKING_DEADLINE_MILLIS,
+                        ),
+                )
+            });
             self.repositories
                 .set_tracking(
                     run_id,
@@ -429,7 +507,7 @@ impl SchedulerService {
                     Some(Timestamp::from_millis(
                         Timestamp::now_millis() + RETRY_BACKOFF_MILLIS,
                     )),
-                    None,
+                    Some(deadline),
                 )
                 .await?;
         } else {
@@ -1230,6 +1308,143 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(persisted.runs[0].status, RunStatus::RetryWait);
+    }
+
+    /// **退避重试有终点**：到期（连接上的 `trackingDeadlineSeconds`，默认 1 小时）仍未成功 ⇒ 判失败。
+    ///
+    /// 为什么必须有终点（2026-10-18）：此前 `RETRY_WAIT` **没有死线也没有次数上限** ——
+    /// 平台一直拒就每 30 秒重试一次、**永远不结束**，用户看到的是一个永远「进行中」的任务；
+    /// 而 `attention` 那时只能说"正在退避重试"（说"到点判失败"是假话，所以上一批把那半句删了）。
+    /// 现在它与「等确认」同一条语义：**等这么久还没成，就判失败，让人来决定下一步。**
+    ///
+    /// 判别点四条：
+    /// 1. 第一次进这一档就写下死线，且**来自连接的配置**（用例配 60 秒 ⇒ 大约还剩 60 秒）；
+    /// 2. 到期后**连 prepare 都不该再走**（`prepare_slots` 为空 = 根本没到提交那一步），
+    ///    run 判 `FAILED` + `RETRY_EXHAUSTED`，且 `retryable: false`（否则下一拍又被排回来，死循环）；
+    /// 3. **反向控制**：死线**还没到**时照旧重试（同一条路径必须还能走通）；
+    /// 4. 每次重试**沿用同一个死线**，不是每失败一次就往后推一小时（那样等于没有死线）。
+    ///
+    /// 负对照：删掉 `execute_claimed` 开头那段到期判据 ⇒ 第 2 条红（会真的又提交一次）。
+    #[tokio::test]
+    async fn retry_wait_gives_up_at_the_connection_deadline() {
+        let repositories = InMemoryRepositories::new();
+        // 死线配成 60 秒（允许的最小值）：下面用 `set_tracking` 直接把死线挪到过去来构造"到期"。
+        seed_environment_with_config(
+            &repositories,
+            BTreeMap::from([("trackingDeadlineSeconds".to_string(), json!(60))]),
+        );
+        create_operation(&repositories).await;
+        let driver = Arc::new(FakeProviderDriver::new(ProviderDescriptor {
+            vendor_id: "openai".to_string(),
+            protocol_id: "openai-images".to_string(),
+            display_name: "OpenAI Images".to_string(),
+            business_capabilities: vec!["text-to-image".to_string()],
+            lifecycle_features: LifecycleFeatures::default(),
+            security_requirements: Default::default(),
+            connection_schema: json!({}),
+            binding_schema: json!({}),
+        }));
+        // 第一次提交被平台拒（可重试）⇒ 进 RETRY_WAIT 并写下死线。
+        driver.push_submit_error(SafeError::retryable("RATE_LIMITED", "临时限流"));
+        let mut registry = DriverRegistry::new();
+        registry.register(driver_key("openai", "openai-images"), driver.clone());
+        let scheduler = SchedulerService {
+            owner: "test-scheduler".to_string(),
+            repositories: Arc::new(repositories.clone()),
+            leases: Arc::new(repositories.clone()),
+            connections: Arc::new(repositories.clone()),
+            assets: Arc::new(repositories.clone()),
+            artifacts: Arc::new(repositories.clone()),
+            drivers: Arc::new(registry),
+        };
+        let first = scheduler.tick().await.expect("第一拍");
+        assert_eq!(first.retry_wait, 1);
+        let run = repositories
+            .find_operation(OperationId(1))
+            .await
+            .unwrap()
+            .unwrap()
+            .runs[0]
+            .clone();
+        let run_id = run.id;
+        // 1) 死线来自连接配置（60 秒），不是写死的默认 1 小时。
+        let deadline = run.tracking_deadline.clone().expect("必须写下死线");
+        let remaining = deadline.millis().saturating_sub(Timestamp::now_millis());
+        assert!(
+            remaining > 50_000 && remaining <= 60_000,
+            "死线应当来自连接的配置（60 秒），实际还剩 {remaining} 毫秒"
+        );
+        assert!(
+            run.next_poll_at.is_some(),
+            "退避时间照旧要有（否则下一拍就重投）"
+        );
+
+        // 3) 死线还没到 ⇒ 照旧重试（把退避时间挪到过去，模拟"到点了该再试一次"）。
+        driver.push_submit_error(SafeError::retryable("RATE_LIMITED", "又限流了"));
+        let due_now = Some(Timestamp::from_millis(
+            Timestamp::now_millis().saturating_sub(1),
+        ));
+        // ⚠️ 死线换成一个**独特的已知值**（55 秒后），不沿用第一拍写下的那个：否则第 4 条断言
+        // 会退化成"两次 `now + 60s` 恰好差不到 1 毫秒"——负对照实测过一次：把实现改成
+        // "每次重试都重算死线"，这条**照样绿**（两次 tick 落在同一毫秒里）。
+        let distinctive = Timestamp::from_millis(Timestamp::now_millis() + 55_000);
+        repositories
+            .set_tracking(
+                run_id,
+                crate::v2::domain::operation::TrackingState::Inactive,
+                due_now.clone(),
+                Some(distinctive.clone()),
+            )
+            .await
+            .expect("挪退避时间");
+        let second = scheduler.tick().await.expect("第二拍");
+        assert_eq!(second.retry_wait, 1, "死线没到就该继续重试");
+        // 4) 死线**没被推后**：重试用的是同一个（逐字相等，不是"差不多"）。
+        let again = repositories
+            .find_operation(OperationId(1))
+            .await
+            .unwrap()
+            .unwrap()
+            .runs[0]
+            .clone();
+        assert_eq!(
+            again.tracking_deadline.as_ref().map(|d| d.0.clone()),
+            Some(distinctive.0.clone()),
+            "每次重试都必须沿用同一个死线（每失败一次就往后推 = 等于没有死线）"
+        );
+
+        // 2) 把死线挪到过去 ⇒ 下一拍不再提交，直接判失败。
+        repositories
+            .set_tracking(
+                run_id,
+                crate::v2::domain::operation::TrackingState::Inactive,
+                due_now,
+                Some(Timestamp::from_millis(
+                    Timestamp::now_millis().saturating_sub(1),
+                )),
+            )
+            .await
+            .expect("把死线挪到过去");
+        let prepares_before = driver.prepare_slots().len();
+        let third = scheduler.tick().await.expect("第三拍");
+        assert_eq!(third.failed, 1, "到期应当判失败");
+        assert_eq!(
+            driver.prepare_slots().len(),
+            prepares_before,
+            "到期之后**连 prepare 都不该再走**（那一步之后就是提交，也就是重复计费的入口）"
+        );
+        let persisted = repositories
+            .find_operation(OperationId(1))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(persisted.runs[0].status, RunStatus::Failed);
+        let error = persisted.runs[0].error.clone().expect("要留下原因");
+        assert_eq!(error.code, "RETRY_EXHAUSTED");
+        assert!(
+            !error.retryable,
+            "这条错误必须是**不可重试**的，否则下一拍又被排回 RETRY_WAIT（死循环）"
+        );
     }
 
     /// **能证明「字节没出去」**的提交失败 ⇒ 直接退避重试，不落「等确认」。

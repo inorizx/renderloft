@@ -563,7 +563,12 @@ impl OperationRepository for InMemoryRepositories {
         now: Timestamp,
     ) -> DomainResult<Option<ClaimedRun>> {
         let mut state = self.state.lock().unwrap();
-        let (run_id, operation_id, recipe_revision_id, sequence, client_run_id, inputs, assets) = {
+        // ⚠️ 认领要**保留 run 上原有的字段**（尤其 `tracking_deadline`）。真实现只改
+        // `status` + `updated_at`（见 `sqlite::exec::claim_next_run` 里那条 UPDATE），
+        // 而这里此前把 run **整个重建成** `tracking_deadline: None` —— 于是任何"看死线"的判据
+        // 在测试里永远看不到死线：**生产会判、测试说没判**。实测踩到过（2026-10-18，
+        // 退避重试到期那条判据在替身上静默失效）。所以这里连整个 run 一起带出来。
+        let (run_id, operation_id, recipe_revision_id, claimed_run) = {
             let run = state
                 .operations
                 .iter_mut()
@@ -587,10 +592,7 @@ impl OperationRepository for InMemoryRepositories {
                 run.id,
                 run.operation_id,
                 run.recipe_revision_id,
-                run.sequence,
-                run.client_run_id.clone(),
-                run.inputs.clone(),
-                run.assets.clone(),
+                run.clone(),
             )
         };
 
@@ -626,25 +628,9 @@ impl OperationRepository for InMemoryRepositories {
         let (_, _, connection_revision) =
             self.connection_snapshot(&state, connection_revision_id)?;
         let claimed = ClaimedRun {
-            run: Run {
-                usage: None,
-                id: run_id,
-                operation_id,
-                client_run_id,
-                recipe_revision_id,
-                connection_revision_id,
-                sequence,
-                inputs,
-                assets,
-                status: RunStatus::Submitting,
-                tracking_state: TrackingState::Inactive,
-                tracking_deadline: None,
-                next_poll_at: None,
-                last_polled_at: None,
-                error: None,
-                created_at: now.clone(),
-                updated_at: now.clone(),
-            },
+            // 用**认领时那条 run 的原样**（只 status/updated_at 被改过）——见上面那段注释：
+            // 重建 run 会把死线、退避时间、上次轮询时间一起丢掉，测试就再也测不到真行为。
+            run: claimed_run,
             recipe_name: state
                 .recipes
                 .get(&recipe_revision.recipe_id)
