@@ -84,6 +84,39 @@ export interface RecipeSummary {
   removedAt?: string | null
 }
 
+/**
+ * 「为什么没在动」——后端给的**稳定原因码** + 一句人话 + 死线 + 到点会怎样 + 现在能做什么。
+ *
+ * 为什么界面需要它：排队、退避重试、提交结果不明这几种，状态**都显示「进行中」**
+ * （实测吃过一次 40 分钟误报：对外报"预计 10 分钟出片"，实际要等到 1 小时死线才判失败）。
+ * 有了它，界面能说清"它在等什么、等到什么时候、到点会怎样"。
+ *
+ * ⚠️ `message` / `deadlineEffect` 是**后端的中文原文**（给 CLI / MCP / Agent 用的）。
+ * 界面**不直接显示它们**——那两句在英文界面里会是中文。界面按 `reason` 取自己的 i18n 文案
+ * （见 `@/shared/lib/attention.ts`），原因码才是机器契约。
+ */
+export interface RunAttention {
+  /** 稳定原因码：`SUBMISSION_UNCERTAIN` / `RETRY_BACKOFF` / `SUBMITTING` / `QUEUED`。 */
+  reason: string
+  message: string
+  since: string
+  /** 死线（毫秒时间戳字符串）；没有死线的档位是 `null`。 */
+  deadline?: string | null
+  deadlineEffect?: string | null
+  nextActions: string[]
+}
+
+/**
+ * 列表摘要里的**精简版**：只有原因码与死线。
+ *
+ * 后端刻意不在摘要里带人话与 nextActions（一页 50 条不该带上 50 份散文）——
+ * 要看全的调 `operation get`。
+ */
+export interface AttentionSummary {
+  reason: string
+  deadline?: string | null
+}
+
 export interface RunRef {
   runId: number
   operationId: number
@@ -93,6 +126,8 @@ export interface RunRef {
   connectionRevisionId: number
   status: string
   trackingState: string
+  /** 「它为什么没在动」；正常在跑与终态是 `null`。 */
+  attention?: RunAttention | null
   /**
    * 平台报的用量（**只转述，不推算**）：`{ unit: "coins", amount: "6", taskCostTime: "27" }`。
    *
@@ -121,6 +156,8 @@ export interface OperationSummary {
   status: string
   runCount: number
   createdAt: string
+  /** 摘要版的「为什么没在动」；没有就是 `null`（"没有"与"有但空"必须能分辨）。 */
+  attention?: AttentionSummary | null
 }
 
 export interface OperationDetail {
@@ -135,6 +172,11 @@ export interface OperationDetail {
   updatedAt: string
   /** 由后端从首个 run 的配方解析出的应用名；配方被删/解析失败时为 undefined。 */
   recipeName?: string
+  /**
+   * operation 级「为什么没在动」：这条任务里**最该被看见**的那条 run 的 attention
+   * （不确定 > 退避 > 提交中 > 排队）。每个 run 上也各有一份。
+   */
+  attention?: RunAttention | null
   runs: RunRef[]
 }
 
