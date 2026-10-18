@@ -123,7 +123,29 @@ impl SafeError {
         self.details = details;
         self
     }
+
+    /// 这次失败**能不能证明「请求字节根本没出去」**？
+    ///
+    /// 证据由 provider 层落进 `details`（见
+    /// `infrastructure::providers::safety::nothing_sent_evidence`：只有**连接被拒 / DNS 解析失败 /
+    /// 握手阶段超时**才为真，其余一律"证明不了"）。这里只做**一个**翻译，让上层不必知道那个键名
+    /// ——`scheduler` 据此决定"直接退避重试"还是"落等确认"，写错一个字符串就是重复扣费。
+    ///
+    /// ⚠️ **它是"字节没出去"的证据，不是"可以重投"的许可**：对**模糊类**（发送后超时、连接被
+    /// 重置…）重投仍然可能重复计费，那需要平台侧去重（`RecoveryProof` 今天没有生产者）。
+    /// 这里只对"证明得了"的那一类给 `true`。
+    pub fn proves_nothing_was_sent(&self) -> bool {
+        self.details
+            .get(NOTHING_SENT_DETAIL)
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+    }
 }
+
+/// `details` 里"字节没出去"那个键的**唯一**定义处（生产者在
+/// `infrastructure::providers::safety::map_network_error`，消费者是
+/// `SafeError::proves_nothing_was_sent`）。
+pub const NOTHING_SENT_DETAIL: &str = "nothingSent";
 
 impl std::fmt::Display for SafeError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
