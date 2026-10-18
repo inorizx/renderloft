@@ -813,8 +813,12 @@ pub static VERBS: &[Verb] = &[
         summary: "取消一个任务",
         mcp_name: Some("renderloft_cancel_operation"),
         mcp_description: Some(
-            "Cancel a queued or running operation. Runs that cannot be cancelled remotely are \
-             reported in remoteMayContinue.",
+            "Cancel a queued or running operation. Runs that could not be cancelled remotely are \
+             reported in remoteMayContinue — and that includes runs we have NO remote handle for: a \
+             submission whose outcome is unknown (SUBMISSION_UNCERTAIN / SUBMITTING) may still be \
+             running on the platform and may still be charged, so do not read `cancelled` alone as \
+             \"nothing is left on the platform\". Runs that were never submitted (QUEUED) only show \
+             up in `cancelled`.",
         ),
         read_only: false,
         destructive: true,
