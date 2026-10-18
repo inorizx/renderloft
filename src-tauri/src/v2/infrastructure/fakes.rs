@@ -812,10 +812,9 @@ impl OperationRepository for InMemoryRepositories {
             .flat_map(|persisted| persisted.runs.iter())
             .filter(|run| {
                 run.connection_revision_id == connection_revision_id
-                    && matches!(
-                        run.status,
-                        RunStatus::Accepted | RunStatus::Running | RunStatus::SubmissionUncertain
-                    )
+                    // 与 sqlite 同判据：`SUBMISSION_UNCERTAIN` **不算占位**——它占的是
+                    // "我们不知道平台收没收到"这个疑问，不是平台的执行位（见 `sqlite::exec` 里那段）。
+                    && matches!(run.status, RunStatus::Accepted | RunStatus::Running)
                     && run.tracking_state == TrackingState::Active
             })
             .count())

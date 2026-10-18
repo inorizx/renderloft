@@ -1272,6 +1272,94 @@ mod tests {
         assert_eq!(stored.message, "提交超时");
     }
 
+    /// **一个不确定的 run 不该占住这条连接唯一的执行位**（2026-10-17 改）。
+    ///
+    /// 起因：一个 `SUBMISSION_UNCERTAIN` 的 run 会把执行位占满到死线（默认 1 小时），
+    /// 后面的 run 全排队 —— 而平台上可能一个都没在跑。空转的代价是**整整一个小时**。
+    ///
+    /// 判别点三条，缺一条都不算做对：
+    /// 1. 有不确定的 run 时，**下一个 run 照常被提交**；
+    /// 2. **反向控制**：`ACCEPTED`（真在平台上跑）的 run 仍然占位，一个都不多领
+    ///    ——少了这条，一个"永远不占位"的实现也能过第 1 条，而那正是当初被平台拒的那个 bug；
+    /// 3. 不确定的那个 run **照旧留在对账队列里**（`list_active_runs`），否则它永远不会被确认。
+    ///
+    /// 负对照：把 `count_active_runs_for_connection` 的状态集合加回 `SUBMISSION_UNCERTAIN`
+    /// （测试走替身，所以改 `infrastructure/fakes.rs` 那一处即可）⇒ 第 1 条红。
+    #[tokio::test]
+    async fn an_uncertain_run_does_not_hold_the_only_execution_slot() {
+        use crate::v2::domain::operation::{TrackingState, Transition};
+
+        let repositories = InMemoryRepositories::new();
+        seed_environment(&repositories);
+        // 第一个任务：提交时网络错误 ⇒ 落不确定态。
+        create_operation(&repositories).await;
+        let driver = driver_with(SubmitOutcome::Accepted(RemoteHandle {
+            provider: "openai-images".to_string(),
+            remote_id: "task-later".to_string(),
+        }));
+        driver.push_submit_error(SafeError::network("SUBMIT_TIMEOUT", "提交超时"));
+        let service = scheduler(repositories.clone(), driver);
+        let first = service.tick().await.expect("tick 应成功");
+        assert_eq!(first.uncertain, 1, "第一个应当落不确定态");
+        let uncertain = repositories
+            .find_operation(OperationId(1))
+            .await
+            .expect("find")
+            .expect("operation");
+        let uncertain_run = uncertain.runs[0].id;
+        assert_eq!(uncertain.runs[0].status, RunStatus::SubmissionUncertain);
+
+        // 1) 再排一个待跑的：**它必须被提交**（执行位不该被"不知道"占着）。
+        create_operation_with_key(&repositories, "second-key").await;
+        let second = service.tick().await.expect("tick 应成功");
+        assert_eq!(
+            second.accepted, 1,
+            "不确定的 run 不该占住执行位——它占的是「不知道」，不是平台的执行位"
+        );
+
+        // 3) 对账队列照旧包含它（`list_active_runs` 是它被确认的唯一途径）。
+        let active = repositories
+            .list_active_runs(100)
+            .await
+            .expect("查活跃 run");
+        assert!(
+            active.iter().any(|entry| entry.run.id == uncertain_run),
+            "不确定的 run 必须继续留在对账队列里，否则永远不会被确认"
+        );
+
+        // 2) 反向控制：真在平台上跑的（ACCEPTED）仍然占位。
+        let repositories = InMemoryRepositories::new();
+        seed_environment(&repositories);
+        let (_, accepted_run) = create_operation(&repositories).await;
+        for transition in [
+            Transition::ToPreparing,
+            Transition::ToSubmitting,
+            Transition::ToAccepted,
+        ] {
+            repositories
+                .transition_run(accepted_run, transition, Vec::new())
+                .await
+                .expect("推到已受理");
+        }
+        repositories
+            .set_tracking(accepted_run, TrackingState::Active, None, None)
+            .await
+            .expect("set tracking");
+        create_operation_with_key(&repositories, "third-key").await;
+        let service = scheduler(
+            repositories.clone(),
+            driver_with(SubmitOutcome::Accepted(RemoteHandle {
+                provider: "openai-images".to_string(),
+                remote_id: "task-never".to_string(),
+            })),
+        );
+        let tick = service.tick().await.expect("tick 应成功");
+        assert_eq!(
+            tick.claimed, 0,
+            "已受理（真在平台上跑）的 run 必须继续占位——否则就是我们自己造成的 TASK_QUEUE_MAXED"
+        );
+    }
+
     #[tokio::test]
     async fn non_retryable_error_marks_run_failed() {
         let repositories = InMemoryRepositories::new();
