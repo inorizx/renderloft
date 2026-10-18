@@ -140,6 +140,20 @@ export interface RunRef {
    * 批量里"哪几张图对应哪条提示词"要靠它回答。
    */
   inputs?: Record<string, unknown>
+  /**
+   * 这条 run 属于**哪个应用**（由它自己的修订反查；`null` = 应用已删或查不到）。
+   *
+   * 界面靠它实现"**用这套参数再跑一次**"：路由是 `/library/:recipeId`，只有修订 id 跳不过去。
+   * `null` 时那个入口**不出现**——宁可不给按钮，也不要跳到一个 schema 都不一样的表单里。
+   */
+  recipeId?: number | null
+  /**
+   * 提交时用的**素材**，形状与 `POST /operations/validate` 的解析结果一致。
+   *
+   * `fieldKey` 为空的是**旧的位置编码**：不能当字段键用（资产的真实身份是「(修订, 字段键)」，
+   * 不是数组下标），所以复用参数时**跳过**它们并让用户重选，而不是猜一个键。
+   */
+  assets?: Array<{ fieldKey?: string | null; assetId: number; checksum: string }>
   /** 「它为什么没在动」；正常在跑与终态是 `null`。 */
   attention?: RunAttention | null
   /**
@@ -415,6 +429,22 @@ export const v2 = {
     checksum: string
   }> {
     return this.get(`/api/v1/artifacts/${artifactId}`)
+  },
+  /**
+   * 按 id 取**素材的元数据**（不取字节；字节见 `fetchAssetBytes`）。
+   *
+   * 用途很具体：把某次任务"用这套参数再跑一次"时，run 上只有 `{fieldKey, assetId, checksum}`，
+   * 而表单的文件位要显示**文件名**。与其让后端在详情里多塞一个字段（每次轮询都要付），
+   * 不如在这里按需取一次——只有真的要复用时才发生。
+   */
+  getAsset(assetId: number): Promise<{
+    assetId: number
+    filename: string
+    mimeType: string
+    byteSize: number
+    checksum: string
+  }> {
+    return this.get(`/api/v1/assets/${assetId}`)
   },
   listArtifacts(runId: number): Promise<
     Page<{

@@ -244,6 +244,15 @@ const messages = {
       '会为这 {count} 条失败各新建一个任务（沿用它们原来的参数），并再计费 {count} 次。要继续吗？',
     'task.retryFailed': '重试失败，请稍后重试。',
     'task.retryFailedDetail': '重试失败：{message}',
+    // 「用这套参数再跑一次（可改）」：打开那个应用的表单并预填，**不立刻提交**。
+    // 与「重新运行」（立刻再投一次）刻意分成两个入口，所以文案要能让人分清。
+    'task.reuseParams': '用这套参数再跑一次（可改）',
+    'task.confirmReuseOverwrite':
+      '这个应用的表单里已经有内容了，用这次任务的参数覆盖它吗？（覆盖后原内容不再保留）',
+    'task.reuseFailed': '打不开那个应用的表单，请稍后重试。',
+    'task.reuseFailedDetail': '打不开那个应用的表单：{message}',
+    // 素材名字取不到时的**如实**说法（不编一个文件名）。
+    'task.assetFallbackName': '素材 #{id}',
 
     'common.create': '创建',
     'common.creating': '创建中…',
@@ -1092,6 +1101,12 @@ const messages = {
       'This creates one NEW task for each of the {count} failed runs (reusing their own parameters) and charges your account {count} more times. Continue?',
     'task.retryFailed': 'Retry failed. Please try again.',
     'task.retryFailedDetail': 'Retry failed: {message}',
+    'task.reuseParams': 'Run again with these parameters (editable)',
+    'task.confirmReuseOverwrite':
+      'This app’s form already has content. Replace it with this task’s parameters? (The current content is not kept.)',
+    'task.reuseFailed': 'Could not open that app’s form. Please try again.',
+    'task.reuseFailedDetail': 'Could not open that app’s form: {message}',
+    'task.assetFallbackName': 'asset #{id}',
 
     'common.create': 'Create',
     'common.creating': 'Creating…',
