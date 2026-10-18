@@ -325,7 +325,11 @@ pub fn run_attention(run: &Run) -> Option<RunAttention> {
         ),
         RunStatus::RetryWait => (
             "上一次提交被平台拒了（或可重试地失败了），正在退避等待后自动重试——不需要人做任何事。",
-            Some("判为失败"),
+            // ⚠️ **不是"判为失败"**（这里此前写着 `Some("判为失败")`，是错的）：`RETRY_WAIT`
+            // **没有死线**（`apply_tracking` 把它清成 `None`），重试也没有次数上限 —— 平台一直拒
+            // 就一直每 30 秒重试一次，直到被受理或被取消。说"到点会判失败"会**让调用方去等一个
+            // 不会发生的事件**（这正是这一整套 attention 要消灭的那种误报）。
+            None,
             &["operation.get", "operation.wait", "operation.cancel"],
         ),
         RunStatus::Submitting => (
@@ -732,6 +736,22 @@ mod tests {
                 .iter()
                 .any(|name| name == "operation.retry"),
             "恢复路径要在下一动作里点名"
+        );
+        // ⚠️ 反向：**没有死线的状态不许说"到点会怎样"**。
+        //
+        // `RETRY_WAIT` 此前写着 `deadlineEffect: "判为失败"`，而它**没有死线**
+        //（`apply_tracking` 清成 `None`），重试也没有次数上限 —— 平台一直拒就一直每 30 秒重试。
+        // 那句话会让调用方**去等一个不会发生的事件**，正是这一整套 attention 要消灭的误报。
+        //
+        // 负对照：把 `RetryWait` 那档的 `None` 改回 `Some("判为失败")` ⇒ 这条红。
+        let retry_wait = run_attention(&run(1, RunStatus::RetryWait)).expect("retry_wait");
+        assert_eq!(
+            retry_wait.deadline, None,
+            "RETRY_WAIT 没有死线（它一直退避重试，不会自己失败）"
+        );
+        assert_eq!(
+            retry_wait.deadline_effect, None,
+            "没有死线就不能说「到点会怎样」——调用方会去等一个不会发生的事件"
         );
         for status in [
             RunStatus::Accepted,
