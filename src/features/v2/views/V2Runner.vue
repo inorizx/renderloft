@@ -143,6 +143,8 @@ const batchAddCount = ref('3')
 const showBatchAddDialog = ref(false)
 /** 「清空待处理」确认弹窗。 */
 const showClearPendingDialog = ref(false)
+/** 「清空表单」确认弹窗（草稿会活过重启，所以要有出口，见下）。 */
+const showClearDraftDialog = ref(false)
 /** 「单独填写的格子是空的」提交前确认弹窗。 */
 const showBlankCellsDialog = ref(false)
 const blankCells = ref<Array<{ label: string; rows: number[] }>>([])
@@ -315,6 +317,35 @@ const deleteBatchRow = (rowId: number) => {
 
 const clearBatchRows = () => {
   batchRows.value = [makeRow()]
+}
+
+/**
+ * 表单里**有没有草稿内容**（决定「清空」要不要出现）。
+ *
+ * 判据用"真的填了什么"，而不是"存在草稿对象"：`open()` 会给每个应用建一份空草稿，
+ * 拿"对象存在"当判据的话，空表单上也会挂一个「清空」。
+ */
+const hasDraftContent = computed(
+  () =>
+    Object.keys(values).length > 0 ||
+    Object.keys(fileRefs.value).length > 0 ||
+    batchRows.value.some(
+      (row) => Object.keys(row.values).length > 0 || Object.keys(row.files).length > 0
+    )
+)
+
+/**
+ * 清空这张表（含批量行草稿）。**要问一句**：草稿是用户自己敲的，而它现在会活过重启
+ * —— 一键抹掉且不可撤销，值得确认一次（与「清空待处理」同一套做法）。
+ */
+const clearDraft = () => {
+  const appId = String(route.params.id)
+  for (const key of Object.keys(values)) delete values[key]
+  fileRefs.value = {}
+  batchRows.value = [makeRow()]
+  variableKeys.value = []
+  runnerSessions.reset(appId)
+  showClearDraftDialog.value = false
 }
 
 /** 「清空待处理」确认后执行。 */
@@ -857,6 +888,19 @@ const goEditFields = () => {
             {{ t('runner.modeBatch') }}
           </button>
         </div>
+        <!--
+          「清空」：草稿会**活过重启**（见 `runner-sessions` 的 `drafts`），所以必须给一个
+          "我要一张干净的表"的出口 —— 否则用户只能一个格子一个格子地删。
+          只在真有内容时出现（空表单上摆一个"清空"是噪音）。
+        -->
+        <button
+          v-if="hasDraftContent"
+          type="button"
+          class="text-xs font-medium text-muted-foreground underline-offset-4 hover:text-foreground hover:underline"
+          @click="showClearDraftDialog = true"
+        >
+          {{ t('runner.clearForm') }}
+        </button>
       </div>
       <div
         v-if="batchMode === 'batch'"
@@ -1183,6 +1227,25 @@ const goEditFields = () => {
           @click="confirmClearBatchRows"
           >{{ t('runner.clearPending') }}</Button
         >
+      </template>
+    </Dialog>
+
+    <Dialog
+      :open="showClearDraftDialog"
+      :title="t('runner.clearFormTitle')"
+      class="max-w-sm"
+      @update:open="showClearDraftDialog = $event"
+    >
+      <p class="text-sm leading-6 text-muted-foreground">
+        {{ t('runner.clearFormDescription') }}
+      </p>
+      <template #footer>
+        <Button type="button" variant="outline" @click="showClearDraftDialog = false">{{
+          t('common.cancel')
+        }}</Button>
+        <Button type="button" variant="outline" class="text-destructive" @click="clearDraft">{{
+          t('runner.clearForm')
+        }}</Button>
       </template>
     </Dialog>
 
