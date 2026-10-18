@@ -2,7 +2,7 @@ use serde_json::json;
 use std::sync::Arc;
 
 use crate::v2::application::credential_reference;
-use crate::v2::domain::errors::{DomainResult, ErrorKind, SafeError};
+use crate::v2::domain::errors::{DomainResult, SafeError};
 use crate::v2::domain::execution::{RecoveryProof, SubmitOutcome};
 use crate::v2::domain::ids::ArtifactId;
 use crate::v2::domain::model::Timestamp;
@@ -375,8 +375,9 @@ impl SchedulerService {
         error: &SafeError,
     ) -> DomainResult<()> {
         let run_id = claimed.run.id;
-        // 判据只有一处（`submission_is_unknown`）：落状态与报计数必须给出同一个答案。
-        let unknown = submission_is_unknown(error);
+        // 判据只有一处（`SafeError::submission_is_unknown`，领域层）：落状态与报计数、
+        // 以及驱动侧"要不要报可按 id 回查的不确定提交"，必须给出同一个答案。
+        let unknown = error.submission_is_unknown();
         if unknown {
             self.repositories
                 .complete_attempt(
@@ -481,36 +482,17 @@ enum ExecuteOutcome {
 /// 只改了落状态那一处 ⇒ run 进了 `RETRY_WAIT`，而 tick 记的是 `uncertain`：
 /// **库里的状态与计数各说各话**，而两边单独看都"没错"。这类分歧不会报错，只会让人看着
 /// 日志排查一个不存在的问题。
+///
+/// 判据本身在 `SafeError::submission_is_unknown`（领域层）：驱动也要用它决定"报可按 id 回查的
+/// 不确定提交"还是"把错误交回去重试"，所以它不能只活在这一层。
 fn error_outcome(error: &SafeError) -> ExecuteOutcome {
-    if submission_is_unknown(error) {
+    if error.submission_is_unknown() {
         ExecuteOutcome::Uncertain
     } else if error.retryable {
         ExecuteOutcome::RetryWait
     } else {
         ExecuteOutcome::Failed
     }
-}
-
-/// 「提交结果不明」= 网络/超时类失败**且我们证明不了字节没出去**。
-///
-/// ⚠️ 后半句决定钱：`ErrorKind::Network` 把两件事混在一起——「连接被拒」（对端**主动拒绝**
-/// 握手 ⇒ 一个字节都没发出去 ⇒ 平台什么都没收到）与「发出去后超时」（请求可能已经在平台上
-/// 跑起来了）。前者重投**不可能**重复扣费，后者重投就是再花一次钱（`AGENTS.md` 铁律二）。
-/// 证据由 provider 层落进 `error.details`（`nothing_sent_evidence`：只认连接被拒 / DNS 失败 /
-/// 握手超时三档）。
-///
-/// * 证明不了 ⇒ `SUBMISSION_UNCERTAIN`：等对账/死线，**绝不自动重投**；
-/// * 证明得了 ⇒ 走**已有的**可重试路径（`RETRY_WAIT`，退避 30 秒），不再为一个"对面根本没收到"
-///   的提交空转到死线（默认 1 小时）。
-///
-/// 为什么证明得了也用 `RETRY_WAIT` 而不新造一种"有上限的重试"：它与平台拒绝
-/// （`TASK_QUEUE_MAXED`）、限流、5xx 那一类**是同一种语义**——"现在不行，等一会儿自己再来"。
-/// 给这一档单独加次数上限，等于同一个状态有两种含义；要限次数就该四类一起限，那是另一件事。
-/// 代价说清楚：网络一直不通时它会**每 30 秒一直重试**（不会自己判失败），要放弃就
-/// `operation cancel`；`attention` 会如实说"正在退避重试，不需要人做任何事"。
-fn submission_is_unknown(error: &SafeError) -> bool {
-    matches!(error.kind, ErrorKind::Network | ErrorKind::Timeout)
-        && !error.proves_nothing_was_sent()
 }
 
 #[cfg(test)]

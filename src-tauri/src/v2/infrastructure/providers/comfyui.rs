@@ -6,8 +6,8 @@ use std::sync::OnceLock;
 
 use crate::v2::domain::errors::{DomainResult, SafeError};
 use crate::v2::domain::execution::{
-    ArtifactData, ArtifactDraft, CancelOutcome, ConnectionCheck, ProviderDescriptor, RemoteHandle,
-    SubmitOutcome, TaskSnapshot, TaskStatus,
+    ArtifactData, ArtifactDraft, CancelOutcome, ConnectionCheck, ProviderDescriptor, RecoveryProof,
+    RemoteHandle, SubmitOutcome, TaskSnapshot, TaskStatus, UncertainSubmission,
 };
 use crate::v2::domain::model::{is_api_key_slot, ConnectionRevision, LifecycleFeatures};
 use crate::v2::ports::provider::{
@@ -352,6 +352,59 @@ impl ComfyUiDriver {
         })
     }
 
+    /// 队列里有没有这个 prompt_id？有就报"还在排队/在跑"，没有就 `None`。
+    ///
+    /// 为什么必须问这一句：ComfyUI 只在任务**执行完**才写 `/history`，排队中与运行中的都在
+    /// `/queue`（`queue_running` + `queue_pending`，元素是队列项元组序列化成的数组：
+    /// 下标 1 是 prompt_id、下标 3 是 extra_data）。只看 `/history` 会把"平台正在跑"读成
+    /// "平台没收到"——而这两者的处理完全相反。
+    ///
+    /// 判据只用 **prompt_id**（我们自己定的那个），不靠 client_id：client_id 在服务端是全局字段，
+    /// 并发提交会互相覆盖，拿它当身份会认错任务。
+    async fn queue_snapshot(
+        &self,
+        base: &Url,
+        prompt_id: &str,
+        key: Option<String>,
+    ) -> DomainResult<Option<TaskSnapshot>> {
+        let url = Self::endpoint(base, "queue")?;
+        let response = self
+            .authorize(self.client.get(url.clone()), key)
+            .send()
+            .await
+            .map_err(|error| map_network_error(&error, "comfyui_queue"))?;
+        if !response.status().is_success() {
+            return Err(map_http_error(
+                response.status().as_u16(),
+                "ComfyUI 队列查询失败",
+            ));
+        }
+        let queue: Value = serde_json::from_slice(&read_limited(response, 4 * 1024 * 1024).await?)
+            .map_err(|_| {
+                SafeError::validation("PROVIDER_RESPONSE_INVALID", "队列响应不是有效 JSON")
+            })?;
+        for (field, status) in [
+            ("queue_running", TaskStatus::Running),
+            ("queue_pending", TaskStatus::Queued),
+        ] {
+            let Some(items) = queue.get(field).and_then(Value::as_array) else {
+                continue;
+            };
+            let found = items
+                .iter()
+                .any(|item| item.get(1).and_then(Value::as_str) == Some(prompt_id));
+            if found {
+                return Ok(Some(TaskSnapshot {
+                    status,
+                    results: vec![],
+                    error: None,
+                    usage: None,
+                }));
+            }
+        }
+        Ok(None)
+    }
+
     fn view_url(base: &Url, image: &Value) -> Result<Url, SafeError> {
         let filename = image
             .get("filename")
@@ -641,6 +694,37 @@ fn simple_checksum(bytes: &[u8]) -> u64 {
     hash
 }
 
+/// 我们自己给 ComfyUI 任务定的 job id（提交体里的 `prompt_id`）：**规范小写带连字符的 UUID**。
+///
+/// 为什么要自己定：ComfyUI 收客户端传来的 `prompt_id` 并**原样采用**，于是"提交响应丢了"之后
+/// 我们**知道该去查哪个 id** —— `GET /history/{prompt_id}`（排队中/运行中在 `GET /queue`）
+/// 能回答"平台到底收没收到"。这是四个驱动里**唯一**存在这种抓手的地方（RunningHub 的创建接口
+/// 没有任何客户端标识字段、所有查询只认它自己发的 taskId；OpenAI 图像 API 连响应都没有 id）。
+///
+/// ⚠️ 形状必须**规范**：服务端对不合规的值直接 400 `invalid_prompt_id`
+/// （"must be a UUID string in canonical lowercase hyphenated form"），所以这不是"随便一个 id"。
+/// 这里按 UUIDv5 的形状来：sha256 取前 16 字节，再按 UUID 规范写版本位（5 = 名字型）与变体位。
+/// 从指纹派生 ⇒ **同一次提交永远同一个 id**（重投是新 attempt ⇒ 新指纹 ⇒ 新 id，不会串）。
+///
+/// 负对照：把版本位那行去掉 ⇒ `comfy_job_id_is_a_canonical_uuid` 会红（形状不再合规）。
+fn comfy_job_id(seed: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(seed.as_bytes());
+    let mut bytes = [0u8; 16];
+    bytes.copy_from_slice(&digest[..16]);
+    bytes[6] = (bytes[6] & 0x0f) | 0x50;
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+    let hex: String = bytes.iter().map(|byte| format!("{byte:02x}")).collect();
+    format!(
+        "{}-{}-{}-{}-{}",
+        &hex[0..8],
+        &hex[8..12],
+        &hex[12..16],
+        &hex[16..20],
+        &hex[20..32]
+    )
+}
+
 #[async_trait]
 impl ProviderDriver for ComfyUiDriver {
     fn descriptor(&self) -> &ProviderDescriptor {
@@ -814,10 +898,24 @@ impl ProviderDriver for ComfyUiDriver {
             request.request_fingerprint,
             simple_checksum(&serde_json::to_vec(&workflow).unwrap_or_default(),)
         );
+        // 提交时**我们自己定 job id**：ComfyUI 收客户端传来的 `prompt_id` 并原样采用
+        // （官方示例就是这么用的），于是"提交响应丢了"之后我们**知道该去查哪个 id**
+        // ——`GET /history/{prompt_id}`，排队中/运行中在 `GET /queue`。
+        //
+        // 这是四个驱动里**唯一**存在这种抓手的地方（RunningHub / OpenAI 图像 / 通用异步平台
+        // 都没有客户端幂等键，见 `docs/agent-cookbook.md` §11d）。所以它值得一次专门的改造：
+        // 没有它，"提交结果不明"只能等到死线（默认 1 小时）判失败——而平台上那份可能早就跑完了。
+        let prompt_id = comfy_job_id(&request_id);
         Ok(PreparedExecution {
             connection_revision: request.connection_revision,
-            provider_request: json!({ "prompt": workflow }),
-            request_id,
+            provider_request: json!({
+                "prompt": workflow,
+                "prompt_id": prompt_id,
+                // `client_id` 在服务端是**全局**字段（websocket 路由用），并发提交会互相覆盖
+                // ⇒ 每次提交给一个唯一值。与 prompt_id 同源即可：一次提交只有一个。
+                "client_id": prompt_id,
+            }),
+            request_id: prompt_id,
         })
     }
 
@@ -825,7 +923,7 @@ impl ProviderDriver for ComfyUiDriver {
         let base = self.base_url(&execution.connection_revision).await?;
         let url = Self::endpoint(&base, "prompt")?;
         let key = self.api_key(&execution.connection_revision).await?;
-        let response = self
+        let sent = self
             .authorize(
                 self.client
                     .post(url.clone())
@@ -840,8 +938,32 @@ impl ProviderDriver for ComfyUiDriver {
                 key,
             )
             .send()
-            .await
-            .map_err(|error| map_network_error(&error, "comfyui_submit"))?;
+            .await;
+        let response = match sent {
+            Ok(response) => response,
+            Err(error) => {
+                let mapped = map_network_error(&error, "comfyui_submit");
+                if !mapped.submission_is_unknown() {
+                    // 两种情况都**原样**把错误交回去，语义不变：
+                    // ① 证明得了"字节没出去"（连接被拒 / DNS 失败 / 握手超时）⇒ scheduler 走
+                    //    退避重试（30 秒后自己再来，不可能重复计费）；
+                    // ② 压根不是网络类失败（如被包成 validation 的 4xx）。
+                    return Err(mapped);
+                }
+                // 证明不了 ⇒ **平台可能已经收下了**。这时"我们提交时自己定的 prompt_id"
+                // 就是抓手：报一个"不确定 + 可按 id 回查"，于是 run 拿到远端句柄、进对账队列
+                // ——查得到就正常收尾（**不再白等 1 小时判失败**），查不到就等到死线
+                // （与改造前一样，只多了一次廉价的查询）。
+                //
+                // ⚠️ 这是 `RecoveryProof::LookupByRequestId` 在**生产代码里的第一个生产者**
+                // （此前只有测试在造 `SubmitOutcome::Uncertain`，所以 scheduler 里那条
+                // `ToRetryWait` 分支不可达）。
+                return Ok(SubmitOutcome::Uncertain(UncertainSubmission {
+                    reason: mapped.message.clone(),
+                    recovery: RecoveryProof::LookupByRequestId(execution.request_id.clone()),
+                }));
+            }
+        };
         if response.url() != &url {
             return Err(SafeError::validation(
                 "PROVIDER_REQUEST_REDIRECTED",
@@ -892,6 +1014,17 @@ impl ProviderDriver for ComfyUiDriver {
         .map_err(|_| SafeError::validation("PROVIDER_RESPONSE_INVALID", "查询响应不是有效 JSON"))?;
         let entry = Self::history_entry(&history, &request.remote_handle.remote_id);
         if entry.is_null() {
+            // ⚠️ **历史里没有 ≠ 平台没收到**（2026-10-18 补）：ComfyUI 只在任务**执行完**才写
+            // `/history`，排队中与运行中的都在 `/queue`；而且 history 是内存态（上限 10000 条、
+            // 可被清空、重启即丢）。所以"历史里没有"必须先问一次队列，否则"提交响应丢了但平台
+            // 收下了"的任务会在队列里跑着、我们这边却一路 Unknown 到死线判失败——那正是这次
+            // 改造要消灭的假失败。
+            if let Some(snapshot) = self
+                .queue_snapshot(&base, &request.remote_handle.remote_id, key.clone())
+                .await?
+            {
+                return Ok(snapshot);
+            }
             return Ok(TaskSnapshot {
                 status: TaskStatus::Unknown,
                 results: vec![],
@@ -956,7 +1089,6 @@ impl ProviderDriver for ComfyUiDriver {
         Ok(CancelOutcome::RemoteMayContinue)
     }
 }
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1152,6 +1284,7 @@ mod tests {
     struct MockState {
         prompt_bodies: Arc<Mutex<Vec<Value>>>,
         history: Arc<Mutex<Value>>,
+        queue: Arc<Mutex<Value>>,
         view_bytes: Arc<Mutex<Vec<u8>>>,
     }
 
@@ -1170,8 +1303,14 @@ mod tests {
         if prompt_id == "prompt-42" {
             axum::Json(state.history.lock().unwrap().clone()).into_response()
         } else {
-            StatusCode::NOT_FOUND.into_response()
+            // 真服务对**不认识**的 prompt_id 回的是**空对象**（不是 404）：排队中/运行中的任务
+            // 也还没进 history，所以"空"是这一层的正常答复，而不是错误。
+            axum::Json(json!({})).into_response()
         }
+    }
+
+    async fn queue_handler(State(state): State<MockState>) -> Response {
+        axum::Json(state.queue.lock().unwrap().clone()).into_response()
     }
 
     async fn view_handler(State(state): State<MockState>) -> Response {
@@ -1195,6 +1334,7 @@ mod tests {
                 "/history/{prompt_id}",
                 get(history_handler).with_state(state.clone()),
             )
+            .route("/queue", get(queue_handler).with_state(state.clone()))
             .route("/view", get(view_handler).with_state(state.clone()))
             .route("/upload/image", post(upload_handler));
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
@@ -1256,6 +1396,227 @@ mod tests {
         let bodies = state.prompt_bodies.lock().unwrap().clone();
         assert_eq!(bodies.len(), 1);
         assert_eq!(bodies[0]["prompt"]["6"]["inputs"]["text"], "a red house");
+    }
+
+    /// `comfy_job_id` 必须是**规范 UUID**：服务端对不合规的 `prompt_id` 直接
+    /// 400 `invalid_prompt_id`（"must be a UUID string in canonical lowercase hyphenated form"），
+    /// 而那只有真机上才看得见——本地不钉形状，上线就是"所有 ComfyUI 提交都失败"。
+    ///
+    /// 负对照：去掉版本位那行（`bytes[6] = (bytes[6] & 0x0f) | 0x50`）⇒ 这条红。
+    #[test]
+    fn comfy_job_id_is_a_canonical_uuid() {
+        let id = comfy_job_id("run-7:attempt-1-abc");
+        let parts: Vec<&str> = id.split('-').collect();
+        assert_eq!(
+            parts.iter().map(|part| part.len()).collect::<Vec<_>>(),
+            vec![8, 4, 4, 4, 12],
+            "必须是 8-4-4-4-12 五段：{id}"
+        );
+        assert!(
+            id.chars()
+                .all(|c| c == '-' || (c.is_ascii_hexdigit() && !c.is_ascii_uppercase())),
+            "必须是**小写**十六进制：{id}"
+        );
+        assert_eq!(
+            parts[2].as_bytes()[0],
+            b'5',
+            "版本位必须是 5（名字型）：{id}"
+        );
+        assert!(
+            matches!(parts[3].as_bytes()[0], b'8' | b'9' | b'a' | b'b'),
+            "变体位必须是 8/9/a/b：{id}"
+        );
+        // 确定性：同一次提交永远同一个 id（重投是**新 attempt** ⇒ 新指纹 ⇒ 新 id，不会串）。
+        assert_eq!(comfy_job_id("run-7:attempt-1-abc"), id);
+        assert_ne!(
+            comfy_job_id("run-7:attempt-2-abc"),
+            id,
+            "不同 attempt 不能撞 id"
+        );
+    }
+
+    /// 提交体里必须带上**我们自己定的** `prompt_id` 与唯一的 `client_id`。
+    ///
+    /// 这是"响应丢了还能回查"的全部依据：没有它，`LookupByRequestId` 就是空话。
+    #[tokio::test]
+    async fn prepare_sends_our_own_job_id_so_a_lost_response_can_be_looked_up() {
+        let (base, state) = mock_server().await;
+        let driver = ComfyUiDriver::new(Box::new(NoSecrets));
+        let prepared = driver
+            .prepare(request(connection(base), workflow_fixture()))
+            .await
+            .expect("prepare 应成功");
+        let body = &prepared.provider_request;
+        let prompt_id = body["prompt_id"]
+            .as_str()
+            .expect("必须带 prompt_id")
+            .to_string();
+        assert_eq!(
+            prompt_id, prepared.request_id,
+            "回查用的 id 必须与提交体里那个一致，否则查的是别人"
+        );
+        assert_eq!(
+            body["client_id"].as_str(),
+            Some(prompt_id.as_str()),
+            "client_id 也要给（服务端全局字段，必须每次唯一）"
+        );
+        // 形状：规范 UUID（与 `comfy_job_id` 同一条判据，这里只再钉一次"真的发出去了"）。
+        assert_eq!(prompt_id.len(), 36);
+        assert_eq!(prompt_id.split('-').count(), 5);
+        let _ = driver.submit(prepared).await.expect("submit 应成功");
+        let bodies = state.prompt_bodies.lock().unwrap().clone();
+        assert_eq!(
+            bodies[0]["prompt_id"].as_str(),
+            Some(prompt_id.as_str()),
+            "提交体里必须真的带上我们自己定的 id"
+        );
+    }
+
+    /// 一个"接了连接、读到请求、但**不回话**直接断开"的服务器。
+    ///
+    /// 这是"提交响应丢了"最贴近真实的复现：字节**确实发出去了**（所以不许说"没出去"），
+    /// 而响应永远不来。
+    async fn silent_server() -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("应能监听");
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            while let Ok((socket, _)) = listener.accept().await {
+                tokio::spawn(async move {
+                    let mut buffer = [0u8; 4096];
+                    // `peek` 不消费，只用来确认"请求字节到了"——然后不回话直接断开。
+                    let _ = socket.peek(&mut buffer).await;
+                    drop(socket);
+                });
+            }
+        });
+        format!("http://127.0.0.1:{}", address.port())
+    }
+
+    /// **响应丢了**（可能已经收下）⇒ 报"不确定 + 可按 id 回查"，而不是把错误交回去。
+    ///
+    /// 这是 `RecoveryProof::LookupByRequestId` 在**生产代码里的第一个生产者**：有了它，
+    /// run 会拿到远端句柄并进对账队列，查得到就正常收尾（不再白等 1 小时判失败）。
+    ///
+    /// 反向控制见下一条 `a_refused_submit_is_left_to_the_retry_path`：**证明得了"字节没出去"**
+    /// 时不许走这条路（那一档该直接退避重试，重投不可能重复计费）。
+    #[tokio::test]
+    async fn a_lost_submit_response_becomes_a_lookup_by_our_own_job_id() {
+        let base = silent_server().await;
+        let driver = ComfyUiDriver::new(Box::new(NoSecrets));
+        let prepared = driver
+            .prepare(request(connection(base), workflow_fixture()))
+            .await
+            .expect("prepare 应成功");
+        let job_id = prepared.request_id.clone();
+        let outcome = driver.submit(prepared).await.expect("应当是 Ok(Uncertain)");
+        match outcome {
+            SubmitOutcome::Uncertain(submission) => {
+                assert_eq!(
+                    submission.recovery,
+                    RecoveryProof::LookupByRequestId(job_id),
+                    "回查用的必须是我们自己定的那个 job id"
+                );
+            }
+            other => panic!("期望 Uncertain(LookupByRequestId)，得到 {other:?}"),
+        }
+    }
+
+    /// **证明得了「字节没出去」**（连接被拒）⇒ 原样把错误交回去，让 scheduler 走退避重试。
+    ///
+    /// 负对照：把 `submit` 里那句 `if !mapped.submission_is_unknown() { return Err(mapped) }`
+    /// 删掉 ⇒ 这条红（连接被拒也会被报成"可按 id 回查"，于是白白多等一轮对账）。
+    #[tokio::test]
+    async fn a_refused_submit_is_left_to_the_retry_path() {
+        // 没人听的端口：连接**被拒**（对端主动拒绝握手）⇒ 一个字节都没发出去。
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("应能占用端口");
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+        let driver = ComfyUiDriver::new(Box::new(NoSecrets));
+        let prepared = driver
+            .prepare(request(
+                connection(format!("http://127.0.0.1:{port}")),
+                workflow_fixture(),
+            ))
+            .await
+            .expect("prepare 应成功");
+        let error = driver
+            .submit(prepared)
+            .await
+            .expect_err("连接被拒必须交回错误，而不是报不确定");
+        assert!(
+            error.proves_nothing_was_sent(),
+            "连接被拒 = 一个字节都没出去，证据必须留下：{:?}",
+            error.details
+        );
+        assert!(
+            !error.submission_is_unknown(),
+            "证明得了就不该走等确认/回查那条路"
+        );
+    }
+
+    /// **历史里没有 ≠ 平台没收到**：排队中的任务只在 `/queue` 里。
+    ///
+    /// ComfyUI 只在任务**执行完**才写 `/history`，而且 history 是内存态（上限 10000 条、可被清空、
+    /// 重启即丢）。所以"历史里没有"必须先问一次队列——否则"提交响应丢了但平台收下了"的任务
+    /// 会在队列里跑着、我们这边却一路 Unknown 到死线判失败。
+    ///
+    /// 判别点两条：① 在 `queue_running` 里 ⇒ `Running`；② 在 `queue_pending` 里 ⇒ `Queued`；
+    /// ③ 反向控制：队列里**没有**这个 id ⇒ 仍然是 `Unknown`（不许猜成"失败"，也不许猜成"在跑"）。
+    #[tokio::test]
+    async fn reconcile_finds_a_queued_job_when_history_is_empty() {
+        let (base, state) = mock_server().await;
+        let driver = ComfyUiDriver::new(Box::new(NoSecrets));
+        let handle = RemoteHandle {
+            provider: "comfyui".to_string(),
+            remote_id: "job-lost".to_string(),
+        };
+        let reconcile = |handle: RemoteHandle| {
+            let driver = &driver;
+            let connection = connection(base.clone());
+            async move {
+                driver
+                    .reconcile(ReconcileRequest {
+                        connection_revision: connection,
+                        remote_handle: handle,
+                    })
+                    .await
+            }
+        };
+
+        // ③ 先看"哪儿都没有"这一档：必须是 Unknown（不许猜）。
+        *state.queue.lock().unwrap() = json!({ "queue_running": [], "queue_pending": [] });
+        let snapshot = reconcile(handle.clone()).await.expect("reconcile 应成功");
+        assert_eq!(snapshot.status, TaskStatus::Unknown);
+
+        // ① 在跑。
+        *state.queue.lock().unwrap() = json!({
+            "queue_running": [[0, "job-lost", {}, { "client_id": "job-lost" }, [], {}]],
+            "queue_pending": []
+        });
+        let snapshot = reconcile(handle.clone()).await.expect("reconcile 应成功");
+        assert_eq!(snapshot.status, TaskStatus::Running);
+
+        // ② 排队中。
+        *state.queue.lock().unwrap() = json!({
+            "queue_running": [],
+            "queue_pending": [[1, "job-lost", {}, {}, [], {}]]
+        });
+        let snapshot = reconcile(handle.clone()).await.expect("reconcile 应成功");
+        assert_eq!(snapshot.status, TaskStatus::Queued);
+
+        // ④ 别人的任务在跑（id 不匹配）⇒ 不能认成自己的。
+        *state.queue.lock().unwrap() = json!({
+            "queue_running": [[0, "someone-else", {}, {}, [], {}]],
+            "queue_pending": []
+        });
+        let snapshot = reconcile(handle).await.expect("reconcile 应成功");
+        assert_eq!(
+            snapshot.status,
+            TaskStatus::Unknown,
+            "id 不匹配就不能认成自己的任务"
+        );
     }
 
     #[tokio::test]
