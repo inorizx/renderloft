@@ -253,6 +253,11 @@ const messages = {
     'task.reuseFailedDetail': '打不开那个应用的表单：{message}',
     // 素材名字取不到时的**如实**说法（不编一个文件名）。
     'task.assetFallbackName': '素材 #{id}',
+    // 表单草稿会**活过重启**（见 `runner-sessions` 的 drafts），所以要有出口与说明。
+    'runner.clearForm': '清空表单',
+    'runner.clearFormTitle': '清空这张表？',
+    'runner.clearFormDescription':
+      '会把当前填的内容全部清掉（含批量行草稿）。清掉后不再保留——注意：已经提交过的任务不受影响，它的参数在任务里还能「用这套参数再跑一次」。',
 
     'common.create': '创建',
     'common.creating': '创建中…',
@@ -1107,6 +1112,10 @@ const messages = {
     'task.reuseFailed': 'Could not open that app’s form. Please try again.',
     'task.reuseFailedDetail': 'Could not open that app’s form: {message}',
     'task.assetFallbackName': 'asset #{id}',
+    'runner.clearForm': 'Clear form',
+    'runner.clearFormTitle': 'Clear this form?',
+    'runner.clearFormDescription':
+      'Clears everything currently filled in, including batch row drafts. Submitted tasks are not affected — their parameters are still available via “Run again with these parameters”.',
 
     'common.create': 'Create',
     'common.creating': 'Creating…',
