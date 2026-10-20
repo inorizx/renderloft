@@ -42,7 +42,7 @@
 
 ### Linux（无头版）
 
-Linux 的形态是**无头**：没有桌面壳、也没有托盘——**CLI、网页控制台（daemon 伺服）、MCP 三入口共用同一个 daemon**。发布时会连同 `RenderLoft_<版本>_x64-linux.tar.gz` 一起提供（从下一个版本起）；也可以自行从源码构建（需要 Node + pnpm + Rust）：
+Linux 的形态是**无头**：没有桌面壳、也没有托盘——**CLI、网页控制台（daemon 伺服）、MCP 三入口共用同一个 daemon**。发布时会连同 `RenderLoft_<版本>_x64-linux.tar.gz` 一起提供（v0.1.1 起）；也可以自行从源码构建（需要 Node + pnpm + Rust）：
 
 ```bash
 pnpm install
@@ -272,11 +272,13 @@ git tag v0.2.0
 git push --tags                # tag 触发 .github/workflows/release.yml
 ```
 
-`release.yml` 先校验 **tag 与版本号一致**，再打包、生成免安装 zip 与 `SHA256SUMS.txt`，发成 GitHub Release（notes 由 commit 自动生成）。
+`release.yml` 先校验 **tag 与版本号一致**，再打包、生成免安装 zip、Linux 便携包与 `SHA256SUMS.txt`，发成 GitHub Release（notes 由 commit 自动生成）。
 
 > CI 与 Release 都由 **GitHub Actions** 跑（`.github/workflows/`）。
 >
-> Gitee 那边是**代码镜像**：代码同步过去，但**不发 Release 附件**——安装包以 GitHub Releases 为准。
+> Gitee 那边是**只读代码镜像**：Gitee 仓库里配了 GitHub → Gitee 的 Pull 镜像，代码与 tag 自动同步，
+> **不要再往 Gitee 推**（会被下一次同步覆盖），已发布的 tag 也别删或移动——发行版挂在 tag 上。
+> 安装包以 GitHub Releases 为准；Gitee 发行版的附件由本机手动上传——镜像只搬代码，不搬附件。
 >
 > CI 里那个 `windows-installer` job 产出的是 **Actions artifact**（14 天过期、下载要登录 GitHub）——它只用于调试，**不是给用户的下载渠道**。
 

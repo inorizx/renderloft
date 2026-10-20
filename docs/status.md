@@ -274,7 +274,9 @@
 - RunningHub 应用市场的站内搜索、作者浏览和完整发现体验。
 - 发布渠道：**GitHub 是发布渠道，Gitee 是代码镜像**。CI（`.github/workflows/ci.yml`，push 触发）
   与 Release（`.github/workflows/release.yml`，`v*` tag 触发）都在 GitHub 上跑；Release 产出
-  NSIS 安装包 + 免安装 zip + Linux 便携包 tar.gz + `SHA256SUMS.txt`（Linux 构建失败会拦截发布）。Gitee 同步代码、tag 与 Release 附件（附件由本机手动搬运，Gitee 不跑 CI）。
+  NSIS 安装包 + 免安装 zip + Linux 便携包 tar.gz + `SHA256SUMS.txt`（Linux 构建失败会拦截发布）。
+  Gitee 侧是 **GitHub → Gitee 的 Pull 镜像**：代码与 tag 自动同步，**别直接往 Gitee 推**；
+  Gitee 发行版的附件仍由本机手动上传（Gitee 不跑 CI）。
 
 ## 当前产品优先级
 
