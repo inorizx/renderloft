@@ -155,16 +155,12 @@ console.log(`日志轮转阈值守门通过：两处一致（${logLimitSources[0
 // 为什么需要机器守：代理是"装了却只装一半"最危险的那种能力——提交走了代理、查询没走，
 // 用户看到的是"任务提交成功，然后永远查不到状态"；而**新加一个驱动时没人会想起这件事**。
 // 判据因此落在"建客户端的那一行"上：
-//   * 同一行里有 `proxy::configure(` ⇒ 合格；
+//   * 同一行（或**上一行**，链式写法会折行）里有 `proxy::configure(` ⇒ 合格；
 //   * 紧接着 `.no_proxy()` ⇒ 合格（测试与"刻意直连"的客户端都这么写）；
 //   * 其余文件在例外名单里（每条都要写**为什么**）。
 const OUTBOUND_WRAPPER = 'src-tauri/src/v2/infrastructure/providers/proxy.rs'
 const OUTBOUND_EXCEPTIONS = new Map([
-  [OUTBOUND_WRAPPER, '这里就是装配点：测试把裸 builder 交给 apply() 正是判据本身'],
-  [
-    'src-tauri/src/v2/infrastructure/sqlite/exec.rs',
-    '完成回调**刻意直连**：回调地址是用户自己的内网服务，塞进公网代理只会让它失败',
-  ],
+  [OUTBOUND_WRAPPER, '这里就是装配点：测试把裸 builder 交给 apply_with() 正是判据本身'],
 ])
 const CLIENT_LINE = /Client::(builder|new)\(\)/
 const outboundProblems = []
@@ -174,7 +170,9 @@ for (const file of walk(join(ROOT, 'src-tauri', 'src'))) {
   const lines = readFileSync(file, 'utf8').split('\n')
   lines.forEach((line, index) => {
     if (!CLIENT_LINE.test(line)) return
-    if (line.includes('proxy::configure(')) return
+    // 折行写法：`lets = ...::configure(` 在上一行、`Client::builder(),` 在下一行。
+    const context = lines.slice(Math.max(0, index - 1), index + 1).join('\n')
+    if (context.includes('proxy::configure(')) return
     // 往后看三行：`Client::builder()` 之后紧跟 `.no_proxy()` 是"刻意直连"的写法。
     if (lines.slice(index, index + 3).join('\n').includes('.no_proxy()')) return
     outboundProblems.push(

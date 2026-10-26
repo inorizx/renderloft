@@ -2478,11 +2478,17 @@ pub struct HttpCallbackDeliverer {
 #[allow(dead_code)]
 impl HttpCallbackDeliverer {
     pub fn new() -> Result<Self, String> {
-        let client = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(15))
-            .redirect(reqwest::redirect::Policy::none())
-            .build()
-            .map_err(|error| format!("无法创建回调客户端：{error}"))?;
+        // 回调也是出站 HTTP，走同一条代理装配：**没有例外**。
+        // （这条以前是"刻意直连"，理由是回调地址是用户自己的内网服务；但规则一旦有例外，
+        // 下一个新增的出网路径就会漏掉代理。回环地址由判据本身保证直连，
+        // 内网地址由系统绕过列表管——那正是浏览器处理自己内网服务的方式。）
+        let client = crate::v2::infrastructure::providers::proxy::configure(
+            reqwest::Client::builder(),
+        )
+        .timeout(std::time::Duration::from_secs(15))
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .map_err(|error| format!("无法创建回调客户端：{error}"))?;
         Ok(Self { client })
     }
 }

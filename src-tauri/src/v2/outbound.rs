@@ -18,8 +18,6 @@
 //! 与诊断端点（transports）都要用它，而 `scripts/check-layers.mjs` 不允许 transports
 //! 直接 import infrastructure。
 
-use std::sync::OnceLock;
-
 /// 代理从哪来（诊断里要如实报这一格：用户看到"系统代理"才会去查代理软件）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProxySource {
@@ -184,9 +182,24 @@ pub fn plan_from(env: &EnvironmentView, system: Option<ExplicitProxy>) -> ProxyP
     match system {
         // 注意：这里**不看有没有地址**。只有 socks / PAC 的系统代理同样会走到这，
         // 它的价值是"诊断里能说出为什么没生效"，而不是"没有代理"。
-        Some(system) => ProxyPlan::Explicit(system),
+        Some(system) => ProxyPlan::Explicit(with_no_proxy(system, env.no_proxy.as_deref())),
         None => ProxyPlan::Off { disabled: false },
     }
+}
+
+/// 把环境里的 `NO_PROXY` 并进系统代理的绕过表。
+///
+/// 为什么：`NO_PROXY` 是**跨工具通用的约定**（curl / git / npm 都认），而 Windows 的
+/// `ProxyOverride` 只管得到用它自己那份配置的应用。用户既然写了一份"这些别走代理"，
+/// 就不该因为"我们这次读的是注册表"而失效。
+fn with_no_proxy(mut proxy: ExplicitProxy, raw: Option<&str>) -> ExplicitProxy {
+    let Some(raw) = raw else {
+        return proxy;
+    };
+    let (mut patterns, local) = split_bypass(raw);
+    proxy.bypass.append(&mut patterns);
+    proxy.bypass_local |= local;
+    proxy
 }
 
 /// 空白值不算"配了代理"（`HTTPS_PROXY=` 这种形态很常见：变量在、但没有值）。
@@ -204,11 +217,14 @@ fn is_off(value: &str) -> bool {
     )
 }
 
-/// 本次进程实际生效的代理方案（**只解析一次**：环境变量与系统设置在一次运行里不会变，
-/// 而错误信息、诊断、每个 HTTP 客户端都要问同一件事——问三次就该只有一张嘴）。
-pub fn resolve() -> &'static ProxyPlan {
-    static PLAN: OnceLock<ProxyPlan> = OnceLock::new();
-    PLAN.get_or_init(|| plan_from(&EnvironmentView::current(), system_proxy()))
+/// 当前该用哪种方式出网。**每次都重新算**，不缓存。
+///
+/// 为什么不缓存（这里踩过）：系统代理是**活的**——用户完全可能先开应用、再开代理软件
+/// （或反过来关掉）。缓存一次的话，界面上写着旧代理、请求也还按旧代理走，用户只能重启。
+/// 浏览器不会这样：系统设置一变，下一次请求就跟上了。一次解析 = 两三次注册表读取
+/// （几十微秒），对比一次网络请求可以忽略。
+pub fn resolve() -> ProxyPlan {
+    plan_from(&EnvironmentView::current(), system_proxy())
 }
 
 /// Windows 系统代理；其它平台与"没开"都是 `None`。
@@ -492,8 +508,8 @@ fn glob_match(text: &str, pattern: &str) -> bool {
 /// 诊断里"出网代理"那一格：**实际会用的那个**（环境变量优先，其次系统代理）。
 pub fn configured_proxy() -> Option<String> {
     match resolve() {
-        ProxyPlan::Environment => environment_proxy(),
         ProxyPlan::Explicit(proxy) => proxy.display_url().map(str::to_string),
+        ProxyPlan::Environment => environment_proxy(),
         ProxyPlan::Off { .. } => None,
     }
 }
@@ -511,7 +527,7 @@ pub fn proxy_source() -> &'static str {
 /// 认得出但这一版不支持的代理形态（socks / PAC）——诊断里如实报，别让它静默失效。
 pub fn unsupported_proxy_entries() -> Vec<String> {
     match resolve() {
-        ProxyPlan::Explicit(proxy) => proxy.unsupported.clone(),
+        ProxyPlan::Explicit(proxy) => proxy.unsupported,
         _ => Vec::new(),
     }
 }
@@ -683,6 +699,37 @@ mod tests {
             !bypasses("www.runninghub.cn", &patterns, local),
             "公网地址不在列表里，必须走代理"
         );
+    }
+
+    /// 环境里的 `NO_PROXY` 要并进系统代理的绕过表。
+    ///
+    /// 为什么：`NO_PROXY` 是**跨工具通用**的约定（curl / git / npm 都认），而 Windows 的
+    /// `ProxyOverride` 只管得到用它自己那份配置的应用。用户写了一份"这些别走代理"，
+    /// 不该因为"我们这次读的是注册表"就失效。
+    #[test]
+    fn no_proxy_is_merged_into_the_system_bypass_list() {
+        let system = parse_registry_proxy(REAL_SERVER, "localhost");
+        let merged = with_no_proxy(system, Some("*.internal, 10.*;<local>"));
+        assert!(bypasses("api.internal", &merged.bypass, merged.bypass_local));
+        assert!(bypasses("10.9.9.9", &merged.bypass, merged.bypass_local));
+        assert!(merged.bypass_local, "`<local>` 也要并进来");
+        assert!(
+            bypasses("localhost", &merged.bypass, merged.bypass_local),
+            "系统自己那几条不能被顶掉"
+        );
+
+        // 决定逻辑真的会调用它（不是只有 helper 对）。
+        let env = EnvironmentView {
+            no_proxy: Some("*.internal".to_string()),
+            ..Default::default()
+        };
+        match plan_from(&env, Some(parse_registry_proxy(REAL_SERVER, ""))) {
+            ProxyPlan::Explicit(proxy) => assert!(
+                proxy.proxy_for("https", "api.internal").is_none(),
+                "环境里的 NO_PROXY 必须在系统代理模式下也生效"
+            ),
+            other => panic!("应当是系统代理，实际 {other:?}"),
+        }
     }
 
     #[test]
