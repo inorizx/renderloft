@@ -348,6 +348,7 @@ mod tests {
             let mut registry = DriverRegistry::new();
             registry.register(driver_key("openai", "openai-images"), scheduler_driver);
             let scheduler = crate::v2::application::scheduler::SchedulerService {
+                capacity: Default::default(),
                 owner: "test-scheduler".to_string(),
                 repositories: Arc::new(repositories.clone()),
                 leases: Arc::new(repositories.clone()),
@@ -522,6 +523,7 @@ mod tests {
             let mut registry = DriverRegistry::new();
             registry.register(driver_key("openai", "openai-images"), scheduler_driver);
             let scheduler = crate::v2::application::scheduler::SchedulerService {
+                capacity: Default::default(),
                 owner: "test-scheduler".to_string(),
                 repositories: Arc::new(repositories.clone()),
                 leases: Arc::new(repositories.clone()),
@@ -587,6 +589,7 @@ mod tests {
             let mut registry = DriverRegistry::new();
             registry.register(driver_key("openai", "openai-images"), scheduler_driver);
             let scheduler = crate::v2::application::scheduler::SchedulerService {
+                capacity: Default::default(),
                 owner: "test-scheduler".to_string(),
                 repositories: Arc::new(repositories.clone()),
                 leases: Arc::new(repositories.clone()),

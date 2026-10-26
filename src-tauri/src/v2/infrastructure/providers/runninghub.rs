@@ -11,7 +11,7 @@ use crate::v2::domain::execution::{
 use crate::v2::domain::media::MediaMapping;
 use crate::v2::domain::model::{is_api_key_slot, ConnectionRevision, LifecycleFeatures};
 use crate::v2::ports::provider::{
-    CancelRequest, PrepareRequest, PreparedExecution, ProviderDriver, ReconcileRequest,
+    CancelRequest, PrepareRequest, PreparedExecution, ProviderDriver, QueueCapacity, ReconcileRequest,
     WebappSchema,
 };
 use crate::v2::ports::stores::SecretStore;
@@ -463,6 +463,30 @@ impl ProviderDriver for RunningHubDriver {
             .ok_or_else(|| {
                 SafeError::validation("PROVIDER_RESPONSE_INVALID", "RunningHub 队列接口缺少数据")
             })
+    }
+
+    /// 官方字段：`concurrentLimit`（数字，该 Key 的最大并发）、`runningCount`（**字符串**，
+    /// 平台侧正在跑的个数，含不是我们提交的）。
+    ///
+    /// `runningCount` 用字符串是官方的形状（与余额 `remainCoins` 同一口径），所以按字符串解析；
+    /// 解析不出来就当 0 —— 宁可多领一条被拒（拒了不花钱），也不要因为一个脏字段把队列卡死。
+    fn queue_capacity(&self, status: &Value) -> Option<QueueCapacity> {
+        let limit = status.get("concurrentLimit")?.as_u64()? as usize;
+        if limit == 0 {
+            return None;
+        }
+        let running = status
+            .get("runningCount")
+            .and_then(Value::as_str)
+            .and_then(|value| value.trim().parse::<usize>().ok())
+            .unwrap_or(0);
+        Some(QueueCapacity { limit, running })
+    }
+
+    /// "执行位已满"的识别与 `rejection_error` 同一判据：拒绝原文里带 `TASK_QUEUE_MAXED`。
+    fn is_capacity_rejection(&self, error: &SafeError) -> bool {
+        error.code == "RUNNINGHUB_REJECTED"
+            && error.message.to_ascii_uppercase().contains("TASK_QUEUE_MAXED")
     }
 
     async fn validate_connection(
@@ -1074,6 +1098,58 @@ mod tests {
             Some(json!({ "unit": "coins", "amount": "3" }))
         );
     }
+    /// 队列容量：读官方那两格，脏值不猜。
+    ///
+    /// 官方形状（`/openapi/v2/queue/status`）：`concurrentLimit` 是数字，`runningCount`
+    /// 是**字符串**。`limit` 缺失或 0 ⇒ `None`（退回静态槽位），不编一个数。
+    #[test]
+    fn queue_capacity_reads_the_official_shape() {
+        let driver = RunningHubDriver::new(Box::new(NoSecrets));
+        let status = json!({
+            "apiKeyType": "NORMAL",
+            "concurrentLimit": 3,
+            "runningCount": "2",
+            "queuedCount": "0",
+            "totalCurrentTasks": "2"
+        });
+        assert_eq!(
+            driver.queue_capacity(&status),
+            Some(QueueCapacity {
+                limit: 3,
+                running: 2
+            })
+        );
+
+        // `runningCount` 脏了 ⇒ 当 0（宁可多领一条被拒，也不要把队列卡死）。
+        let dirty = json!({ "concurrentLimit": 3, "runningCount": "三" });
+        assert_eq!(
+            driver.queue_capacity(&dirty),
+            Some(QueueCapacity {
+                limit: 3,
+                running: 0
+            })
+        );
+
+        // 上限缺失 / 0 ⇒ 不问不猜，调度退回 `available_slots()`。
+        assert_eq!(driver.queue_capacity(&json!({ "runningCount": "1" })), None);
+        assert_eq!(
+            driver.queue_capacity(&json!({ "concurrentLimit": 0, "runningCount": "1" })),
+            None
+        );
+    }
+
+    /// "满了"与"参数错"必须分得开：前者让调度停手，后者要人去改。
+    #[test]
+    fn capacity_rejection_is_told_apart_from_other_rejections() {
+        let driver = RunningHubDriver::new(Box::new(NoSecrets));
+        assert!(driver.is_capacity_rejection(&rejection_error("TASK_QUEUE_MAXED")));
+        assert!(!driver.is_capacity_rejection(&rejection_error("APIKEY_INVALID")));
+        assert!(!driver.is_capacity_rejection(&SafeError::provider(
+            "SOMETHING_ELSE",
+            "TASK_QUEUE_MAXED"
+        )));
+    }
+
     /// 两个方向都要钉住：漏报会把活丢掉，误报会让坏参数无限重试（还要花钱）。
     #[test]
     fn queue_full_is_retryable_but_parameter_errors_are_not() {

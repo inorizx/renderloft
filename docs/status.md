@@ -4,6 +4,15 @@
 
 ## 已完成
 
+- **调度按平台声明的并发容量跑，不再恒为 1**（2026-10-26）：`available_slots()` 的静态值只是
+  兜底，真正的容量来自连接上的 `/openapi/v2/queue/status`——`concurrentLimit` 是**用户买到的**
+  并发位（实测本机账号是 3，不是 1），`runningCount` 是平台侧占用（**含网页控制台、别的工具
+  提交的任务**）。每轮可领 = `limit − max(平台占用, 本地在跑)`；容量缓存 30 秒（2 秒一轮不能
+  每轮都问平台），**被平台拒一次就停手本轮并丢掉缓存**——否则 tick 会把队列里的 run 全领出来
+  挨个撞，三条 run 一起进退避。查询失败退回静态 1：接口挂了只慢不死。
+  判据：`scheduler` 4 条新用例（一轮领满 3 条 / 平台占用优先 / 拒一次即停手 + 缓存失效 /
+  缓存只查一次）+ `runninghub` 2 条（官方字段形状与脏值、`TASK_QUEUE_MAXED` 与其它拒绝分得开）。
+  负对照：把容量查询改成恒 `None` ⇒ 第一轮只领 1 条，`uses_the_platform_declared_capacity` 变红。
 - V2 本地 Rust Daemon、SQLite 工作区和 `/api/v1` HTTP/SSE 接口。
 - Recipe / Connection / Operation / Run / Attempt / Asset / Artifact 核心模型。
 - 持久化调度、Provider 提交、远端对账、取消、重试和结果归档。

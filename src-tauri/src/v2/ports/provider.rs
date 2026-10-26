@@ -115,12 +115,42 @@ impl NodeInfoCatalog {
     }
 }
 
+/// 平台**此刻**声明的并发容量。
+///
+/// 为什么不是"我们自己数自己"：本地账本只知道**这条连接上我们自己提交了几个**，而同一把
+/// API Key 还可能被网页控制台、别的工具用着。平台把 `runningCount` 报得很清楚（含所有来源），
+/// 读它才是"现在到底还有没有位子"的事实。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct QueueCapacity {
+    /// 这个连接允许同时跑几个（RunningHub 的 `concurrentLimit`）。
+    pub limit: usize,
+    /// 平台侧正在跑的个数（含不是我们提交的）。
+    pub running: usize,
+}
+
 #[async_trait]
 pub trait ProviderDriver: Send + Sync {
     fn descriptor(&self) -> &ProviderDescriptor;
 
     fn available_slots(&self) -> usize {
         1
+    }
+
+    /// 从 `fetch_queue_status` 的原始返回值里读出并发容量。`None` = 平台没有这个说法
+    /// （ComfyUI / 模型 API），调度退回 `available_slots()`。
+    ///
+    /// 刻意读**原始 Value** 而不是让驱动多开一个端点：`fetch_queue_status` 已经是同一次
+    /// 查询，解析放在驱动里，调度只认 `QueueCapacity` 这一个形状。
+    fn queue_capacity(&self, _status: &Value) -> Option<QueueCapacity> {
+        None
+    }
+
+    /// 这次提交失败是不是"平台并发已满"？
+    ///
+    /// 调度用它做两件事：**本轮不再领**（连着撞三次只会让三条 run 一起进退避），
+    /// 以及**丢掉容量缓存**（下一个 tick 重新问平台，别拿旧数字接着撞）。
+    fn is_capacity_rejection(&self, _error: &SafeError) -> bool {
+        false
     }
 
     /// 拉取节点定义（ComfyUI 的 `GET /object_info/<class>`），用于把"通用控件"升级成真控件。

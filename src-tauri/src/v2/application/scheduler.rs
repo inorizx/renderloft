@@ -1,5 +1,7 @@
 use serde_json::json;
+use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use crate::v2::application::credential_reference;
 use crate::v2::domain::errors::{DomainResult, SafeError};
@@ -7,7 +9,7 @@ use crate::v2::domain::execution::{RecoveryProof, SubmitOutcome};
 use crate::v2::domain::ids::ArtifactId;
 use crate::v2::domain::model::Timestamp;
 use crate::v2::domain::operation::Transition;
-use crate::v2::ports::provider::{driver_key, DriverRegistry, PrepareRequest};
+use crate::v2::ports::provider::{driver_key, DriverRegistry, PrepareRequest, ProviderDriver, QueueCapacity};
 use crate::v2::ports::repositories::{
     AssetRepository, AttemptResolution, ConnectionRepository, EventSpec, LeaseStore,
     OperationRepository,
@@ -41,6 +43,42 @@ pub struct SchedulerService {
     pub assets: Arc<dyn AssetRepository>,
     pub artifacts: Arc<dyn ArtifactStore>,
     pub drivers: Arc<DriverRegistry>,
+    pub capacity: CapacityCache,
+}
+
+/// 并发容量是**平台说的事实**，但不必每个 tick 都问一次。
+///
+/// tick 每 2 秒一轮：100 条连接直接问 = 50 req/s，平台会先以"请求太快"回敬我们。
+/// 30 秒够用——容量是订阅档位，不是秒级变化；真变了（被平台拒）我们会**立刻**丢掉缓存重问，
+/// 所以这里的"旧"最多只让一次提交白撞，而那次拒绝不花钱。
+const CAPACITY_TTL: Duration = Duration::from_secs(30);
+
+#[derive(Default)]
+pub struct CapacityCache {
+    entries: std::sync::Mutex<HashMap<u64, (Instant, Option<QueueCapacity>)>>,
+}
+
+impl CapacityCache {
+    /// `Some(...)` = 缓存有效（内层 `None` 表示"平台没有这个说法/查不到"）。
+    fn get(&self, revision_id: u64) -> Option<Option<QueueCapacity>> {
+        let entries = self.entries.lock().unwrap_or_else(|e| e.into_inner());
+        let (at, capacity) = entries.get(&revision_id)?;
+        (at.elapsed() < CAPACITY_TTL).then_some(*capacity)
+    }
+
+    fn put(&self, revision_id: u64, capacity: Option<QueueCapacity>) {
+        self.entries
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(revision_id, (Instant::now(), capacity));
+    }
+
+    fn invalidate(&self, revision_id: u64) {
+        self.entries
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&revision_id);
+    }
 }
 
 impl SchedulerService {
@@ -87,6 +125,24 @@ impl SchedulerService {
         Ok(result)
     }
 
+    /// 这条连接此刻的并发容量（平台声明）。查不到就 `None`，由调用方退回静态槽位。
+    async fn capacity_for(
+        &self,
+        revision: &crate::v2::domain::model::ConnectionRevision,
+        driver: &dyn ProviderDriver,
+    ) -> Option<QueueCapacity> {
+        if let Some(cached) = self.capacity.get(revision.id.0) {
+            return cached;
+        }
+        // 查询失败不使 tick 失败：退回静态槽位（保守），30 秒后再试。
+        let capacity = match driver.fetch_queue_status(revision).await {
+            Ok(status) => driver.queue_capacity(&status),
+            Err(_) => None,
+        };
+        self.capacity.put(revision.id.0, capacity);
+        capacity
+    }
+
     async fn tick_claimed(&self, token: &str) -> DomainResult<SchedulerTickResult> {
         let mut result = SchedulerTickResult::default();
         let now = Timestamp::now();
@@ -97,20 +153,25 @@ impl SchedulerService {
                 Ok(driver) => driver,
                 Err(_) => continue,
             };
-            let slots = driver.available_slots();
-            // ⚠️ `available_slots` 是"这个 provider **总共**允许几个并发"，**不是**
-            // "每个 tick 可以领几个"。此前只按前者当循环次数用，于是 tick 2 会在
-            // tick 1 的任务还在跑时继续提交——被平台拒。
-            //
-            // 实测（并发上限为 1 的 RunningHub 账号）：同时提交 2 个任务，
-            // 第 2 个必然以 `RUNNINGHUB_REJECTED / TASK_QUEUE_MAXED` 失败，
-            // 而且这个**我们自己造成的**失败会被当成"任务失败"报给用户。
-            // 用户看到的是"两张图里有一张失败了"，而真正的原因是我们在抢执行位。
+            // 「这个 provider 总共允许几个并发」的静态值，只在平台不报容量时兜底。
+            let base_slots = driver.available_slots().max(1);
+            // ⚠️ 光看静态槽位不够：tick 2 会在 tick 1 的任务还在跑时继续提交，被平台拒。
+            // 实测（并发上限为 1 的 RunningHub 账号）：同时提交 2 个任务，第 2 个必然以
+            // `RUNNINGHUB_REJECTED / TASK_QUEUE_MAXED` 失败，而这个**我们自己造成的**失败
+            // 会被当成"任务失败"报给用户。所以先扣掉已经在跑的那几个。
             let in_flight = self
                 .repositories
                 .count_active_runs_for_connection(revision.id)
                 .await?;
-            let remaining = slots.saturating_sub(in_flight);
+            // 平台报的 `runningCount` 含**所有来源**（网页控制台、别的工具），比本地账本更准；
+            // 但两边都可能滞后，所以取大的那个：宁可少领一条，也不要撞一次拒绝。
+            let capacity = self.capacity_for(&revision, driver.as_ref()).await;
+            let used = match capacity {
+                Some(capacity) => capacity.running.max(in_flight),
+                None => in_flight,
+            };
+            let limit = capacity.map(|capacity| capacity.limit).unwrap_or(base_slots);
+            let remaining = limit.saturating_sub(used);
             for _ in 0..remaining {
                 let Some(claimed) = self
                     .repositories
@@ -125,7 +186,17 @@ impl SchedulerService {
                         ExecuteOutcome::Succeeded => result.succeeded += 1,
                         ExecuteOutcome::Accepted => result.accepted += 1,
                         ExecuteOutcome::Uncertain => result.uncertain += 1,
-                        ExecuteOutcome::RetryWait => result.retry_wait += 1,
+                        ExecuteOutcome::RetryWait {
+                            capacity_exhausted,
+                        } => {
+                            result.retry_wait += 1;
+                            if capacity_exhausted {
+                                // 平台刚说了"满了"：本轮**不再领**（接着领只会连撞三次，
+                                // 让三条 run 一起进退避），并丢掉缓存让下个 tick 重新问。
+                                self.capacity.invalidate(revision.id.0);
+                                break;
+                            }
+                        }
                         ExecuteOutcome::Failed => result.failed += 1,
                         ExecuteOutcome::Cancelled => {}
                     },
@@ -219,7 +290,7 @@ impl SchedulerService {
             Ok(revision) => revision,
             Err(error) => {
                 self.resolve_submit_error(claimed, &error).await?;
-                return Ok(error_outcome(&error));
+                return Ok(error_outcome(&error, false));
             }
         };
         let mut resolved_assets = Vec::with_capacity(claimed.run.assets.len());
@@ -248,7 +319,7 @@ impl SchedulerService {
             Ok(prepared) => prepared,
             Err(error) => {
                 self.resolve_submit_error(claimed, &error).await?;
-                return Ok(error_outcome(&error));
+                return Ok(error_outcome(&error, false));
             }
         };
 
@@ -401,7 +472,7 @@ impl SchedulerService {
                                 None,
                             )
                             .await?;
-                        Ok(ExecuteOutcome::RetryWait)
+                        Ok(ExecuteOutcome::RetryWait { capacity_exhausted: false })
                     }
                     _ => {
                         self.repositories
@@ -421,7 +492,10 @@ impl SchedulerService {
             }
             Err(error) => {
                 self.resolve_submit_error(claimed, &error).await?;
-                Ok(error_outcome(&error))
+                Ok(error_outcome(
+                    &error,
+                    driver.is_capacity_rejection(&error),
+                ))
             }
         }
     }
@@ -554,7 +628,9 @@ enum ExecuteOutcome {
     Succeeded,
     Accepted,
     Uncertain,
-    RetryWait,
+    /// 可重试的失败。`capacity_exhausted` = 平台明确说"执行位满了"——
+    /// 本轮不该再领（接着领只会连撞，把更多 run 一起推进退避）。
+    RetryWait { capacity_exhausted: bool },
     Failed,
     /// attempt 已被 cancel fencing：run 已取消，跳过一切状态推进。
     Cancelled,
@@ -570,11 +646,11 @@ enum ExecuteOutcome {
 ///
 /// 判据本身在 `SafeError::submission_is_unknown`（领域层）：驱动也要用它决定"报可按 id 回查的
 /// 不确定提交"还是"把错误交回去重试"，所以它不能只活在这一层。
-fn error_outcome(error: &SafeError) -> ExecuteOutcome {
+fn error_outcome(error: &SafeError, capacity_exhausted: bool) -> ExecuteOutcome {
     if error.submission_is_unknown() {
         ExecuteOutcome::Uncertain
     } else if error.retryable {
-        ExecuteOutcome::RetryWait
+        ExecuteOutcome::RetryWait { capacity_exhausted }
     } else {
         ExecuteOutcome::Failed
     }
@@ -1056,8 +1132,138 @@ mod tests {
             assets: Arc::new(repositories.clone()),
             artifacts: Arc::new(repositories.clone()),
             drivers: Arc::new(registry),
+            capacity: Default::default(),
         }
     }
+
+    /// 一个"平台会报容量"的替身：接受 `limit` 条，`running` 是**平台侧**已有占用。
+    fn capacity_driver(limit: usize, running: usize) -> Arc<FakeProviderDriver> {
+        let driver = Arc::new(
+            FakeProviderDriver::new(ProviderDescriptor {
+                vendor_id: "openai".to_string(),
+                protocol_id: "openai-images".to_string(),
+                display_name: "OpenAI Images".to_string(),
+                business_capabilities: vec!["text-to-image".to_string()],
+                lifecycle_features: LifecycleFeatures {
+                    synchronous_result: true,
+                    remote_reconciliation: true,
+                    ..Default::default()
+                },
+                security_requirements: Default::default(),
+                connection_schema: json!({}),
+                binding_schema: json!({}),
+            })
+            .with_concurrency_limit(limit)
+            .with_queue_capacity(limit, running),
+        );
+        for index in 0..limit {
+            driver.push_outcome(SubmitOutcome::Accepted(RemoteHandle {
+                provider: "openai-images".to_string(),
+                remote_id: format!("task-{index}"),
+            }));
+        }
+        driver
+    }
+
+    /// **平台说有几个位，就用几个**——不是恒 1。
+    ///
+    /// 判别点：一轮 tick 领满 3 条（而不是 1 条），第二轮一个都不领（本地账本已经 3 条在跑）。
+    /// 负对照：把 `capacity_for` 改成恒 `None` ⇒ 第一轮只领 1 条，第一条断言就红。
+    #[tokio::test]
+    async fn uses_the_platform_declared_capacity() {
+        let repositories = InMemoryRepositories::new();
+        seed_environment(&repositories);
+        for index in 0..3 {
+            create_operation_with_key(&repositories, &format!("capacity-{index}")).await;
+        }
+        let driver = capacity_driver(3, 0);
+        let service = scheduler(repositories.clone(), driver.clone());
+
+        let first = service.tick().await.expect("tick 应成功");
+        assert_eq!(first.accepted, 3, "平台报 3 个位，一轮就该受理 3 条");
+
+        let second = service.tick().await.expect("tick 应成功");
+        assert_eq!(second.claimed, 0, "3 条都在跑时不该再领");
+        assert_eq!(driver.refusal_count(), 0, "一条都不该被平台拒");
+    }
+
+    /// **平台报的占用优先于本地账本**：网页控制台跑着 2 条，我们只剩 1 个位。
+    ///
+    /// 这是"多个入口共用一把 key"的现实：本地账本只知道自己的，平台知道全部。
+    #[tokio::test]
+    async fn platform_running_count_is_subtracted_from_the_capacity() {
+        let repositories = InMemoryRepositories::new();
+        seed_environment(&repositories);
+        for index in 0..3 {
+            create_operation_with_key(&repositories, &format!("occupied-{index}")).await;
+        }
+        let driver = capacity_driver(3, 2);
+        let service = scheduler(repositories.clone(), driver.clone());
+
+        let tick = service.tick().await.expect("tick 应成功");
+        assert_eq!(
+            tick.accepted, 1,
+            "平台已经有 2 条在跑（不是我们提交的），只该再领 1 条"
+        );
+        assert_eq!(driver.refusal_count(), 0, "宁可少领，也不要撞一次拒绝");
+    }
+
+    /// **被平台拒一次就停手**：本轮不再领，并丢掉容量缓存（下个 tick 重新问）。
+    ///
+    /// 现场：平台缓存说"3 个位都空"，但实际被别的入口占满了。修之前 tick 会把 3 条全领出来
+    /// 挨个撞，三条 run 一起进退避；现在只撞一条。
+    #[tokio::test]
+    async fn a_capacity_rejection_stops_the_rest_of_the_tick() {
+        let repositories = InMemoryRepositories::new();
+        seed_environment(&repositories);
+        for index in 0..3 {
+            create_operation_with_key(&repositories, &format!("reject-{index}")).await;
+        }
+        let driver = capacity_driver(3, 0);
+        // 平台侧实际被占满，但缓存里的"空位"是旧的。
+        for index in 0..3 {
+            driver.occupy_external(&format!("external-{index}"));
+        }
+        let service = scheduler(repositories.clone(), driver.clone());
+
+        let first = service.tick().await.expect("tick 应成功");
+        assert_eq!(first.claimed, 1, "拒一次就该停手，不该把队列里的全领出来撞一遍");
+        assert_eq!(first.retry_wait, 1);
+        assert_eq!(driver.refusal_count(), 1, "只该撞一次");
+        assert_eq!(
+            service.capacity.entries.lock().unwrap().len(),
+            0,
+            "被拒之后容量缓存必须失效，下个 tick 重新问平台"
+        );
+
+        // 下个 tick 会重新问一次（而不是拿旧缓存接着撞）。
+        let before = driver.queue_status_calls();
+        let _ = service.tick().await.expect("tick 应成功");
+        assert_eq!(
+            driver.queue_status_calls(),
+            before + 1,
+            "失效之后必须重新查询"
+        );
+    }
+
+    /// 容量查询有缓存：两个 tick 只问平台一次。
+    #[tokio::test]
+    async fn capacity_is_cached_between_ticks() {
+        let repositories = InMemoryRepositories::new();
+        seed_environment(&repositories);
+        create_operation(&repositories).await;
+        let driver = capacity_driver(3, 0);
+        let service = scheduler(repositories.clone(), driver.clone());
+
+        let _ = service.tick().await.expect("tick 应成功");
+        let _ = service.tick().await.expect("tick 应成功");
+        assert_eq!(
+            driver.queue_status_calls(),
+            1,
+            "2 秒一轮不能每轮都问平台；30 秒缓存内只查一次"
+        );
+    }
+
 
     /// 凭据引用：引用方的 run 提交时，驱动拿到的必须是**被引用连接**的槽位。
     ///
@@ -1250,6 +1456,7 @@ mod tests {
         let mut registry = DriverRegistry::new();
         registry.register(driver_key("openai", "openai-images"), driver.clone());
         let scheduler = SchedulerService {
+            capacity: Default::default(),
             owner: "test-scheduler".to_string(),
             repositories: Arc::new(repositories.clone()),
             leases: Arc::new(repositories.clone()),
@@ -1299,6 +1506,7 @@ mod tests {
         let mut registry = DriverRegistry::new();
         registry.register(driver_key("openai", "openai-images"), driver);
         let scheduler = SchedulerService {
+            capacity: Default::default(),
             owner: "test-scheduler".to_string(),
             repositories: Arc::new(repositories.clone()),
             leases: Arc::new(repositories.clone()),
@@ -1356,6 +1564,7 @@ mod tests {
         let mut registry = DriverRegistry::new();
         registry.register(driver_key("openai", "openai-images"), driver.clone());
         let scheduler = SchedulerService {
+            capacity: Default::default(),
             owner: "test-scheduler".to_string(),
             repositories: Arc::new(repositories.clone()),
             leases: Arc::new(repositories.clone()),
@@ -1499,6 +1708,7 @@ mod tests {
         let mut registry = DriverRegistry::new();
         registry.register(driver_key("openai", "openai-images"), driver.clone());
         let scheduler = SchedulerService {
+            capacity: Default::default(),
             owner: "test-scheduler".to_string(),
             repositories: Arc::new(repositories.clone()),
             leases: Arc::new(repositories.clone()),
@@ -1552,6 +1762,7 @@ mod tests {
         let mut registry = DriverRegistry::new();
         registry.register(driver_key("openai", "openai-images"), driver.clone());
         let scheduler = SchedulerService {
+            capacity: Default::default(),
             owner: "test-scheduler".to_string(),
             repositories: Arc::new(repositories.clone()),
             leases: Arc::new(repositories.clone()),
@@ -1615,6 +1826,7 @@ mod tests {
         let mut registry = DriverRegistry::new();
         registry.register(driver_key("openai", "openai-images"), driver);
         let scheduler = SchedulerService {
+            capacity: Default::default(),
             owner: "test-scheduler".to_string(),
             repositories: Arc::new(repositories.clone()),
             leases: Arc::new(repositories.clone()),
@@ -1677,6 +1889,7 @@ mod tests {
         let mut registry = DriverRegistry::new();
         registry.register(driver_key("openai", "openai-images"), driver);
         let scheduler = SchedulerService {
+            capacity: Default::default(),
             owner: "test-scheduler".to_string(),
             repositories: Arc::new(repositories.clone()),
             leases: Arc::new(repositories.clone()),
@@ -1817,6 +2030,7 @@ mod tests {
         let mut registry = DriverRegistry::new();
         registry.register(driver_key("openai", "openai-images"), driver);
         let scheduler = SchedulerService {
+            capacity: Default::default(),
             owner: "test-scheduler".to_string(),
             repositories: Arc::new(repositories.clone()),
             leases: Arc::new(repositories.clone()),

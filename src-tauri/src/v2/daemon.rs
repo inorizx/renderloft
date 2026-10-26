@@ -217,6 +217,7 @@ impl V2Runtime {
             drivers: drivers.clone(),
         });
         let scheduler = Arc::new(SchedulerService {
+            capacity: Default::default(),
             owner: "v2-scheduler".to_string(),
             repositories: operations.clone(),
             leases,

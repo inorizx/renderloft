@@ -23,7 +23,7 @@ use crate::v2::domain::operation::{
 use crate::v2::ports::callback::{CallbackDeliverer, DeliveryOutcome, DeliveryRequest};
 use crate::v2::ports::policy::{AssetPolicy, AuthorizationPolicy, PolicyDecision};
 use crate::v2::ports::provider::{
-    CancelRequest, PrepareRequest, PreparedExecution, ProviderDriver, ReconcileRequest,
+    CancelRequest, PrepareRequest, PreparedExecution, ProviderDriver, QueueCapacity, ReconcileRequest,
 };
 use crate::v2::ports::repositories::{
     ActiveRun, ActorTokenRecord, AttemptResolution, CallbackDeliveryRecord,
@@ -1242,6 +1242,11 @@ pub struct FakeProviderDriver {
     prepare_slots: Mutex<Vec<Vec<String>>>,
     /// "平台声明的模型清单"。`None` = 这个驱动没有清单这条路（与端口的默认实现同义）。
     models: Mutex<Option<Vec<String>>>,
+    /// 平台声明的并发容量。`None` = 这个替身**不报容量**（默认），调度退回静态槽位——
+    /// 这样既有的"每 tick 一条"用例语义不变，要用容量的用例显式声明。
+    declared_capacity: Mutex<Option<QueueCapacity>>,
+    /// `fetch_queue_status` 被调了几次。用来钉住"容量有缓存，不是每个 tick 都问"。
+    queue_status_calls: std::sync::atomic::AtomicUsize,
 }
 
 impl FakeProviderDriver {
@@ -1259,6 +1264,8 @@ impl FakeProviderDriver {
             workflow_prompt: Mutex::new(None),
             prepare_slots: Mutex::new(Vec::new()),
             models: Mutex::new(None),
+            declared_capacity: Mutex::new(None),
+            queue_status_calls: std::sync::atomic::AtomicUsize::new(0),
         }
     }
 
@@ -1272,6 +1279,27 @@ impl FakeProviderDriver {
     pub fn with_concurrency_limit(mut self, limit: usize) -> Self {
         self.concurrency_limit = limit;
         self
+    }
+
+    /// 让平台"报出自己的容量"（`concurrentLimit` / `runningCount`）。
+    ///
+    /// `running` 是平台侧看到的占用，**可以包含不是我们提交的任务**——这正是它比本地账本
+    /// 更准的理由；`occupy_external` 造的就是那种任务。
+    pub fn with_queue_capacity(self, limit: usize, running: usize) -> Self {
+        *self.declared_capacity.lock().unwrap() = Some(QueueCapacity { limit, running });
+        self
+    }
+
+    /// 模拟"平台上已经有任务在跑，但不是我们提交的"（网页控制台 / 别的工具）。
+    ///
+    /// 与 `release` 对称：这个任务会占住执行位，让 `submit` 按并发上限拒绝我们。
+    pub fn occupy_external(&self, remote_id: &str) {
+        self.in_flight.lock().unwrap().insert(remote_id.to_string());
+    }
+
+    pub fn queue_status_calls(&self) -> usize {
+        self.queue_status_calls
+            .load(std::sync::atomic::Ordering::SeqCst)
     }
 
     /// 模拟"平台上的这个任务跑完了，执行位释放"。
@@ -1374,13 +1402,45 @@ impl ProviderDriver for FakeProviderDriver {
         &self,
         _connection: &ConnectionRevision,
     ) -> DomainResult<serde_json::Value> {
-        Ok(serde_json::json!({
-            "apiKeyType": "pro",
-            "concurrentLimit": 2,
-            "runningCount": "1",
-            "queuedCount": "0",
-            "totalCurrentTasks": "1"
-        }))
+        self.queue_status_calls
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let declared = *self.declared_capacity.lock().unwrap();
+        Ok(match declared {
+            Some(capacity) => serde_json::json!({
+                "apiKeyType": "pro",
+                "concurrentLimit": capacity.limit,
+                "runningCount": capacity.running.to_string(),
+                "queuedCount": "0",
+                "totalCurrentTasks": capacity.running.to_string()
+            }),
+            // 没声明容量时仍给一份"能看"的队列状态（设置页的展示用例读它），
+            // 但 `queue_capacity` 会返回 None —— 两种语义不能混。
+            None => serde_json::json!({
+                "apiKeyType": "pro",
+                "concurrentLimit": 2,
+                "runningCount": "1",
+                "queuedCount": "0",
+                "totalCurrentTasks": "1"
+            }),
+        })
+    }
+
+    fn queue_capacity(&self, status: &serde_json::Value) -> Option<QueueCapacity> {
+        if self.declared_capacity.lock().unwrap().is_none() {
+            return None;
+        }
+        let limit = status.get("concurrentLimit")?.as_u64()? as usize;
+        let running = status
+            .get("runningCount")
+            .and_then(serde_json::Value::as_str)
+            .and_then(|value| value.trim().parse::<usize>().ok())
+            .unwrap_or(0);
+        (limit > 0).then_some(QueueCapacity { limit, running })
+    }
+
+    fn is_capacity_rejection(&self, error: &SafeError) -> bool {
+        error.code == "RUNNINGHUB_REJECTED"
+            && error.message.to_ascii_uppercase().contains("TASK_QUEUE_MAXED")
     }
 
     async fn prepare(&self, request: PrepareRequest) -> DomainResult<PreparedExecution> {
@@ -1409,10 +1469,12 @@ impl ProviderDriver for FakeProviderDriver {
         if self.in_flight.lock().unwrap().len() >= self.concurrency_limit {
             self.refusals
                 .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            return Err(SafeError::provider(
-                "RUNNINGHUB_REJECTED",
-                "TASK_QUEUE_MAXED",
-            ));
+            // 与真驱动一致：队列满**是可重试的**（`retryable: true`），不是终态失败。
+            // 旧的替身漏了这一格，于是"被拒"在调度器眼里成了失败——真平台上是等一会儿。
+            return Err(SafeError {
+                retryable: true,
+                ..SafeError::provider("RUNNINGHUB_REJECTED", "TASK_QUEUE_MAXED")
+            });
         }
         if let Some(error) = self.submit_errors.lock().unwrap().pop() {
             return Err(error);
