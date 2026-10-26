@@ -1252,7 +1252,23 @@ impl OperationRepository for SqliteRepositories {
         Ok(count as usize)
     }
 
-    /// 把"sources 里那些**已经排满**的连接上、从未尝试过"的 QUEUED run 改派到目标连接
+    async fn count_queued_runs_for_connection(
+        &self,
+        connection_revision_id: crate::v2::domain::ids::ConnectionRevisionId,
+    ) -> DomainResult<usize> {
+        let connection = self.connection.lock().unwrap_or_else(|e| e.into_inner());
+        let count: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM v2_runs
+                 WHERE connection_revision_id = ?1 AND status = 'QUEUED'",
+                params![connection_revision_id.0],
+                |row| row.get(0),
+            )
+            .map_err(|_| SafeError::storage("无法统计排队的 Run"))?;
+        Ok(count as usize)
+    }
+
+    /// 把"sources 里那些**排满**的连接上、从未尝试过"的 QUEUED run 改派到目标连接
     /// （见端口注释的三条边界）。
     ///
     /// 为什么要 `sources`：只剩"目标有空位"这一个条件时，一个空闲连接会把别人的活全吸走，

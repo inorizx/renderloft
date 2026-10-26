@@ -348,6 +348,15 @@ pub trait OperationRepository: Send + Sync {
         connection_revision_id: crate::v2::domain::ids::ConnectionRevisionId,
     ) -> DomainResult<usize>;
 
+    /// 这条连接上还排着几条没提交的 run（`QUEUED`）。
+    ///
+    /// 与 `count_active_runs_for_connection` 一起用：**排队数 − 剩余容量 = 这条连接多出来的活**，
+    /// 只有"多出来"的连接才该被别的连接叫号。
+    async fn count_queued_runs_for_connection(
+        &self,
+        connection_revision_id: crate::v2::domain::ids::ConnectionRevisionId,
+    ) -> DomainResult<usize>;
+
     /// 把**从未尝试过**的 `QUEUED` run 改派到 `connection_revision_id`，最多 `max` 条。
     ///
     /// 为什么允许改派：这些 run 还没提交过——钱没花、平台没见过它。挪动它不改变任何
@@ -595,6 +604,14 @@ impl OperationRepository for Arc<dyn OperationRepository> {
     ) -> DomainResult<usize> {
         self.as_ref()
             .count_active_runs_for_connection(connection_revision_id)
+            .await
+    }
+    async fn count_queued_runs_for_connection(
+        &self,
+        connection_revision_id: crate::v2::domain::ids::ConnectionRevisionId,
+    ) -> DomainResult<usize> {
+        self.as_ref()
+            .count_queued_runs_for_connection(connection_revision_id)
             .await
     }
     async fn adopt_queued_runs(

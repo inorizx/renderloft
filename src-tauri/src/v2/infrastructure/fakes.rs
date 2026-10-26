@@ -787,6 +787,22 @@ impl OperationRepository for InMemoryRepositories {
         Err(SafeError::not_found("RUN_NOT_FOUND", "Run 不存在"))
     }
 
+    async fn count_queued_runs_for_connection(
+        &self,
+        connection_revision_id: ConnectionRevisionId,
+    ) -> DomainResult<usize> {
+        let state = self.state.lock().unwrap();
+        Ok(state
+            .operations
+            .iter()
+            .flat_map(|persisted| persisted.runs.iter())
+            .filter(|run| {
+                run.connection_revision_id == connection_revision_id
+                    && run.status == RunStatus::Queued
+            })
+            .count())
+    }
+
     async fn adopt_queued_runs(
         &self,
         connection_revision_id: ConnectionRevisionId,

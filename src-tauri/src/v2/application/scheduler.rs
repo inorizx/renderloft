@@ -155,6 +155,8 @@ impl SchedulerService {
             revision: crate::v2::domain::model::ConnectionRevision,
             driver: Arc<dyn ProviderDriver>,
             remaining: usize,
+            /// 这条连接上还没提交的 run 数（含别的批次）。
+            queued: usize,
         }
 
         // 第一遍：先把每条连接的剩余容量算清楚。**必须分两遍**——"叫号"得先知道谁排满了。
@@ -182,31 +184,56 @@ impl SchedulerService {
                 None => in_flight,
             };
             let limit = capacity.map(|capacity| capacity.limit).unwrap_or(base_slots);
+            let queued = self
+                .repositories
+                .count_queued_runs_for_connection(revision.id)
+                .await?;
             plans.push(Plan {
                 remaining: limit.saturating_sub(used),
+                queued,
                 revision,
                 driver,
             });
         }
 
-        // 第二遍：有空位、而**别的连接排满了** ⇒ 把那边"没试过"的排队 run 叫过来。
+        // 第二遍：把"别的连接多出来的活"叫到有空位的连接上。
         //
-        // 为什么来源必须是"排满的连接"：只判"我有空位"的话，一个空转的连接会把别人的活
-        // 全吸走，另一端反而闲着（3+1 的池子上 4 条会全堆到 3 个位的那边）。
-        let full: Vec<_> = plans
+        // 判据两条，缺一条就会走向反面：
+        // * **来源**的"多出来" = 排队数 − 剩余容量 > 0（它本轮吃不下）；
+        // * **目标**的"吃得下" = 剩余容量 − 已有排队 > 0（别把自己撑爆）。
+        //
+        // 第一版只判"目标有空位"，于是 3+1 的池子上 4 条会全堆到 3 个位那边、1 个位那边空转；
+        // 只判"来源排满"又会让连续提交的小批次都停在第一条连接上（它没满就不叫号）。
+        let mut surplus: Vec<(crate::v2::domain::ids::ConnectionRevisionId, usize)> = plans
             .iter()
-            .filter(|plan| plan.remaining == 0)
-            .map(|plan| plan.revision.id)
+            .map(|plan| (plan.revision.id, plan.queued.saturating_sub(plan.remaining)))
+            .filter(|(_, extra)| *extra > 0)
             .collect();
-        if !full.is_empty() {
+        if !surplus.is_empty() {
             for plan in plans.iter_mut() {
-                if plan.remaining == 0 {
+                let mut budget = plan.remaining.saturating_sub(plan.queued);
+                if budget == 0 {
                     continue;
                 }
-                result.adopted += self
-                    .repositories
-                    .adopt_queued_runs(plan.revision.id, &full, plan.remaining)
-                    .await?;
+                for (source, extra) in surplus.iter_mut() {
+                    if budget == 0 {
+                        break;
+                    }
+                    if *source == plan.revision.id || *extra == 0 {
+                        continue;
+                    }
+                    let taken = self
+                        .repositories
+                        .adopt_queued_runs(
+                            plan.revision.id,
+                            &[*source],
+                            budget.min(*extra),
+                        )
+                        .await?;
+                    result.adopted += taken;
+                    *extra = extra.saturating_sub(taken);
+                    budget = budget.saturating_sub(taken);
+                }
             }
         }
 
