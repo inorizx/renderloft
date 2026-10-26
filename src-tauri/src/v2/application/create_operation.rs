@@ -280,7 +280,10 @@ impl CreateOperation {
             return Err(SafeError::validation("INPUT_SCHEMA_INVALID", message));
         }
 
-        let connection_id = revision.binding.connection_allowed(request.connection_id)?;
+        // 连接：显式指定就听调用方的；没指定、而配方列了多条可用连接 ⇒ 按序号轮转（账号池）。
+        let connection_id = revision
+            .binding
+            .connection_for_run(request.connection_id, sequence)?;
         let override_requested = request.connection_id.is_some()
             && request.connection_id != Some(revision.binding.default_connection_id);
         if override_requested && !actor.has_scope(Scope::OperationsSelectConnection) {
@@ -545,8 +548,107 @@ mod tests {
         (RecipeRevisionId(1), ConnectionId(1))
     }
 
-    fn use_case(repositories: InMemoryRepositories) -> CreateOperation {
-        CreateOperation::new(
+    /// 造一只"账号池"：两条连接，配方的可用连接是 [1, 2]。
+    fn seed_pool(repositories: &InMemoryRepositories) {
+        seed_environment(repositories);
+        repositories.seed_connection(
+            Connection {
+                id: ConnectionId(2),
+                vendor: "openai".to_string(),
+                protocol: "openai-images".to_string(),
+                display_name: "OpenAI Images 2".to_string(),
+                current_revision_id: ConnectionRevisionId(2),
+                status: crate::v2::domain::model::ConnectionStatus::Active,
+            },
+            vec![ConnectionRevision {
+                id: ConnectionRevisionId(2),
+                connection_id: ConnectionId(2),
+                config: BTreeMap::new(),
+                secret_bindings: vec![],
+                effective_capabilities: vec!["text-to-image".to_string()],
+                lifecycle_features: LifecycleFeatures {
+                    synchronous_result: true,
+                    ..Default::default()
+                },
+                created_at: Timestamp::now(),
+            }],
+        );
+        // 同一张配方的 revision 2：可用连接扩成池。
+        repositories.seed_recipe(
+            Recipe {
+                id: RecipeId(1),
+                name: "Image Recipe".to_string(),
+                description: "text to image".to_string(),
+                labels: vec![],
+                capability: "text-to-image".to_string(),
+                current_revision_id: RecipeRevisionId(1),
+                visibility: RecipeVisibility::Private,
+                created_at: Timestamp::now(),
+                updated_at: Timestamp::now(),
+                favorite: false,
+                group: None,
+                note: None,
+                last_opened_at: None,
+                field_labels: Default::default(),
+                removed_at: None,
+            },
+            vec![RecipeRevision {
+                id: RecipeRevisionId(2),
+                recipe_id: RecipeId(1),
+                revision: 2,
+                input_schema: json!({
+                    "type": "object",
+                    "required": ["prompt"],
+                    "properties": { "prompt": { "type": "string", "minLength": 1 } }
+                }),
+                output_schema: json!({ "type": "object" }),
+                binding: RecipeBinding {
+                    driver_key: "openai-images".to_string(),
+                    provider_config: BTreeMap::new(),
+                    default_connection_id: ConnectionId(1),
+                    allowed_connection_ids: vec![ConnectionId(1), ConnectionId(2)],
+                    connection_override: ConnectionOverride::Denied,
+                },
+                defaults: BTreeMap::new(),
+                source: RecipeSource::Embedded,
+                created_at: Timestamp::now(),
+            }],
+        );
+    }
+
+    /// **账号池**：调用方不指定连接，批次自动铺到配方声明的多条连接上。
+    ///
+    /// 判别点：4 条 run 落在 revision 2 上 → 连接 revision 依次 1,2,1,2。
+    /// 单连接配方行为不变（池长为 1 时 `connection_for_run` 恒返回默认连接）。
+    #[tokio::test]
+    async fn a_batch_spreads_over_the_recipes_connection_pool() {
+        let repositories = InMemoryRepositories::new();
+        seed_pool(&repositories);
+        let use_case = use_case(repositories);
+        let mut req = request(actor(vec![Scope::OperationsExecute]));
+        req.runs = (1..=4)
+            .map(|index| RunRequest {
+                client_run_id: format!("pool-{index}"),
+                recipe_revision_id: RecipeRevisionId(2),
+                connection_id: None,
+                inputs: BTreeMap::from([("prompt".to_string(), json!("a red house"))]),
+                assets: vec![],
+            })
+            .collect();
+        let persisted = use_case.execute(req).await.expect("应当受理");
+        let landed: Vec<u64> = persisted
+            .runs
+            .iter()
+            .map(|run| run.connection_revision_id.0)
+            .collect();
+        assert_eq!(
+            landed,
+            vec![1, 2, 1, 2],
+            "4 条 run 应当轮转铺到两条连接上"
+        );
+    }
+
+    fn use_case(repositories: InMemoryRepositories) -> CreateOperation {        CreateOperation::new(
             Repositories {
                 recipes: Box::new(repositories.clone()),
                 connections: Box::new(repositories.clone()),

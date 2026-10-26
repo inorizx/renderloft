@@ -174,6 +174,40 @@ impl RecipeBinding {
         self.allowed_connection_ids.contains(&connection_id)
     }
 
+    /// 这一批可以铺到哪几条连接（默认连接排第一，去重）。
+    ///
+    /// **列表里有第二条 = 这是一只账号池**：配方自己声明了"这几条连接可以互换"。
+    /// 只列一条（绝大多数配方）时下面的分配就是恒等于那条，行为与以前逐字节一致。
+    pub fn batch_connections(&self) -> Vec<ConnectionId> {
+        let mut pool = vec![self.default_connection_id];
+        for connection_id in &self.allowed_connection_ids {
+            if !pool.contains(connection_id) {
+                pool.push(*connection_id);
+            }
+        }
+        pool
+    }
+
+    /// 这一批里的第 `sequence` 条 run 该落在哪条连接。
+    ///
+    /// 调用方**没指定**连接、而配方列了多条可用连接时，按序号轮转：
+    /// 调用方只提交批次，不选账号——这是账号池的全部语义。
+    /// 指定了连接仍走 `connection_allowed`（连同 scope 校验）。
+    ///
+    /// ⚠️ 轮转**不做容量加权**：创建时不知道各账号此刻有几个空位（那要问平台）。
+    /// 分歪了由调度器的"改派"兜底——见 `scheduler` 里对未尝试 run 的重绑。
+    pub fn connection_for_run(
+        &self,
+        requested: Option<ConnectionId>,
+        sequence: u32,
+    ) -> Result<ConnectionId, SafeError> {
+        if requested.is_some() {
+            return self.connection_allowed(requested);
+        }
+        let pool = self.batch_connections();
+        Ok(pool[(sequence as usize) % pool.len()])
+    }
+
     pub fn connection_allowed(
         &self,
         requested: Option<ConnectionId>,

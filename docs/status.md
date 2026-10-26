@@ -4,6 +4,15 @@
 
 ## 已完成
 
+- **一个批次可以自动铺到多条连接上（账号池的第一步）**（2026-10-26）：调用方**不再需要选账号**——
+  提交时不指定 `connectionId`、而配方的 `allowedConnectionIds` 列了多条连接，run 就按序号轮转
+  落到这些连接上（`RecipeBinding::connection_for_run`）。只列一条的配方行为逐字节不变；
+  显式指定连接仍走原来的 scope 校验。判据：`a_batch_spreads_over_the_recipes_connection_pool`
+  （4 条 run → 连接 revision 1,2,1,2）。
+  ⚠️ 这一版是**均匀轮转**，不是按容量加权：创建时不知道各账号此刻有几个空位（那要问平台）。
+  3+1 的池子上 4 条会先分成 2/2，多等一轮；按容量派单 + "未尝试过的 run 可改派"是下一步。
+  ⚠️ 已知缺口：池里某个成员被删除 / 停用时，这批会整体 `CONNECTION_NOT_FOUND`；
+  成员过滤与熔断（401 / 余额不足 / 连续被拒）还没做。
 - **调度按平台声明的并发容量跑，不再恒为 1**（2026-10-26）：`available_slots()` 的静态值只是
   兜底，真正的容量来自连接上的 `/openapi/v2/queue/status`——`concurrentLimit` 是**用户买到的**
   并发位（实测本机账号是 3，不是 1），`runningCount` 是平台侧占用（**含网页控制台、别的工具
