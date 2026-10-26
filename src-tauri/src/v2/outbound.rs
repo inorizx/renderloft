@@ -398,18 +398,24 @@ fn split_bypass(list: &str) -> (Vec<String>, bool) {
     (patterns, local)
 }
 
-/// 这个主机要不要**绕过**代理直连。纯判据，三个层次：
+/// 这个主机要不要**绕过**代理直连。纯判据，两个层次：
 ///
-/// 1. **永远直连的地址**：回环、私有网段、链路本地、`.local` / `localhost` —— 公网代理
-///    根本到不了它们，硬走代理只会把"本机 ComfyUI 明明是绿的"变成红的；
-/// 2. `<local>`：没有点的主机名（内网短名，如 `gpu-box`）；
-/// 3. 模式匹配（`127.*` / `*.local` / 精确名），`*` 是通配。
+/// 1. **回环地址永远直连**（`localhost` / `127.0.0.0/8` / `::1`）—— 与 Chromium 一致：
+///    它默认就是 `<-loopback>` 未开的状态。本机 ComfyUI 不能因为机器上开着代理就变红；
+/// 2. 其余一律**听系统的绕过列表**（`ProxyOverride` / `NO_PROXY`），`<local>` 按 Windows 的
+///    原义展开成"没有点的主机名"。
+///
+/// ⚠️ **不替用户发明规则**：这里曾经硬编码"私有网段（`10.*` / `192.168.*`）与 `.local`
+/// 一律直连"，理由是"公网代理到不了它们、别把内网 ComfyUI 弄挂"。但那是错的取舍——
+/// 企业内网走代理（PAC / 内网代理）是真实用法，我们一绕过就等于替用户否掉了它。
+/// 主流软件（Chromium / Windows 自身）只在**回环**上做隐式例外，其它交给配置。
+/// 内网 ComfyUI 的绕过由代理软件自己写进 `ProxyOverride`（Clash 就写了 20 条）。
 pub fn bypasses(host: &str, patterns: &[String], bypass_local: bool) -> bool {
     let host = normalize_host(host);
     if host.is_empty() {
         return false;
     }
-    if is_always_direct(&host) {
+    if is_loopback(&host) {
         return true;
     }
     if bypass_local && !host.contains('.') && host.parse::<std::net::IpAddr>().is_err() {
@@ -426,18 +432,14 @@ fn normalize_host(host: &str) -> String {
         .to_ascii_lowercase()
 }
 
-fn is_always_direct(host: &str) -> bool {
-    if host == "localhost" || host.ends_with(".localhost") || host.ends_with(".local") {
+fn is_loopback(host: &str) -> bool {
+    if host == "localhost" || host.ends_with(".localhost") {
         return true;
     }
-    match host.parse::<std::net::IpAddr>() {
-        Ok(std::net::IpAddr::V4(v4)) => {
-            v4.is_loopback() || v4.is_private() || v4.is_link_local() || v4.is_unspecified()
-        }
-        Ok(std::net::IpAddr::V6(v6)) => v6.is_loopback() || v6.is_unspecified(),
-        Err(_) => false,
-    }
+    host.parse::<std::net::IpAddr>()
+        .is_ok_and(|address| address.is_loopback())
 }
+
 
 /// 通配匹配（只认 `*`）。`*.example.com` 也匹配裸域 `example.com`——**人的直觉优先于
 /// WinINET 的字面语义**，而且"我明明写了绕过它却还是走了代理"比"多绕过了一台"更糟。
@@ -638,10 +640,13 @@ mod tests {
         assert_eq!(proxy.display_url(), Some("http://127.0.0.1:7897"));
     }
 
-    /// **本机与内网永远直连**——这条不是偏好，是正确性：公网代理到不了 `127.0.0.1`，
-    /// 而 ComfyUI 十有八九就住在那里。
+    /// **只有回环是隐式直连**，其它一律听系统的绕过列表——与 Chromium / Windows 同一条规矩。
+    ///
+    /// 这条判据的正反两面都要钉住：回环（本机 ComfyUI 就住那儿）必须永远直连；
+    /// **私有网段不能**被我们擅自绕过——企业内网走代理是真实用法，绕过等于替用户否决它。
+    /// 负对照：把 `is_loopback` 换成"回环 + 私有网段"，下面第二条断言就红。
     #[test]
-    fn loopback_and_private_addresses_always_bypass_even_without_patterns() {
+    fn only_loopback_bypasses_without_a_pattern() {
         for host in [
             "127.0.0.1",
             "127.1.2.3",
@@ -649,21 +654,35 @@ mod tests {
             "LOCALHOST",
             "::1",
             "[::1]",
+        ] {
+            assert!(bypasses(host, &[], false), "回环必须直连：{host}");
+        }
+        for host in [
+            "www.runninghub.cn",
+            "8.8.8.8",
+            // 私有网段：**没有**写在绕过列表里就该走代理（主流语义）
             "10.0.0.8",
             "192.168.1.20",
             "172.16.5.5",
             "169.254.1.1",
             "gpu-box.local",
+            "172.32.0.1",
         ] {
-            assert!(
-                bypasses(host, &[], false),
-                "必须直连：{host}"
-            );
+            assert!(!bypasses(host, &[], false), "不该被隐式绕过：{host}");
         }
-        // 公网地址不在这个名单里
-        for host in ["www.runninghub.cn", "8.8.8.8", "172.32.0.1"] {
-            assert!(!bypasses(host, &[], false), "不该直连：{host}");
-        }
+    }
+
+    /// 但"写在列表里"的私有网段当然要直连——这正是 Clash 往注册表里写那 20 条的意思。
+    #[test]
+    fn a_private_range_bypasses_when_the_system_says_so() {
+        let (patterns, local) = split_bypass(REAL_OVERRIDE);
+        assert!(bypasses("192.168.1.20", &patterns, local));
+        assert!(bypasses("10.1.2.3", &patterns, local));
+        assert!(bypasses("172.20.0.9", &patterns, local));
+        assert!(
+            !bypasses("www.runninghub.cn", &patterns, local),
+            "公网地址不在列表里，必须走代理"
+        );
     }
 
     #[test]

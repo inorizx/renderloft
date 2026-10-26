@@ -181,7 +181,8 @@ impl ComfyUiDriver {
     }
 
     pub fn new(secrets: Box<dyn SecretStore>) -> Self {
-        // 本机 ComfyUI 由代理判据**永久直连**（回环/私有网段），云端 rh-proxy 才会走代理。
+        // 本机 ComfyUI 由代理判据**永久直连**（回环地址），云端 rh-proxy 才会走代理；
+        // 内网/局域网那类由系统的绕过列表（`ProxyOverride`）决定，与浏览器同一套语义。
         let client = super::proxy::configure(Client::builder())
             .redirect(reqwest::redirect::Policy::none())
             .timeout(std::time::Duration::from_secs(120))

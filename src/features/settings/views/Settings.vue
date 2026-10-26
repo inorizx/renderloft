@@ -290,10 +290,6 @@ const describeProxy = (info: DiagnosticInfo | undefined): string => {
   return t('settings.runtimeOutboundProxyEmpty')
 }
 const outboundProxyText = computed(() => describeProxy(diagnostics.value))
-/** 认得出、但这一版用不了的（`socks=…` / `pac`）。静默退回直连是最坏的，所以要**报**。 */
-const unsupportedProxyText = computed(() =>
-  (diagnostics.value?.outboundProxyUnsupported ?? []).join('、')
-)
 /**
  * 运行参数那张表：每行 = 叫什么 / 现在是什么 / **改哪个变量**。
  *
@@ -324,13 +320,6 @@ const runtimeRows = computed(() => {
       where: 'RENDERLOFT_PROXY / HTTP(S)_PROXY'
     }
   ]
-  if (unsupportedProxyText.value) {
-    rows.push({
-      label: t('settings.outboundProxyUnsupported'),
-      value: unsupportedProxyText.value,
-      where: ''
-    })
-  }
   return rows
 })
 /*
