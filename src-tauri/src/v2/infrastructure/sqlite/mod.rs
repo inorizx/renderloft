@@ -2135,11 +2135,13 @@ mod tests {
     /// "签名时序列化的那份 body"与"真正发出去的字节"必须逐字节一致，否则这条就红。
     /// 这正是最容易悄悄坏掉的地方（换个序列化器、中间再加工一次 body 都会中招）。
     ///
-    /// 关于代理：一度以为"回环投递必须显式 `no_proxy`，否则会被环境里那个死代理拦掉"，
-    /// 于是给投递器加了第二个客户端。**负对照把它否了**——在
-    /// `HTTP_PROXY=http://127.0.0.1:1`（没人听）的环境里，强制走"公网客户端"投递到
-    /// `http://127.0.0.1:<port>` **照样成功**：reqwest 默认就不把回环交给代理。
-    /// 所以那半个客户端被撤掉了（不留没有证据的代码），这条测试留在这里当证据。
+    /// 关于代理：回环投递**直连是我们自己的判据保证的**（`outbound::bypasses` 对回环
+    /// 永远返回真），装配点在 `providers::proxy`。**别把这件事寄在 reqwest 身上**：
+    /// 2026-10-26 实测，环境里有 `HTTP(S)_PROXY` 时它会把 `127.0.0.1` 的请求也交给代理
+    /// （本仓库曾有两条测试因此变红）。判据在 `outbound.rs` 的
+    /// `only_loopback_bypasses_without_a_pattern` 与 `proxy.rs` 的
+    /// `a_loopback_target_never_goes_through_the_proxy`（假代理必须收不到连接）。
+    /// 这条测试只负责"投递链路能通、签名能验"，不承担证明代理行为。
     #[tokio::test]
     async fn http_delivery_reaches_a_loopback_receiver_and_the_signature_verifies() {
         use crate::v2::domain::signing;
