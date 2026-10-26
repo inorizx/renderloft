@@ -27,6 +27,46 @@ pub struct SafeError {
     pub details: BTreeMap<String, Value>,
 }
 
+/// 一次失败**该怪谁**。与 `retryable` / `submission_is_unknown` 并列的第三个判据。
+///
+/// 为什么要它：账号池里"一个成员坏了"和"平台忙"必须分开处理——前者暂停那个成员接新单，
+/// 后者只退避。混在一起就会出现"把忙当成坏"，池子越跑越小。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FaultScope {
+    /// 这个账号 / 这把 key 的问题（鉴权、余额、被禁用）：修好之前别让它接新单。
+    Account,
+    /// 平台忙（并发位满、队列满）：不是故障，等一会儿。
+    Capacity,
+    /// 平台整体或网络：所有账号都受影响，别赖某一个。
+    Platform,
+    /// 请求本身（参数、内容、资产）：换哪个账号都一样。
+    Request,
+}
+
+impl SafeError {
+    /// 默认分类：先看 `kind`，再看错误码里的关键词。驱动可以覆盖
+    /// （平台把多种拒绝压成同一个码时，只有驱动知道那句话是什么意思）。
+    pub fn fault_scope(&self) -> FaultScope {
+        match self.kind {
+            ErrorKind::Auth | ErrorKind::Authorization => FaultScope::Account,
+            ErrorKind::Network | ErrorKind::Timeout => FaultScope::Platform,
+            _ => {
+                let code = self.code.to_ascii_uppercase();
+                if ["APIKEY", "API_KEY", "TOKEN", "CREDENTIAL", "AUTH"].iter().any(|needle| code.contains(needle)) {
+                    FaultScope::Account
+                } else if code.contains("QUEUE_MAXED")
+                    || code.contains("CONCURRENCY")
+                    || code.contains("RATE_LIMIT")
+                {
+                    FaultScope::Capacity
+                } else {
+                    FaultScope::Request
+                }
+            }
+        }
+    }
+}
+
 impl SafeError {
     pub fn validation(code: impl Into<String>, message: impl Into<String>) -> Self {
         Self {

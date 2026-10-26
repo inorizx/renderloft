@@ -46,6 +46,7 @@ pub struct SchedulerService {
     pub artifacts: Arc<dyn ArtifactStore>,
     pub drivers: Arc<DriverRegistry>,
     pub capacity: CapacityCache,
+    pub paused: PausedAccounts,
 }
 
 /// 并发容量是**平台说的事实**，但不必每个 tick 都问一次。
@@ -54,6 +55,49 @@ pub struct SchedulerService {
 /// 30 秒够用——容量是订阅档位，不是秒级变化；真变了（被平台拒）我们会**立刻**丢掉缓存重问，
 /// 所以这里的"旧"最多只让一次提交白撞，而那次拒绝不花钱。
 const CAPACITY_TTL: Duration = Duration::from_secs(30);
+
+/// 账号级冻结：某个成员的 key 失效 / 余额不足时，暂时不让它接新单。
+///
+/// **刻意不做"熔断器"**：没有阈值、没有半开状态、没有探测请求。只有一条规则——
+/// 是谁的错就停谁；`PAUSE_TTL` 到点自动放行一次，让修好的 key 重新进来
+/// （修不好就再冻 10 分钟，一条 run 的代价）。
+const PAUSE_TTL: Duration = Duration::from_secs(600);
+
+#[derive(Default)]
+pub struct PausedAccounts {
+    entries: std::sync::Mutex<HashMap<u64, (Instant, String)>>,
+}
+
+impl PausedAccounts {
+    /// 被冻结则返回原因；过期的顺手清掉。
+    fn reason(&self, revision_id: u64) -> Option<String> {
+        let mut entries = self.entries.lock().unwrap_or_else(|e| e.into_inner());
+        let (until, reason) = entries.get(&revision_id)?;
+        if Instant::now() < *until {
+            return Some(reason.clone());
+        }
+        entries.remove(&revision_id);
+        None
+    }
+
+    fn pause(&self, revision_id: u64, reason: String) {
+        self.entries
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(revision_id, (Instant::now() + PAUSE_TTL, reason));
+    }
+
+    /// 诊断用：当前被冻结的连接 revision 与原因。
+    pub fn snapshot(&self) -> Vec<(u64, String)> {
+        let mut entries = self.entries.lock().unwrap_or_else(|e| e.into_inner());
+        let now = Instant::now();
+        entries.retain(|_, (until, _)| now < *until);
+        entries
+            .iter()
+            .map(|(id, (_, reason))| (*id, reason.clone()))
+            .collect()
+    }
+}
 
 #[derive(Default)]
 pub struct CapacityCache {
@@ -166,6 +210,10 @@ impl SchedulerService {
             let Ok(driver) = self.drivers.get(&key) else {
                 continue;
             };
+            // 账号级冻结（key 失效 / 余额不足）：这一轮完全不碰它，也不往里叫号。
+            if self.paused.reason(revision.id.0).is_some() {
+                continue;
+            }
             // 「这个 provider 总共允许几个并发」的静态值，只在平台不报容量时兜底。
             let base_slots = driver.available_slots().max(1);
             // ⚠️ 光看静态槽位不够：tick 2 会在 tick 1 的任务还在跑时继续提交，被平台拒。
@@ -560,6 +608,16 @@ impl SchedulerService {
             }
             Err(error) => {
                 self.resolve_submit_error(claimed, &error).await?;
+                // 只有"账号的错"才冻结这个成员：容量/平台/请求的错换谁都一样，
+                // 冻它只会让池子越跑越小。
+                if driver.fault_scope(&error) == crate::v2::domain::errors::FaultScope::Account {
+                    let reason = format!("{}：{}", error.code, error.message);
+                    self.paused.pause(claimed.connection_revision.id.0, reason.clone());
+                    crate::v2::logging::log_line(&format!(
+                        "[renderloft-scheduler] 连接 revision {} 暂停接单（{}）",
+                        claimed.connection_revision.id.0, reason
+                    ));
+                }
                 Ok(error_outcome(
                     &error,
                     driver.is_capacity_rejection(&error),
@@ -1284,6 +1342,7 @@ mod tests {
             artifacts: Arc::new(repositories.clone()),
             drivers: Arc::new(registry),
             capacity: Default::default(),
+            paused: Default::default(),
         }
     }
 
@@ -1415,6 +1474,58 @@ mod tests {
         );
     }
 
+
+    /// **账号的错只停那个账号**：key 失效 ⇒ 判失败 + 冻结这条连接，下一轮不再领新单。
+    ///
+    /// 反面对照在下面那条：容量满（`TASK_QUEUE_MAXED`）**不许**冻结——那是"忙"，不是"坏"。
+    #[tokio::test]
+    async fn an_account_fault_pauses_that_connection_until_the_key_is_fixed() {
+        let repositories = InMemoryRepositories::new();
+        seed_environment(&repositories);
+        create_operation(&repositories).await;
+        let driver = driver_with(SubmitOutcome::Accepted(RemoteHandle {
+            provider: "openai-images".to_string(),
+            remote_id: "never".to_string(),
+        }));
+        driver.push_submit_error(SafeError::provider("APIKEY_INVALID", "key 已失效"));
+        let service = scheduler(repositories.clone(), driver);
+
+        let first = service.tick().await.expect("tick 应成功");
+        assert_eq!(first.failed, 1, "鉴权错是非可重试的，应当判失败而不是退避");
+        assert!(
+            service.paused.snapshot().iter().any(|(id, _)| *id == 1),
+            "账号的错必须冻结这条连接：{:?}",
+            service.paused.snapshot()
+        );
+
+        create_operation_with_key(&repositories, "after-pause").await;
+        let second = service.tick().await.expect("tick 应成功");
+        assert_eq!(second.claimed, 0, "冻结期间不该再领新单");
+    }
+
+    /// **容量满不是账号的错**：不许冻结，只退避。
+    #[tokio::test]
+    async fn a_capacity_rejection_does_not_pause_the_connection() {
+        let repositories = InMemoryRepositories::new();
+        seed_environment(&repositories);
+        create_operation(&repositories).await;
+        let driver = driver_with(SubmitOutcome::Accepted(RemoteHandle {
+            provider: "openai-images".to_string(),
+            remote_id: "never".to_string(),
+        }));
+        driver.push_submit_error(SafeError {
+            retryable: true,
+            ..SafeError::provider("RUNNINGHUB_REJECTED", "TASK_QUEUE_MAXED")
+        });
+        let service = scheduler(repositories, driver);
+
+        let tick = service.tick().await.expect("tick 应成功");
+        assert_eq!(tick.retry_wait, 1, "队列满应当退避重试");
+        assert!(
+            service.paused.snapshot().is_empty(),
+            "忙不是坏：不该冻结连接"
+        );
+    }
 
     /// **调度侧再平衡**：把"没试过"的排队 run 从别的池成员叫到有空位的连接上。
     ///
@@ -1640,6 +1751,7 @@ mod tests {
         registry.register(driver_key("openai", "openai-images"), driver.clone());
         let scheduler = SchedulerService {
             capacity: Default::default(),
+            paused: Default::default(),
             owner: "test-scheduler".to_string(),
             repositories: Arc::new(repositories.clone()),
             leases: Arc::new(repositories.clone()),
@@ -1690,6 +1802,7 @@ mod tests {
         registry.register(driver_key("openai", "openai-images"), driver);
         let scheduler = SchedulerService {
             capacity: Default::default(),
+            paused: Default::default(),
             owner: "test-scheduler".to_string(),
             repositories: Arc::new(repositories.clone()),
             leases: Arc::new(repositories.clone()),
@@ -1748,6 +1861,7 @@ mod tests {
         registry.register(driver_key("openai", "openai-images"), driver.clone());
         let scheduler = SchedulerService {
             capacity: Default::default(),
+            paused: Default::default(),
             owner: "test-scheduler".to_string(),
             repositories: Arc::new(repositories.clone()),
             leases: Arc::new(repositories.clone()),
@@ -1892,6 +2006,7 @@ mod tests {
         registry.register(driver_key("openai", "openai-images"), driver.clone());
         let scheduler = SchedulerService {
             capacity: Default::default(),
+            paused: Default::default(),
             owner: "test-scheduler".to_string(),
             repositories: Arc::new(repositories.clone()),
             leases: Arc::new(repositories.clone()),
@@ -1946,6 +2061,7 @@ mod tests {
         registry.register(driver_key("openai", "openai-images"), driver.clone());
         let scheduler = SchedulerService {
             capacity: Default::default(),
+            paused: Default::default(),
             owner: "test-scheduler".to_string(),
             repositories: Arc::new(repositories.clone()),
             leases: Arc::new(repositories.clone()),
@@ -2010,6 +2126,7 @@ mod tests {
         registry.register(driver_key("openai", "openai-images"), driver);
         let scheduler = SchedulerService {
             capacity: Default::default(),
+            paused: Default::default(),
             owner: "test-scheduler".to_string(),
             repositories: Arc::new(repositories.clone()),
             leases: Arc::new(repositories.clone()),
@@ -2073,6 +2190,7 @@ mod tests {
         registry.register(driver_key("openai", "openai-images"), driver);
         let scheduler = SchedulerService {
             capacity: Default::default(),
+            paused: Default::default(),
             owner: "test-scheduler".to_string(),
             repositories: Arc::new(repositories.clone()),
             leases: Arc::new(repositories.clone()),
@@ -2214,6 +2332,7 @@ mod tests {
         registry.register(driver_key("openai", "openai-images"), driver);
         let scheduler = SchedulerService {
             capacity: Default::default(),
+            paused: Default::default(),
             owner: "test-scheduler".to_string(),
             repositories: Arc::new(repositories.clone()),
             leases: Arc::new(repositories.clone()),

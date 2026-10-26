@@ -4,7 +4,7 @@ use serde_json::{json, Value};
 use std::collections::BTreeMap;
 use std::sync::OnceLock;
 
-use crate::v2::domain::errors::{DomainResult, SafeError};
+use crate::v2::domain::errors::{FaultScope, DomainResult, SafeError};
 use crate::v2::domain::execution::{
     CancelOutcome, ConnectionCheck, ProviderDescriptor, SubmitOutcome, TaskSnapshot,
 };
@@ -481,6 +481,21 @@ impl ProviderDriver for RunningHubDriver {
             .and_then(|value| value.trim().parse::<usize>().ok())
             .unwrap_or(0);
         Some(QueueCapacity { limit, running })
+    }
+
+    /// RunningHub 把所有拒绝压成 `RUNNINGHUB_REJECTED`，只能看原文分账：
+    /// 队列满 = 忙（Capacity）；APIKEY/TOKEN 类 = 账号的错（Account）；其余 = 请求的错。
+    fn fault_scope(&self, error: &SafeError) -> FaultScope {
+        if error.code == "RUNNINGHUB_REJECTED" {
+            let message = error.message.to_ascii_uppercase();
+            if message.contains("TASK_QUEUE_MAXED") {
+                return FaultScope::Capacity;
+            }
+            if ["APIKEY", "API_KEY", "TOKEN", "LOGIN"].iter().any(|needle| message.contains(needle)) {
+                return FaultScope::Account;
+            }
+        }
+        error.fault_scope()
     }
 
     /// "执行位已满"的识别与 `rejection_error` 同一判据：拒绝原文里带 `TASK_QUEUE_MAXED`。
@@ -1148,6 +1163,27 @@ mod tests {
             "SOMETHING_ELSE",
             "TASK_QUEUE_MAXED"
         )));
+    }
+
+    /// **忙不是坏**：同样的 `RUNNINGHUB_REJECTED`，只有鉴权类才该冻结账号。
+    #[test]
+    fn fault_scope_tells_busy_from_broken() {
+        let driver = RunningHubDriver::new(Box::new(NoSecrets));
+        assert_eq!(
+            driver.fault_scope(&rejection_error("TASK_QUEUE_MAXED")),
+            FaultScope::Capacity,
+            "队列满是平台忙，冻结账号只会让池子越跑越小"
+        );
+        assert_eq!(
+            driver.fault_scope(&rejection_error("APIKEY_INVALID")),
+            FaultScope::Account,
+            "key 失效是账号的错，该暂停它接新单"
+        );
+        assert_eq!(
+            driver.fault_scope(&rejection_error("PARAM_ERROR")),
+            FaultScope::Request,
+            "参数错换哪个账号都一样，不该赖账号"
+        );
     }
 
     /// 两个方向都要钉住：漏报会把活丢掉，误报会让坏参数无限重试（还要花钱）。

@@ -3,7 +3,7 @@ use serde_json::Value;
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 
-use crate::v2::domain::errors::{DomainResult, SafeError};
+use crate::v2::domain::errors::{DomainResult, FaultScope, SafeError};
 use crate::v2::domain::execution::{
     CancelOutcome, ConnectionCheck, ProviderDescriptor, RemoteHandle, SubmitOutcome, TaskSnapshot,
 };
@@ -143,6 +143,12 @@ pub trait ProviderDriver: Send + Sync {
     /// 查询，解析放在驱动里，调度只认 `QueueCapacity` 这一个形状。
     fn queue_capacity(&self, _status: &Value) -> Option<QueueCapacity> {
         None
+    }
+
+    /// 这次失败该怪谁？默认按 `SafeError::fault_scope` 判；平台把多种拒绝压成同一个码时，
+    /// 只有驱动知道那句话是什么意思（见 RunningHub 的实现）。
+    fn fault_scope(&self, error: &SafeError) -> FaultScope {
+        error.fault_scope()
     }
 
     /// 这次提交失败是不是"平台并发已满"？

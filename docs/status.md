@@ -4,6 +4,14 @@
 
 ## 已完成
 
+- **账号坏了只停它一个（失败分账）**（2026-10-27）：提交失败先归类——**账号的错**（鉴权 / 余额）、
+  **平台的错**（网络 / 超时）、**平台忙**（并发 / 队列满）、**请求的错**（参数 / 内容 / 资产）。
+  只有账号的错会**冻结那条连接 10 分钟**（期间不领新单、也不往里叫号），其余照常退避或直接失败。
+  刻意**不做"熔断器"**：没有阈值、没有半开状态、没有探测请求——那套东西在 2~10 个账号的池子里
+  只会把"忙"误判成"坏"，越熔越小。
+  判据：`an_account_fault_pauses_that_connection_until_the_key_is_fixed`、
+  `a_capacity_rejection_does_not_pause_the_connection`（反面对照：忙不许冻结）、
+  `fault_scope_tells_busy_from_broken`（同一个 `RUNNINGHUB_REJECTED` 分三档）。
 - **一个批次可以自动铺到多条连接上（账号池的第一步）**（2026-10-26）：调用方**不再需要选账号**——
   提交时不指定 `connectionId`、而配方的 `allowedConnectionIds` 列了多条连接，run 就按序号轮转
   落到这些连接上（`RecipeBinding::connection_for_run`）。只列一条的配方行为逐字节不变；

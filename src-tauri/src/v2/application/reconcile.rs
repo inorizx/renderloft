@@ -599,6 +599,7 @@ mod tests {
         registry.register(driver_key("openai", "openai-images"), driver);
         let scheduler = crate::v2::application::scheduler::SchedulerService {
             capacity: Default::default(),
+            paused: Default::default(),
             owner: "test-scheduler".to_string(),
             repositories: Arc::new(repositories.clone()),
             leases: Arc::new(repositories.clone()),

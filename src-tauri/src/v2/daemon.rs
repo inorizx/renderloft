@@ -218,6 +218,7 @@ impl V2Runtime {
         });
         let scheduler = Arc::new(SchedulerService {
             capacity: Default::default(),
+            paused: Default::default(),
             owner: "v2-scheduler".to_string(),
             repositories: operations.clone(),
             leases,
