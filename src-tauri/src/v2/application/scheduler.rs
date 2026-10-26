@@ -32,6 +32,8 @@ pub struct SchedulerTickResult {
     pub retry_wait: usize,
     pub failed: usize,
     pub recovered: usize,
+    /// 本轮从别的连接"叫过来"的、从未尝试过的排队 run 数（账号池的再平衡）。
+    pub adopted: usize,
     pub busy: bool,
 }
 
@@ -172,6 +174,15 @@ impl SchedulerService {
             };
             let limit = capacity.map(|capacity| capacity.limit).unwrap_or(base_slots);
             let remaining = limit.saturating_sub(used);
+            // 有空位、这条连接自己却排不到队 ⇒ 把同一张配方里**没尝试过**的 run 叫过来。
+            // 这就是"账号池"的调度侧：3+1 的池子上 4 条先被平均分成了 2/2，这里把多出来的
+            // 那一条从 1 个位的账号挪到 3 个位的账号上，一轮就能跑完。
+            if remaining > 0 {
+                result.adopted += self
+                    .repositories
+                    .adopt_queued_runs(revision.id, remaining)
+                    .await?;
+            }
             for _ in 0..remaining {
                 let Some(claimed) = self
                     .repositories
@@ -830,6 +841,75 @@ mod tests {
         repositories.seed_recipe(recipe, vec![revision]);
     }
 
+    /// 两条连接 + 一张"池子"配方（可用连接 [1, 2]）。run 归属按序号轮转。
+    fn seed_pool(repositories: &InMemoryRepositories) {
+        seed_environment(repositories);
+        repositories.seed_connection(
+            Connection {
+                id: ConnectionId(2),
+                vendor: "openai".to_string(),
+                protocol: "openai-images".to_string(),
+                display_name: "OpenAI Images 2".to_string(),
+                current_revision_id: ConnectionRevisionId(2),
+                status: crate::v2::domain::model::ConnectionStatus::Active,
+            },
+            vec![ConnectionRevision {
+                id: ConnectionRevisionId(2),
+                connection_id: ConnectionId(2),
+                config: Default::default(),
+                secret_bindings: vec![],
+                effective_capabilities: vec!["text-to-image".to_string()],
+                lifecycle_features: LifecycleFeatures {
+                    synchronous_result: true,
+                    remote_reconciliation: true,
+                    ..Default::default()
+                },
+                created_at: Timestamp::now(),
+            }],
+        );
+        // 同一张配方、同一个 revision id，绑定换成"两只连接都可用"。
+        repositories.seed_recipe(
+            Recipe {
+                id: RecipeId(1),
+                name: "Image Recipe".to_string(),
+                description: "text to image".to_string(),
+                labels: vec![],
+                capability: "text-to-image".to_string(),
+                current_revision_id: RecipeRevisionId(1),
+                visibility: RecipeVisibility::Private,
+                created_at: Timestamp::now(),
+                updated_at: Timestamp::now(),
+                favorite: false,
+                group: None,
+                note: None,
+                last_opened_at: None,
+                field_labels: Default::default(),
+                removed_at: None,
+            },
+            vec![RecipeRevision {
+                id: RecipeRevisionId(1),
+                recipe_id: RecipeId(1),
+                revision: 1,
+                input_schema: json!({
+                    "type": "object",
+                    "required": ["prompt"],
+                    "properties": { "prompt": { "type": "string" } }
+                }),
+                output_schema: json!({ "type": "object" }),
+                binding: RecipeBinding {
+                    driver_key: "openai-images".to_string(),
+                    provider_config: Default::default(),
+                    default_connection_id: ConnectionId(1),
+                    allowed_connection_ids: vec![ConnectionId(1), ConnectionId(2)],
+                    connection_override: ConnectionOverride::Denied,
+                },
+                defaults: Default::default(),
+                source: RecipeSource::Embedded,
+                created_at: Timestamp::now(),
+            }],
+        );
+    }
+
     async fn create_operation(
         repositories: &InMemoryRepositories,
     ) -> (OperationId, crate::v2::domain::ids::RunId) {
@@ -839,6 +919,15 @@ mod tests {
     async fn create_operation_with_key(
         repositories: &InMemoryRepositories,
         key: &str,
+    ) -> (OperationId, crate::v2::domain::ids::RunId) {
+        create_operation_with_runs(repositories, key, 1).await
+    }
+
+    /// 一次提交 N 条 run（一条 Operation）——账号池的分发只在**一个批次内**轮转。
+    async fn create_operation_with_runs(
+        repositories: &InMemoryRepositories,
+        key: &str,
+        count: usize,
     ) -> (OperationId, crate::v2::domain::ids::RunId) {
         use crate::v2::application::create_operation::{
             CreateOperation, CreateOperationRequest, Repositories, RunRequest,
@@ -860,13 +949,18 @@ mod tests {
                 actor: actor(),
                 origin: "mcp".to_string(),
                 idempotency_key: IdempotencyKey(key.to_string()),
-                runs: vec![RunRequest {
-                    client_run_id: "image-1".to_string(),
-                    recipe_revision_id: RecipeRevisionId(1),
-                    connection_id: None,
-                    inputs: BTreeMap::from([("prompt".to_string(), json!("a red house"))]),
-                    assets: vec![],
-                }],
+                runs: (1..=count)
+                    .map(|index| RunRequest {
+                        client_run_id: format!("image-{index}"),
+                        recipe_revision_id: RecipeRevisionId(1),
+                        connection_id: None,
+                        inputs: BTreeMap::from([(
+                            "prompt".to_string(),
+                            json!("a red house"),
+                        )]),
+                        assets: vec![],
+                    })
+                    .collect(),
                 metadata: Default::default(),
                 callback: None,
             })
@@ -1264,6 +1358,38 @@ mod tests {
         );
     }
 
+
+    /// **调度侧再平衡**：把"没试过"的排队 run 从别的池成员叫到有空位的连接上。
+    ///
+    /// 现场就是这个：3+1 的池子上 4 条被轮转成 2/2，连接 1 还有 1 个空位、
+    /// 连接 2 却排着一条——改派把它挪过去，一轮跑完。
+    ///
+    /// 边界：一次最多 `max` 条；挪走的不会重复计数；已经不在原连接上的不再动。
+    #[tokio::test]
+    async fn adoption_rebalances_a_pool_without_touching_anything_else() {
+        let repositories = InMemoryRepositories::new();
+        seed_pool(&repositories);
+        create_operation_with_runs(&repositories, "adopt-pool", 4).await;
+        let conn1 = crate::v2::domain::ids::ConnectionRevisionId(1);
+        let conn2 = crate::v2::domain::ids::ConnectionRevisionId(2);
+
+        // 轮转后 2/2：连接 1 有 2 条、连接 2 有 2 条。
+        // 连接 1 还有 1 个空位 ⇒ 从连接 2 叫一条过来。
+        assert_eq!(
+            repositories.adopt_queued_runs(conn1, 1).await.unwrap(),
+            1,
+            "只该叫 max 条"
+        );
+        // 再叫：连接 2 只剩 1 条，叫过来之后它自己空了。
+        assert_eq!(repositories.adopt_queued_runs(conn1, 1).await.unwrap(), 1);
+        // 连接 2 已经空了 ⇒ 没有可叫的。
+        assert_eq!(repositories.adopt_queued_runs(conn1, 1).await.unwrap(), 0);
+        assert_eq!(
+            repositories.adopt_queued_runs(conn2, 1).await.unwrap(),
+            0,
+            "连接 1 那 4 条已经不在排队区了（这里只验不会再被反向搬走）"
+        );
+    }
 
     /// 凭据引用：引用方的 run 提交时，驱动拿到的必须是**被引用连接**的槽位。
     ///

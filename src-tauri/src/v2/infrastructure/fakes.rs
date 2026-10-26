@@ -787,9 +787,48 @@ impl OperationRepository for InMemoryRepositories {
         Err(SafeError::not_found("RUN_NOT_FOUND", "Run 不存在"))
     }
 
+    async fn adopt_queued_runs(
+        &self,
+        connection_revision_id: ConnectionRevisionId,
+        max: usize,
+    ) -> DomainResult<usize> {
+        let mut state = self.state.lock().unwrap();
+        // 先收集"这张池子已经用到的配方"，再改 run（借用不能混）。
+        let recipes: Vec<u64> = state
+            .operations
+            .iter()
+            .flat_map(|persisted| persisted.runs.iter())
+            .filter(|run| run.connection_revision_id == connection_revision_id)
+            .map(|run| run.recipe_revision_id.0)
+            .collect();
+        let attempted: Vec<u64> = state
+            .attempts
+            .iter()
+            .map(|attempt| attempt.run_id.0)
+            .collect();
+        let mut adopted = 0usize;
+        'outer: for persisted in &mut state.operations {
+            for run in &mut persisted.runs {
+                if adopted == max {
+                    break 'outer;
+                }
+                if run.status == RunStatus::Queued
+                    && run.connection_revision_id != connection_revision_id
+                    && recipes.contains(&run.recipe_revision_id.0)
+                    && !attempted.contains(&run.id.0)
+                {
+                    run.connection_revision_id = connection_revision_id;
+                    run.updated_at = Timestamp::now();
+                    adopted += 1;
+                }
+            }
+        }
+        Ok(adopted)
+    }
+
     async fn count_active_runs_for_connection(
         &self,
-        connection_revision_id: crate::v2::domain::ids::ConnectionRevisionId,
+        connection_revision_id: ConnectionRevisionId,
     ) -> DomainResult<usize> {
         let state = self.state.lock().unwrap();
         Ok(state

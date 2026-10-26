@@ -1252,6 +1252,70 @@ impl OperationRepository for SqliteRepositories {
         Ok(count as usize)
     }
 
+    /// 把"从未尝试过"的 QUEUED run 改派到目标连接（见端口注释的**三条边界**）。
+    ///
+    /// 用一次事务（选 + 改）保证不会把同一条 run 选两次；`NOT EXISTS` 查的是 attempt 表，
+    /// 而不是 `status <> 'RETRY_WAIT'`——状态可能被别处改回 QUEUED，尝试记录才是硬证据。
+    async fn adopt_queued_runs(
+        &self,
+        connection_revision_id: crate::v2::domain::ids::ConnectionRevisionId,
+        max: usize,
+    ) -> DomainResult<usize> {
+        if max == 0 {
+            return Ok(0);
+        }
+        let connection = self.connection.lock().unwrap_or_else(|e| e.into_inner());
+        let transaction = connection
+            .unchecked_transaction()
+            .map_err(|_| SafeError::storage("无法开始改派事务"))?;
+        let ids: Vec<i64> = {
+            let mut statement = transaction
+                .prepare(
+                    "SELECT r.id FROM v2_runs r
+                     WHERE r.status = 'QUEUED'
+                       AND r.connection_revision_id <> ?1
+                       AND NOT EXISTS (SELECT 1 FROM v2_run_attempts a WHERE a.run_id = r.id)
+                       AND r.recipe_revision_id IN (
+                           SELECT recipe_revision_id FROM v2_runs WHERE connection_revision_id = ?1
+                       )
+                     ORDER BY r.created_at ASC, r.id ASC
+                     LIMIT ?2",
+                )
+                .map_err(|_| SafeError::storage("无法准备改派查询"))?;
+            let mut rows = statement
+                .query_map(params![connection_revision_id.0, max as i64], |row| row.get(0))
+                .map_err(|_| SafeError::storage("无法查询可改派的 Run"))?;
+            let mut ids = Vec::new();
+            for row in rows.by_ref() {
+                ids.push(row.map_err(|_| SafeError::storage("无法读取可改派的 Run"))?);
+            }
+            drop(rows);
+            ids
+        };
+        if ids.is_empty() {
+            return Ok(0);
+        }
+        let placeholders = std::iter::repeat_n("?", ids.len())
+            .collect::<Vec<_>>()
+            .join(",");
+        let sql = format!(
+            "UPDATE v2_runs SET connection_revision_id = ?, updated_at = ?
+             WHERE id IN ({placeholders})"
+        );
+        let mut values: Vec<rusqlite::types::Value> = Vec::with_capacity(ids.len() + 2);
+        values.push(rusqlite::types::Value::Integer(connection_revision_id.0 as i64));
+        values.push(rusqlite::types::Value::Integer(Timestamp::now_millis() as i64));
+        values.extend(ids.iter().map(|id| rusqlite::types::Value::Integer(*id)));
+        transaction
+            .prepare(&sql)
+            .and_then(|mut statement| statement.execute(rusqlite::params_from_iter(values.iter())))
+            .map_err(|_| SafeError::storage("无法改派 Run 的连接"))?;
+        transaction
+            .commit()
+            .map_err(|_| SafeError::storage("无法提交改派事务"))?;
+        Ok(ids.len())
+    }
+
     async fn list_active_runs(&self, limit: usize) -> DomainResult<Vec<ActiveRun>> {
         let connection = self.connection.lock().unwrap_or_else(|e| e.into_inner());
         let transaction = connection

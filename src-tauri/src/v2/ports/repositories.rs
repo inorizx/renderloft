@@ -348,6 +348,21 @@ pub trait OperationRepository: Send + Sync {
         connection_revision_id: crate::v2::domain::ids::ConnectionRevisionId,
     ) -> DomainResult<usize>;
 
+    /// 把**从未尝试过**的 `QUEUED` run 改派到 `connection_revision_id`，最多 `max` 条。
+    ///
+    /// 为什么允许改派：这些 run 还没提交过——钱没花、平台没见过它。挪动它不改变任何
+    /// 已经发生的事实，只是把排队的人叫到另一个空窗口。
+    ///
+    /// 三条边界，缺一条就会出错：
+    /// * **只认 `QUEUED`**：`RETRY_WAIT` 有 attempt，改派等于让重试换账号（可能双扣）；
+    /// * **必须有 attempt 记录就不碰**：状态可能被别处改回 QUEUED，attempt 表才是硬证据；
+    /// * **只认同一张配方**：池成员是配方声明的，不能把别的配方的 run 挪过来。
+    async fn adopt_queued_runs(
+        &self,
+        connection_revision_id: crate::v2::domain::ids::ConnectionRevisionId,
+        max: usize,
+    ) -> DomainResult<usize>;
+
     async fn recover_expired_submissions(&self) -> DomainResult<usize>;
 
     async fn set_tracking(
@@ -579,6 +594,15 @@ impl OperationRepository for Arc<dyn OperationRepository> {
     ) -> DomainResult<usize> {
         self.as_ref()
             .count_active_runs_for_connection(connection_revision_id)
+            .await
+    }
+    async fn adopt_queued_runs(
+        &self,
+        connection_revision_id: crate::v2::domain::ids::ConnectionRevisionId,
+        max: usize,
+    ) -> DomainResult<usize> {
+        self.as_ref()
+            .adopt_queued_runs(connection_revision_id, max)
             .await
     }
     async fn find_operation(&self, id: OperationId) -> DomainResult<Option<PersistedOperation>> {
