@@ -790,8 +790,12 @@ impl OperationRepository for InMemoryRepositories {
     async fn adopt_queued_runs(
         &self,
         connection_revision_id: ConnectionRevisionId,
+        sources: &[ConnectionRevisionId],
         max: usize,
     ) -> DomainResult<usize> {
+        if max == 0 || sources.is_empty() {
+            return Ok(0);
+        }
         let mut state = self.state.lock().unwrap();
         // 先收集"这张池子已经用到的配方"，再改 run（借用不能混）。
         let recipes: Vec<u64> = state
@@ -814,6 +818,7 @@ impl OperationRepository for InMemoryRepositories {
                 }
                 if run.status == RunStatus::Queued
                     && run.connection_revision_id != connection_revision_id
+                    && sources.contains(&run.connection_revision_id)
                     && recipes.contains(&run.recipe_revision_id.0)
                     && !attempted.contains(&run.id.0)
                 {

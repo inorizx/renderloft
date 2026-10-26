@@ -149,11 +149,20 @@ impl SchedulerService {
         let mut result = SchedulerTickResult::default();
         let now = Timestamp::now();
         let revisions = self.connections.list_revisions().await?;
+
+        /// 一条连接这一轮还吃得下几条。
+        struct Plan {
+            revision: crate::v2::domain::model::ConnectionRevision,
+            driver: Arc<dyn ProviderDriver>,
+            remaining: usize,
+        }
+
+        // 第一遍：先把每条连接的剩余容量算清楚。**必须分两遍**——"叫号"得先知道谁排满了。
+        let mut plans = Vec::new();
         for (vendor, protocol, revision) in revisions {
             let key = driver_key(&vendor, &protocol);
-            let driver = match self.drivers.get(&key) {
-                Ok(driver) => driver,
-                Err(_) => continue,
+            let Ok(driver) = self.drivers.get(&key) else {
+                continue;
             };
             // 「这个 provider 总共允许几个并发」的静态值，只在平台不报容量时兜底。
             let base_slots = driver.available_slots().max(1);
@@ -173,26 +182,47 @@ impl SchedulerService {
                 None => in_flight,
             };
             let limit = capacity.map(|capacity| capacity.limit).unwrap_or(base_slots);
-            let remaining = limit.saturating_sub(used);
-            // 有空位、这条连接自己却排不到队 ⇒ 把同一张配方里**没尝试过**的 run 叫过来。
-            // 这就是"账号池"的调度侧：3+1 的池子上 4 条先被平均分成了 2/2，这里把多出来的
-            // 那一条从 1 个位的账号挪到 3 个位的账号上，一轮就能跑完。
-            if remaining > 0 {
+            plans.push(Plan {
+                remaining: limit.saturating_sub(used),
+                revision,
+                driver,
+            });
+        }
+
+        // 第二遍：有空位、而**别的连接排满了** ⇒ 把那边"没试过"的排队 run 叫过来。
+        //
+        // 为什么来源必须是"排满的连接"：只判"我有空位"的话，一个空转的连接会把别人的活
+        // 全吸走，另一端反而闲着（3+1 的池子上 4 条会全堆到 3 个位的那边）。
+        let full: Vec<_> = plans
+            .iter()
+            .filter(|plan| plan.remaining == 0)
+            .map(|plan| plan.revision.id)
+            .collect();
+        if !full.is_empty() {
+            for plan in plans.iter_mut() {
+                if plan.remaining == 0 {
+                    continue;
+                }
                 result.adopted += self
                     .repositories
-                    .adopt_queued_runs(revision.id, remaining)
+                    .adopt_queued_runs(plan.revision.id, &full, plan.remaining)
                     .await?;
             }
-            for _ in 0..remaining {
+        }
+
+        // 第三遍：领单、提交。一个 tick 内仍是顺序提交（平台只要求"同时在跑几个"，
+        // 不要求我们并发发起请求）。
+        for plan in plans {
+            for _ in 0..plan.remaining {
                 let Some(claimed) = self
                     .repositories
-                    .claim_next_run(&self.owner, token, revision.id, now.clone())
+                    .claim_next_run(&self.owner, token, plan.revision.id, now.clone())
                     .await?
                 else {
                     break;
                 };
                 result.claimed += 1;
-                match self.execute_claimed(&claimed, driver.clone()).await {
+                match self.execute_claimed(&claimed, plan.driver.clone()).await {
                     Ok(outcome) => match outcome {
                         ExecuteOutcome::Succeeded => result.succeeded += 1,
                         ExecuteOutcome::Accepted => result.accepted += 1,
@@ -204,7 +234,7 @@ impl SchedulerService {
                             if capacity_exhausted {
                                 // 平台刚说了"满了"：本轮**不再领**（接着领只会连撞三次，
                                 // 让三条 run 一起进退避），并丢掉缓存让下个 tick 重新问。
-                                self.capacity.invalidate(revision.id.0);
+                                self.capacity.invalidate(plan.revision.id.0);
                                 break;
                             }
                         }
@@ -1376,16 +1406,16 @@ mod tests {
         // 轮转后 2/2：连接 1 有 2 条、连接 2 有 2 条。
         // 连接 1 还有 1 个空位 ⇒ 从连接 2 叫一条过来。
         assert_eq!(
-            repositories.adopt_queued_runs(conn1, 1).await.unwrap(),
+            repositories.adopt_queued_runs(conn1, &[conn2], 1).await.unwrap(),
             1,
             "只该叫 max 条"
         );
         // 再叫：连接 2 只剩 1 条，叫过来之后它自己空了。
-        assert_eq!(repositories.adopt_queued_runs(conn1, 1).await.unwrap(), 1);
+        assert_eq!(repositories.adopt_queued_runs(conn1, &[conn2], 1).await.unwrap(), 1);
         // 连接 2 已经空了 ⇒ 没有可叫的。
-        assert_eq!(repositories.adopt_queued_runs(conn1, 1).await.unwrap(), 0);
+        assert_eq!(repositories.adopt_queued_runs(conn1, &[conn2], 1).await.unwrap(), 0);
         assert_eq!(
-            repositories.adopt_queued_runs(conn2, 1).await.unwrap(),
+            repositories.adopt_queued_runs(conn2, &[conn1], 1).await.unwrap(),
             0,
             "连接 1 那 4 条已经不在排队区了（这里只验不会再被反向搬走）"
         );

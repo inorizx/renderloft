@@ -1252,63 +1252,95 @@ impl OperationRepository for SqliteRepositories {
         Ok(count as usize)
     }
 
-    /// 把"从未尝试过"的 QUEUED run 改派到目标连接（见端口注释的**三条边界**）。
+    /// 把"sources 里那些**已经排满**的连接上、从未尝试过"的 QUEUED run 改派到目标连接
+    /// （见端口注释的三条边界）。
     ///
-    /// 用一次事务（选 + 改）保证不会把同一条 run 选两次；`NOT EXISTS` 查的是 attempt 表，
-    /// 而不是 `status <> 'RETRY_WAIT'`——状态可能被别处改回 QUEUED，尝试记录才是硬证据。
+    /// 为什么要 `sources`：只剩"目标有空位"这一个条件时，一个空闲连接会把别人的活全吸走，
+    /// 另一端反而空转（3+1 的池子上 4 条会全落到 3 个位的那边）。只有**排满的**连接才该被叫号。
+    ///
+    /// 一次事务（选 + 改）保证不会把同一条 run 选两次；`NOT EXISTS` 查 attempt 表而不是
+    /// `status <> 'RETRY_WAIT'`——状态可能被别处改回 QUEUED，尝试记录才是硬证据。
     async fn adopt_queued_runs(
         &self,
         connection_revision_id: crate::v2::domain::ids::ConnectionRevisionId,
+        sources: &[crate::v2::domain::ids::ConnectionRevisionId],
         max: usize,
     ) -> DomainResult<usize> {
-        if max == 0 {
+        let sources: Vec<_> = sources
+            .iter()
+            .copied()
+            .filter(|source| *source != connection_revision_id)
+            .collect();
+        if max == 0 || sources.is_empty() {
             return Ok(0);
         }
         let connection = self.connection.lock().unwrap_or_else(|e| e.into_inner());
         let transaction = connection
             .unchecked_transaction()
             .map_err(|_| SafeError::storage("无法开始改派事务"))?;
+        let source_placeholders = std::iter::repeat_n("?", sources.len())
+            .collect::<Vec<_>>()
+            .join(",");
+        let sql = format!(
+            "SELECT r.id FROM v2_runs r
+             WHERE r.status = 'QUEUED'
+               AND r.connection_revision_id IN ({source_placeholders})
+               AND NOT EXISTS (SELECT 1 FROM v2_run_attempts a WHERE a.run_id = r.id)
+               AND r.recipe_revision_id IN (
+                   SELECT recipe_revision_id FROM v2_runs WHERE connection_revision_id = ?
+               )
+             ORDER BY r.created_at ASC, r.id ASC
+             LIMIT ?"
+        );
+        let mut values: Vec<rusqlite::types::Value> = Vec::with_capacity(sources.len() + 2);
+        values.extend(
+            sources
+                .iter()
+                .map(|id| rusqlite::types::Value::Integer(id.0 as i64)),
+        );
+        values.push(rusqlite::types::Value::Integer(connection_revision_id.0 as i64));
+        values.push(rusqlite::types::Value::Integer(max as i64));
         let ids: Vec<i64> = {
             let mut statement = transaction
-                .prepare(
-                    "SELECT r.id FROM v2_runs r
-                     WHERE r.status = 'QUEUED'
-                       AND r.connection_revision_id <> ?1
-                       AND NOT EXISTS (SELECT 1 FROM v2_run_attempts a WHERE a.run_id = r.id)
-                       AND r.recipe_revision_id IN (
-                           SELECT recipe_revision_id FROM v2_runs WHERE connection_revision_id = ?1
-                       )
-                     ORDER BY r.created_at ASC, r.id ASC
-                     LIMIT ?2",
-                )
+                .prepare(&sql)
                 .map_err(|_| SafeError::storage("无法准备改派查询"))?;
             let mut rows = statement
-                .query_map(params![connection_revision_id.0, max as i64], |row| row.get(0))
+                .query(rusqlite::params_from_iter(values.iter()))
                 .map_err(|_| SafeError::storage("无法查询可改派的 Run"))?;
             let mut ids = Vec::new();
-            for row in rows.by_ref() {
-                ids.push(row.map_err(|_| SafeError::storage("无法读取可改派的 Run"))?);
+            while let Some(row) = rows
+                .next()
+                .map_err(|_| SafeError::storage("无法读取可改派的 Run"))?
+            {
+                ids.push(
+                    row.get(0)
+                        .map_err(|_| SafeError::storage("无法读取可改派的 Run"))?,
+                );
             }
-            drop(rows);
             ids
         };
         if ids.is_empty() {
             return Ok(0);
         }
-        let placeholders = std::iter::repeat_n("?", ids.len())
+        let update_placeholders = std::iter::repeat_n("?", ids.len())
             .collect::<Vec<_>>()
             .join(",");
-        let sql = format!(
+        let update = format!(
             "UPDATE v2_runs SET connection_revision_id = ?, updated_at = ?
-             WHERE id IN ({placeholders})"
+             WHERE id IN ({update_placeholders})"
         );
-        let mut values: Vec<rusqlite::types::Value> = Vec::with_capacity(ids.len() + 2);
-        values.push(rusqlite::types::Value::Integer(connection_revision_id.0 as i64));
-        values.push(rusqlite::types::Value::Integer(Timestamp::now_millis() as i64));
-        values.extend(ids.iter().map(|id| rusqlite::types::Value::Integer(*id)));
+        let mut update_values: Vec<rusqlite::types::Value> = Vec::with_capacity(ids.len() + 2);
+        update_values.push(rusqlite::types::Value::Integer(connection_revision_id.0 as i64));
+        update_values.push(rusqlite::types::Value::Integer(Timestamp::now_millis() as i64));
+        update_values.extend(
+            ids.iter()
+                .map(|id| rusqlite::types::Value::Integer(*id)),
+        );
         transaction
-            .prepare(&sql)
-            .and_then(|mut statement| statement.execute(rusqlite::params_from_iter(values.iter())))
+            .prepare(&update)
+            .and_then(|mut statement| {
+                statement.execute(rusqlite::params_from_iter(update_values.iter()))
+            })
             .map_err(|_| SafeError::storage("无法改派 Run 的连接"))?;
         transaction
             .commit()

@@ -360,6 +360,7 @@ pub trait OperationRepository: Send + Sync {
     async fn adopt_queued_runs(
         &self,
         connection_revision_id: crate::v2::domain::ids::ConnectionRevisionId,
+        sources: &[crate::v2::domain::ids::ConnectionRevisionId],
         max: usize,
     ) -> DomainResult<usize>;
 
@@ -599,10 +600,11 @@ impl OperationRepository for Arc<dyn OperationRepository> {
     async fn adopt_queued_runs(
         &self,
         connection_revision_id: crate::v2::domain::ids::ConnectionRevisionId,
+        sources: &[crate::v2::domain::ids::ConnectionRevisionId],
         max: usize,
     ) -> DomainResult<usize> {
         self.as_ref()
-            .adopt_queued_runs(connection_revision_id, max)
+            .adopt_queued_runs(connection_revision_id, sources, max)
             .await
     }
     async fn find_operation(&self, id: OperationId) -> DomainResult<Option<PersistedOperation>> {
