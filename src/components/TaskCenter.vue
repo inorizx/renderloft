@@ -941,6 +941,18 @@ const reuseRunParams = async (operation: OperationDetail, run: RunRef) => {
 const failedRuns = (operation: OperationDetail) =>
   operation.runs.filter((run) => run.status === 'FAILED')
 
+/**
+ * 排队位置：这条 run 前面还有几条也在排。
+ *
+ * 为什么由界面自己算：一个批次的顺序就是 Operation 里的 `sequence`，数据已经在手上。
+ * 让后端多吐一个"队列位置"字段，等于多维护一份迟早会漂的派生值。
+ */
+const queuedAhead = (operation: OperationDetail, run: RunRef): number =>
+  run.status === 'QUEUED'
+    ? operation.runs.filter((other) => other.status === 'QUEUED' && other.sequence < run.sequence)
+        .length
+    : 0
+
 const retryingFailed = ref(false)
 const retryFailedError = ref('')
 
@@ -1491,6 +1503,11 @@ onBeforeUnmount(() => {
                 :title="run.connectionName"
                 >{{ run.connectionName }}</span
               >
+              <span
+                v-if="queuedAhead(detailTask, run)"
+                class="shrink-0 text-[11px] text-muted-foreground"
+                >{{ t('task.queuedAhead', { count: queuedAhead(detailTask, run) }) }}</span
+              >
               <span class="shrink-0 text-muted-foreground">{{
                 runTrackingLabel(run.trackingState)
               }}</span>
@@ -1578,6 +1595,12 @@ onBeforeUnmount(() => {
                 class="shrink-0 rounded bg-background/60 px-1.5 py-0.5 text-[11px] text-muted-foreground"
                 :title="run.connectionName"
                 >{{ run.connectionName }}</span
+              >
+              <!-- 排队中也得有个位置感：否则用户只看到一排"排队中"，不知道还要等多久。 -->
+              <span
+                v-if="queuedAhead(batchDetail, run)"
+                class="shrink-0 text-[11px] text-muted-foreground"
+                >{{ t('task.queuedAhead', { count: queuedAhead(batchDetail, run) }) }}</span
               >
               <StatusBadge :status="statusTone(run.status)">{{
                 statusLabel(run.status)

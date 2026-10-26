@@ -215,6 +215,7 @@ const messages = {
     'task.fieldBatchStatus': '批次状态',
     'task.fieldTaskCount': '任务数量',
     'task.fieldRunStatus': '任务状态',
+    'task.queuedAhead': '前面还有 {count} 条',
     'task.noRunsRecorded': '此操作尚未记录 run。',
     'task.failureReasons': '失败原因',
     // 「它为什么没在动」：排队 / 退避重试 / 提交结果不明，状态**都显示「进行中」**，
@@ -1092,6 +1093,7 @@ const messages = {
     'task.fieldBatchStatus': 'Batch status',
     'task.fieldTaskCount': 'Tasks',
     'task.fieldRunStatus': 'Run status',
+    'task.queuedAhead': '{count} ahead',
     'task.noRunsRecorded': 'No runs recorded for this operation.',
     'task.failureReasons': 'Failure reasons',
     // See the Chinese block: queued / retry-backoff / submission-uncertain all *look* like
