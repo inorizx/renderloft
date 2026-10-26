@@ -1485,6 +1485,12 @@ onBeforeUnmount(() => {
               <span class="min-w-0 truncate font-mono">{{
                 run.clientRunId || `run#${run.sequence}`
               }}</span>
+              <span
+                v-if="run.connectionName"
+                class="shrink-0 rounded bg-background/60 px-1.5 py-0.5 text-[11px] text-muted-foreground"
+                :title="run.connectionName"
+                >{{ run.connectionName }}</span
+              >
               <span class="shrink-0 text-muted-foreground">{{
                 runTrackingLabel(run.trackingState)
               }}</span>
@@ -1567,6 +1573,12 @@ onBeforeUnmount(() => {
               <span class="min-w-0 truncate font-mono">{{
                 run.clientRunId || `run#${run.sequence}`
               }}</span>
+              <span
+                v-if="run.connectionName"
+                class="shrink-0 rounded bg-background/60 px-1.5 py-0.5 text-[11px] text-muted-foreground"
+                :title="run.connectionName"
+                >{{ run.connectionName }}</span
+              >
               <StatusBadge :status="statusTone(run.status)">{{
                 statusLabel(run.status)
               }}</StatusBadge>

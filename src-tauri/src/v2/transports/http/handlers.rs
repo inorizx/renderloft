@@ -1050,6 +1050,9 @@ pub async fn get_operation(
     // （跳到那个应用的表单），而它和这里的名字查询是**同一次**读，不该查两遍。
     let mut recipe_of_revision: std::collections::HashMap<u64, Option<u64>> =
         std::collections::HashMap::new();
+    // 每条 run 的账号：按 connection revision 缓存（同一批次的 run 通常只涉及一两条）。
+    let mut connection_of_revision: std::collections::HashMap<u64, Option<(u64, String)>> =
+        std::collections::HashMap::new();
     let recipe_name = if let Some(first) = persisted.runs.first() {
         if let Ok(Some(revision)) = state.recipes.find_revision(first.recipe_revision_id).await {
             recipe_of_revision.insert(first.recipe_revision_id.0, Some(revision.recipe_id.0));
@@ -1082,7 +1085,15 @@ pub async fn get_operation(
             recipe_of_revision.insert(revision_id, resolved);
             resolved
         };
-        runs.push(run_response(run, recipe_id));
+        let connection = match connection_of_revision.get(&run.connection_revision_id.0) {
+            Some(cached) => cached.clone(),
+            None => {
+                let resolved = resolve_connection_label(&state.connections, run.connection_revision_id).await;
+                connection_of_revision.insert(run.connection_revision_id.0, resolved.clone());
+                resolved
+            }
+        };
+        runs.push(run_response(run, recipe_id, connection));
     }
     Ok(Json(
         serde_json::to_value(Envelope::new(json!({
@@ -1156,7 +1167,25 @@ pub async fn list_operations(
     ))
 }
 
-fn run_response(run: &crate::v2::domain::operation::Run, recipe_id: Option<u64>) -> Value {
+/// connection revision → (connectionId, 账号名)。查不到就是 `None`（不编造名字）。
+async fn resolve_connection_label(
+    connections: &Arc<dyn crate::v2::ports::repositories::ConnectionRepository>,
+    revision_id: crate::v2::domain::ids::ConnectionRevisionId,
+) -> Option<(u64, String)> {
+    let revision = connections.find_revision(revision_id).await.ok().flatten()?;
+    let connection = connections
+        .find_connection(revision.connection_id)
+        .await
+        .ok()
+        .flatten()?;
+    Some((connection.id.0, connection.display_name))
+}
+
+fn run_response(
+    run: &crate::v2::domain::operation::Run,
+    recipe_id: Option<u64>,
+    connection: Option<(u64, String)>,
+) -> Value {
     json!({
         "runId": run.id.0,
         "operationId": run.operation_id.0,
@@ -1164,6 +1193,10 @@ fn run_response(run: &crate::v2::domain::operation::Run, recipe_id: Option<u64>)
         "sequence": run.sequence,
         "recipeRevisionId": run.recipe_revision_id.0,
         "connectionRevisionId": run.connection_revision_id.0,
+        // 这条 run 落在**哪个账号**上：账号池里同一个批次会分散到多条连接，
+        // 没有这两个字段，出了账（钱花在哪）和排障（哪个 key 坏了）都无从下手。
+        "connectionId": connection.as_ref().map(|(id, _)| *id),
+        "connectionName": connection.as_ref().map(|(_, name)| name.clone()),
         // 这条 run 属于**哪个应用**（由它自己的修订反查，`null` = 应用已被删/查不到）。
         //
         // 为什么要有：界面要"**用这套参数再跑一次**"（跳到那个应用的表单并预填），
@@ -1242,7 +1275,12 @@ pub async fn get_run(
         _ => None,
     };
     Ok(Json(
-        serde_json::to_value(Envelope::new(run_response(&run, recipe_id))).unwrap(),
+        serde_json::to_value(Envelope::new(run_response(
+            &run,
+            recipe_id,
+            resolve_connection_label(&state.connections, run.connection_revision_id).await,
+        )))
+        .unwrap(),
     ))
 }
 

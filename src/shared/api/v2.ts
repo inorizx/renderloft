@@ -124,6 +124,9 @@ export interface RunRef {
   sequence: number
   recipeRevisionId: number
   connectionRevisionId: number
+  /** 这条 run 落在哪个账号上（账号池里一个批次会分散到多条连接）。查不到时为 null。 */
+  connectionId?: number | null
+  connectionName?: string | null
   status: string
   trackingState: string
   /**
