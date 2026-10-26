@@ -1,57 +1,45 @@
 //! 出网环境：那些"应用看不见、却决定它能不能连上平台"的事实。
 //!
-//! 目前只有一件事：**代理**。有两个来源，优先级从高到低：
+//! 目前只有一件事：**代理**。来源只有两个，优先级从高到低：
 //!
-//! 1. **环境变量**（`HTTP(S)_PROXY` / `ALL_PROXY`）——reqwest 自己就会读，这个模块只是
-//!    把"它到底配了什么"摊到诊断里；
+//! 1. **环境变量**（`HTTP(S)_PROXY` / `ALL_PROXY`）——跨工具通用的约定，curl / git / npm 都认；
 //! 2. **Windows 的「Internet 选项」系统代理**（注册表 `ProxyEnable` / `ProxyServer` /
 //!    `ProxyOverride`）——reqwest **不读**它。于是「Clash 开着系统代理、没设环境变量」这种
 //!    极常见的机器上，浏览器打不开的站它能打开、而 RenderLoft 连不上平台，界面却只说
 //!    "连接测试失败"。2026-10-26 实测：`ProxyEnable=1 / ProxyServer=127.0.0.1:7897`、
 //!    环境变量全空；直连 `google.com` 超时，走代理 302 ⇒ 缺的就是这一条。
 //!
-//! 为什么 2026-10-12 那轮没做：当时把问题归给"环境里的代理是死的"，只补了诊断。
-//! 那只解释了**反向**的一种（环境变量指向没人监听的端口）；系统代理是**正向**的一种
-//! （代理活着，但我们根本没用它）。
+//! **只读不写**：这里从不修改注册表，也不替用户决定"该不该用代理"——它只是把系统已经
+//! 声明的那条出网路线读出来用。读不到、读不懂（socks / PAC）就当没有，退回直连。
+//!
+//! 两个来源最后都落成**同一份** `ExplicitProxy`，由同一套判据决定每条请求走不走：
+//! 回环永远直连、`NO_PROXY` / `ProxyOverride` 一律生效。**不把环境变量那一半留给 reqwest**：
+//! 装了自定义代理之后它不再自己读环境变量（`auto_sys_proxy` 被关掉），这样"这次用的到底
+//! 是哪个代理"只有一份答案，回环豁免也不会看来源下菜。
 //!
 //! 放在 `v2/` 顶层而不是 application/ 或 infrastructure/：网络错误映射（infrastructure）
 //! 与诊断端点（transports）都要用它，而 `scripts/check-layers.mjs` 不允许 transports
 //! 直接 import infrastructure。
 
-/// 代理从哪来（诊断里要如实报这一格：用户看到"系统代理"才会去查代理软件）。
+/// 代理从哪来。**只用于说人话**（日志与错误括注），不做任何决策。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProxySource {
     Environment,
-    /// `RENDERLOFT_PROXY` 手工指定
-    Manual,
     /// Windows 系统代理（注册表）
     System,
-    /// 明确关掉（`RENDERLOFT_PROXY=off`）
-    Off,
 }
 
 impl ProxySource {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            ProxySource::Environment => "environment",
-            ProxySource::Manual => "manual",
-            ProxySource::System => "system",
-            ProxySource::Off => "off",
-        }
-    }
-
     /// 给中文错误信息/日志用的说法。
     fn label(self) -> &'static str {
         match self {
             ProxySource::Environment => "环境变量",
-            ProxySource::Manual => "手工设置",
             ProxySource::System => "系统代理",
-            ProxySource::Off => "已关闭",
         }
     }
 }
 
-/// 一份显式代理配置（系统代理与手工指定共用同一种形状）。
+/// 一份显式代理配置（目前只有系统代理这一种来源）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ExplicitProxy {
     pub source: ProxySource,
@@ -63,12 +51,15 @@ pub struct ExplicitProxy {
     pub bypass: Vec<String>,
     /// Windows 的 `<local>`：**没有点的主机名**直连（内网短名）
     pub bypass_local: bool,
-    /// 认得出、但这一版不支持的条目（socks / PAC）——诊断里报出来，别让它静默失效
+    /// 认得出、但这一版用不了的条目（socks / PAC）。
+    ///
+    /// 只在"没有可用地址"时进错误括注：让用户知道**我们看见了他的配置**，只是不支持，
+    /// 而不是静默直连、看起来像配置没生效。
     pub unsupported: Vec<String>,
 }
 
 impl ExplicitProxy {
-    /// 空配置。`source` 必须显式给：一个"不知道谁给的"代理没法在诊断里说清楚。
+    /// 空配置。`source` 必须显式给：一个"不知道谁给的"代理没法在错误信息里说清楚。
     pub fn new(source: ProxySource) -> Self {
         Self {
             source,
@@ -81,42 +72,12 @@ impl ExplicitProxy {
         }
     }
 
-    pub fn from_manual(url: &str, no_proxy: &str) -> Self {
-        let (bypass, bypass_local) = split_bypass(no_proxy);
-        Self {
-            source: ProxySource::Manual,
-            all: normalize_proxy_url(url),
-            http: None,
-            https: None,
-            bypass,
-            bypass_local,
-            unsupported: Vec::new(),
-        }
-    }
-
     /// 诊断/日志里显示哪个地址（有一个就够）。
     pub fn display_url(&self) -> Option<&str> {
         self.all
             .as_deref()
             .or(self.https.as_deref())
             .or(self.http.as_deref())
-    }
-
-    /// 这个代理是不是**只住在本机回环上**（Clash / v2rayN 那种 `127.0.0.1:7897`）。
-    ///
-    /// 只用来决定"连不上时该不该提示代理软件没开"：回环代理连不上，九成就是那个进程
-    /// 没在跑；而远程 / 公司代理连不上，原因可能在网络那边，乱猜只会误导。
-    pub fn is_loopback_only(&self) -> bool {
-        let urls = [&self.all, &self.http, &self.https];
-        let mut seen = false;
-        for url in urls.into_iter().flatten() {
-            seen = true;
-            let host = proxy_url_host(url);
-            if !is_loopback(host) {
-                return false;
-            }
-        }
-        seen
     }
 
     /// **这条请求要不要走代理、走哪个**（`None` = 直连）。纯判据，可单测。
@@ -132,35 +93,19 @@ impl ExplicitProxy {
     }
 }
 
-/// 从 `http://user@127.0.0.1:7897/` 这种串里取出主机名（够用就行，不引 URL 解析器：
-/// `outbound` 这一层刻意不依赖 reqwest）。
-fn proxy_url_host(url: &str) -> &str {
-    let rest = url.split_once("://").map(|(_, rest)| rest).unwrap_or(url);
-    let authority = rest.split('/').next().unwrap_or(rest);
-    let authority = authority.rsplit_once('@').map(|(_, host)| host).unwrap_or(authority);
-    if authority.starts_with('[') {
-        // IPv6 字面量：`[::1]:7897`
-        authority.split(']').next().unwrap_or(authority).trim_start_matches('[')
-    } else {
-        authority.split(':').next().unwrap_or(authority)
-    }
-}
-
 /// 这次进程该按哪种方式出网。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ProxyPlan {
-    /// 环境变量里有代理：**交给 reqwest 自己读**（它同时认 `NO_PROXY`，我们不要抢）
-    Environment,
-    /// 装我们自己的代理配置（系统代理 / 手工指定）
+    /// 有代理：由**我们自己的判据**决定每条请求走不走、走哪个
+    /// （回环永远直连、`NO_PROXY` / `ProxyOverride` 一律生效）。
     Explicit(ExplicitProxy),
-    /// 不用代理。`disabled` 区分"没有代理"与"被明确关掉"——诊断里这两件事不一样
-    Off { disabled: bool },
+    /// 不用代理
+    Off,
 }
 
 /// 环境变量的一次快照（抽出来是为了让决定逻辑可测：测试里不能改进程环境）。
 #[derive(Debug, Clone, Default)]
 pub struct EnvironmentView {
-    pub renderloft_proxy: Option<String>,
     pub https_proxy: Option<String>,
     pub http_proxy: Option<String>,
     pub all_proxy: Option<String>,
@@ -176,45 +121,58 @@ impl EnvironmentView {
                 .filter(|value| !value.is_empty())
         };
         Self {
-            renderloft_proxy: read("RENDERLOFT_PROXY"),
             https_proxy: read("HTTPS_PROXY").or_else(|| read("https_proxy")),
             http_proxy: read("HTTP_PROXY").or_else(|| read("http_proxy")),
             all_proxy: read("ALL_PROXY").or_else(|| read("all_proxy")),
             no_proxy: read("NO_PROXY").or_else(|| read("no_proxy")),
         }
     }
+
+    /// 环境变量的代理也落成同一份 `ExplicitProxy`。
+    ///
+    /// 为什么不直接"交给 reqwest 读"（这里踩过）：那样回环豁免就只对系统代理生效——
+    /// 设着 `HTTPS_PROXY` 的机器上，本机 ComfyUI 的请求照样会被交给代理（2026-10-26 实测
+    /// 两条测试因此变红）。**一份判据管所有来源**，回环与 `NO_PROXY` 才不会看来源下菜。
+    ///
+    /// 只给了 `socks://` 时同样返回一个"显式但没有可用地址"的方案：让错误括注能说出
+    /// "环境变量 只给了 socks=…，用不了"，而不是静默直连。
+    pub fn as_proxy(&self) -> Option<ExplicitProxy> {
+        let mut proxy = ExplicitProxy::new(ProxySource::Environment);
+        let mut unsupported = Vec::new();
+        for (label, value, slot) in [
+            ("http", &self.http_proxy, &mut proxy.http),
+            ("https", &self.https_proxy, &mut proxy.https),
+            ("all", &self.all_proxy, &mut proxy.all),
+        ] {
+            let Some(value) = value.as_deref().map(str::trim).filter(|v| !v.is_empty()) else {
+                continue;
+            };
+            match normalize_proxy_url(value) {
+                Some(url) => *slot = Some(url),
+                None => unsupported.push(format!("{label}={value}")),
+            }
+        }
+        if proxy.display_url().is_none() && unsupported.is_empty() {
+            return None;
+        }
+        proxy.unsupported = unsupported;
+        Some(with_no_proxy(proxy, self.no_proxy.as_deref()))
+    }
 }
 
 /// 决定"这次按哪种方式出网"。**纯函数**：环境与系统代理都从参数进来。
 ///
-/// 优先级：`RENDERLOFT_PROXY`（关掉或手工指定）> 环境变量 > 系统代理 > 直连。
-/// 环境变量排在系统代理前面是**不改变既有行为**：今天吃着环境变量的人，装完新版本
-/// 走的还是同一条路（reqwest 读它、认 `NO_PROXY`），只是现在诊断里看得见。
+/// 优先级：环境变量 > 系统代理 > 直连。环境变量排在系统代理前面是**不改变既有行为**：
+/// 今天吃着环境变量的人，升级后走的还是同一条路（只是回环与 `NO_PROXY` 现在真的生效）。
 pub fn plan_from(env: &EnvironmentView, system: Option<ExplicitProxy>) -> ProxyPlan {
-    if let Some(value) = env.renderloft_proxy.as_deref() {
-        let trimmed = value.trim();
-        if trimmed.is_empty() {
-            // 空值等于没设：继续往下判
-        } else if is_off(trimmed) {
-            return ProxyPlan::Off { disabled: true };
-        } else {
-            let manual = ExplicitProxy::from_manual(
-                trimmed,
-                env.no_proxy.as_deref().unwrap_or_default(),
-            );
-            if manual.display_url().is_some() {
-                return ProxyPlan::Explicit(manual);
-            }
-        }
-    }
-    if non_empty(&env.https_proxy) || non_empty(&env.http_proxy) || non_empty(&env.all_proxy) {
-        return ProxyPlan::Environment;
+    if let Some(proxy) = env.as_proxy() {
+        return ProxyPlan::Explicit(proxy);
     }
     match system {
         // 注意：这里**不看有没有地址**。只有 socks / PAC 的系统代理同样会走到这，
-        // 它的价值是"诊断里能说出为什么没生效"，而不是"没有代理"。
+        // 它的价值是"错误信息里能说出为什么没生效"，而不是"没有代理"。
         Some(system) => ProxyPlan::Explicit(with_no_proxy(system, env.no_proxy.as_deref())),
-        None => ProxyPlan::Off { disabled: false },
+        None => ProxyPlan::Off,
     }
 }
 
@@ -233,27 +191,12 @@ fn with_no_proxy(mut proxy: ExplicitProxy, raw: Option<&str>) -> ExplicitProxy {
     proxy
 }
 
-/// 空白值不算"配了代理"（`HTTPS_PROXY=` 这种形态很常见：变量在、但没有值）。
-fn non_empty(value: &Option<String>) -> bool {
-    value
-        .as_deref()
-        .map(str::trim)
-        .is_some_and(|value| !value.is_empty())
-}
-
-fn is_off(value: &str) -> bool {
-    matches!(
-        value.trim().to_ascii_lowercase().as_str(),
-        "off" | "none" | "no" | "0" | "false" | "disable" | "disabled" | "direct"
-    )
-}
-
 /// 当前该用哪种方式出网。**每次都重新算**，不缓存。
 ///
 /// 为什么不缓存（这里踩过）：系统代理是**活的**——用户完全可能先开应用、再开代理软件
-/// （或反过来关掉）。缓存一次的话，界面上写着旧代理、请求也还按旧代理走，用户只能重启。
-/// 浏览器不会这样：系统设置一变，下一次请求就跟上了。一次解析 = 两三次注册表读取
-/// （几十微秒），对比一次网络请求可以忽略。
+/// （或反过来关掉）。缓存一次的话，请求还按旧代理走，用户只能重启。浏览器不会这样：
+/// 系统设置一变，下一次请求就跟上了。一次解析 = 两三次注册表读取（几十微秒），
+/// 对比一次网络请求可以忽略。
 pub fn resolve() -> ProxyPlan {
     plan_from(&EnvironmentView::current(), system_proxy())
 }
@@ -263,10 +206,10 @@ pub fn resolve() -> ProxyPlan {
 pub fn system_proxy() -> Option<ExplicitProxy> {
     let enabled = registry::read_dword("ProxyEnable").unwrap_or(0);
     if enabled == 0 {
-        // PAC（自动配置脚本）我们不会去执行它——认得出就报出来，别假装没有。
+        // PAC（自动配置脚本）不会去执行它——认得出就记一笔，别假装没有。
         if registry::read_string("AutoConfigURL").is_some() {
             let mut proxy = ExplicitProxy::new(ProxySource::System);
-            proxy.unsupported.push("pac".to_string());
+            proxy.unsupported.push("PAC".to_string());
             return Some(proxy);
         }
         return None;
@@ -374,7 +317,7 @@ mod registry {
 ///
 /// `ProxyServer` 两种写法都真实存在：
 /// * `127.0.0.1:7897` —— 所有协议一个口；
-/// * `http=127.0.0.1:7897;https=127.0.0.1:7897` —— 分协议（`socks=` 我们这一版不支持）。
+/// * `http=127.0.0.1:7897;https=127.0.0.1:7897` —— 分协议（`socks=` 这一版用不了）。
 pub fn parse_registry_proxy(server: &str, override_list: &str) -> ExplicitProxy {
     let (bypass, bypass_local) = split_bypass(override_list);
     let mut proxy = ExplicitProxy::new(ProxySource::System);
@@ -395,8 +338,6 @@ pub fn parse_registry_proxy(server: &str, override_list: &str) -> ExplicitProxy 
                 "http" => proxy.http = normalize_proxy_url(value),
                 "https" => proxy.https = normalize_proxy_url(value),
                 // reqwest 没有启用 socks 特性；认出来是为了**说出来**，而不是静默直连。
-                // 形状保持 ASCII（`socks=host:port`）：它同时进日志与诊断接口，
-                // 界面那边据此翻成中/英，中文句子不该从后端的 `details` 里漏出去。
                 "socks" | "socks4" | "socks4a" | "socks5" | "socks5h" | "ftp" => {
                     proxy.unsupported.push(format!("{scheme}={value}"))
                 }
@@ -409,7 +350,7 @@ pub fn parse_registry_proxy(server: &str, override_list: &str) -> ExplicitProxy 
     proxy
 }
 
-/// 补上协议、去掉尾部斜杠；`socks*` 这种我们这一版用不了，返回 `None` 并交给调用方记账。
+/// 补上协议、去掉尾部斜杠；`socks*` 这种用不了，返回 `None` 并交给调用方记账。
 fn normalize_proxy_url(value: &str) -> Option<String> {
     let value = value.trim();
     if value.is_empty() {
@@ -487,7 +428,6 @@ fn is_loopback(host: &str) -> bool {
         .is_ok_and(|address| address.is_loopback())
 }
 
-
 /// 通配匹配（只认 `*`）。`*.example.com` 也匹配裸域 `example.com`——**人的直觉优先于
 /// WinINET 的字面语义**，而且"我明明写了绕过它却还是走了代理"比"多绕过了一台"更糟。
 fn pattern_matches(host: &str, pattern: &str) -> bool {
@@ -534,51 +474,14 @@ fn glob_match(text: &str, pattern: &str) -> bool {
     pi == pattern.len()
 }
 
-// ---------- 给诊断 / 错误信息用的三小块 ----------
+// ---------- 给诊断 / 错误信息用的两小块 ----------
 
-/// 诊断里"出网代理"那一格：**实际会用的那个**（环境变量优先，其次系统代理）。
+/// 诊断里"出网代理"那一格：**实际会用的那个**（有就报，没有就是直连）。
 pub fn configured_proxy() -> Option<String> {
     match resolve() {
         ProxyPlan::Explicit(proxy) => proxy.display_url().map(str::to_string),
-        ProxyPlan::Environment => environment_proxy(),
-        ProxyPlan::Off { .. } => None,
+        ProxyPlan::Off => None,
     }
-}
-
-/// "这个代理是谁给的"：`environment` / `manual` / `system` / `off` / `none`。
-pub fn proxy_source() -> &'static str {
-    match resolve() {
-        ProxyPlan::Environment => ProxySource::Environment.as_str(),
-        ProxyPlan::Explicit(proxy) => proxy.source.as_str(),
-        ProxyPlan::Off { disabled: true } => ProxySource::Off.as_str(),
-        ProxyPlan::Off { disabled: false } => "none",
-    }
-}
-
-/// 认得出但这一版不支持的代理形态（socks / PAC）——诊断里如实报，别让它静默失效。
-pub fn unsupported_proxy_entries() -> Vec<String> {
-    match resolve() {
-        ProxyPlan::Explicit(proxy) => proxy.unsupported,
-        _ => Vec::new(),
-    }
-}
-
-/// 环境里实际配着的出网代理（按 reqwest 认的键取第一个非空值）。
-///
-/// 这是**事实陈述**而不是"本次请求用的代理"：真正用哪个还取决于协议与 `NO_PROXY`。
-pub fn environment_proxy() -> Option<String> {
-    const KEYS: [&str; 6] = [
-        "HTTPS_PROXY",
-        "https_proxy",
-        "HTTP_PROXY",
-        "http_proxy",
-        "ALL_PROXY",
-        "all_proxy",
-    ];
-    KEYS.iter()
-        .filter_map(|key| std::env::var(key).ok())
-        .map(|value| value.trim().to_string())
-        .find(|value| !value.is_empty())
 }
 
 /// 给日志用的一句话：谁给的代理、地址、绕开了几条。
@@ -586,10 +489,6 @@ pub fn environment_proxy() -> Option<String> {
 /// 与 `proxy_suffix()` 分开：括注要短（它跟在错误信息后面），日志要全（出问题第一眼看它）。
 pub fn describe() -> String {
     match resolve() {
-        ProxyPlan::Environment => match environment_proxy() {
-            Some(url) => format!("{} {url}", ProxySource::Environment.label()),
-            None => "无（直连）".to_string(),
-        },
         ProxyPlan::Explicit(proxy) => {
             let mut text = match proxy.display_url() {
                 Some(url) => format!("{} {url}", proxy.source.label()),
@@ -602,43 +501,28 @@ pub fn describe() -> String {
                 text.push_str("，含 <local>");
             }
             if !proxy.unsupported.is_empty() {
-                text.push_str(&format!("；不支持：{}", proxy.unsupported.join("；")));
+                text.push_str(&format!("；用不了：{}", proxy.unsupported.join("；")));
             }
             text
         }
-        ProxyPlan::Off { disabled: true } => "已关闭（RENDERLOFT_PROXY）".to_string(),
-        ProxyPlan::Off { disabled: false } => "无（直连）".to_string(),
-    }
-}
-
-/// 连不上时追加的一句**可操作**提示（只在用本机回环代理时才给）。
-///
-/// 浏览器在代理连不上时给的是专门的错误页（"检查代理服务器、防火墙"），而不是一句
-/// "无法访问此网站"；这条是同一用意的本地版本。措辞是**条件句**而不是断言——我们只知道
-/// "配着回环代理 + 这次连不上"，不知道到底是代理软件没开还是平台挂了。
-pub fn local_proxy_hint() -> String {
-    match resolve() {
-        ProxyPlan::Explicit(proxy) if proxy.is_loopback_only() => format!(
-            "（如果代理软件没在跑，请求会停在 {} 这一跳：关掉系统代理，或设 RENDERLOFT_PROXY=off 后重启）",
-            proxy.display_url().unwrap_or("本地代理")
-        ),
-        _ => String::new(),
+        ProxyPlan::Off => "无（直连）".to_string(),
     }
 }
 
 /// 给错误信息用的一小段括注；没有代理时是空串（不给自己加戏）。
 ///
 /// 带上来源是刻意的：用户看到"系统代理"会去关代理软件，看到"环境变量"会去查 shell。
+/// 系统代理只给了 socks / PAC 时也说话——否则就是"配置明明在，却静默失效"。
 pub fn proxy_suffix() -> String {
     match resolve() {
-        ProxyPlan::Off { disabled: true } => "（出网代理已关闭）".to_string(),
-        ProxyPlan::Off { disabled: false } => String::new(),
-        ProxyPlan::Environment => match environment_proxy() {
-            Some(proxy) => format!("（出网代理 {proxy} · {}）", ProxySource::Environment.label()),
-            None => String::new(),
-        },
+        ProxyPlan::Off => String::new(),
         ProxyPlan::Explicit(proxy) => match proxy.display_url() {
             Some(url) => format!("（出网代理 {url} · {}）", proxy.source.label()),
+            None if !proxy.unsupported.is_empty() => format!(
+                "（{} 只给了 {}，用不了）",
+                proxy.source.label(),
+                proxy.unsupported.join("、")
+            ),
             None => String::new(),
         },
     }
@@ -662,16 +546,19 @@ mod tests {
             !proxy.bypass.iter().any(|item| item == "<local>"),
             "`<local>` 不能留在模式表里（它匹配不到任何主机名）"
         );
-        assert_eq!(proxy.proxy_for("https", "www.runninghub.cn"), Some("http://127.0.0.1:7897"));
-        assert_eq!(proxy.proxy_for("http", "www.runninghub.cn"), Some("http://127.0.0.1:7897"));
+        assert_eq!(
+            proxy.proxy_for("https", "www.runninghub.cn"),
+            Some("http://127.0.0.1:7897")
+        );
+        assert_eq!(
+            proxy.proxy_for("http", "www.runninghub.cn"),
+            Some("http://127.0.0.1:7897")
+        );
     }
 
     #[test]
     fn a_keyed_registry_server_splits_by_scheme() {
-        let proxy = parse_registry_proxy(
-            "http=127.0.0.1:7890;https=127.0.0.1:7891",
-            "localhost",
-        );
+        let proxy = parse_registry_proxy("http=127.0.0.1:7890;https=127.0.0.1:7891", "localhost");
         assert_eq!(proxy.http.as_deref(), Some("http://127.0.0.1:7890"));
         assert_eq!(proxy.https.as_deref(), Some("http://127.0.0.1:7891"));
         assert_eq!(proxy.all, None, "分协议写法不该再有一个 all");
@@ -687,11 +574,56 @@ mod tests {
         let proxy = parse_registry_proxy("socks=127.0.0.1:1080", "");
         assert_eq!(proxy.display_url(), None);
         assert!(
-            proxy.unsupported.iter().any(|item| item.contains("socks=127.0.0.1:1080")),
+            proxy
+                .unsupported
+                .iter()
+                .any(|item| item.contains("socks=127.0.0.1:1080")),
             "socks 必须进 unsupported：{:?}",
             proxy.unsupported
         );
         assert_eq!(proxy.proxy_for("https", "a.com"), None);
+    }
+
+    /// 只有 socks 的系统代理：方案是"显式但没地址"，错误括注要说清是它用不了。
+    ///
+    /// 这条只走纯函数，不碰本机注册表——判据是括注的**形状**，不是这台机器开没开代理。
+    #[test]
+    fn a_socks_only_system_proxy_explains_itself_in_the_error_suffix() {
+        let system = parse_registry_proxy("socks=127.0.0.1:1080", "");
+        let plan = plan_from(&EnvironmentView::default(), Some(system));
+        match &plan {
+            ProxyPlan::Explicit(proxy) => assert!(proxy.display_url().is_none()),
+            other => panic!("应当是显式但无地址，实际 {other:?}"),
+        }
+        let text = match plan {
+            ProxyPlan::Explicit(proxy) => format!(
+                "（{} 只给了 {}，用不了）",
+                proxy.source.label(),
+                proxy.unsupported.join("、")
+            ),
+            other => panic!("应当是显式方案，实际 {other:?}"),
+        };
+        assert_eq!(text, "（系统代理 只给了 socks=127.0.0.1:1080，用不了）");
+    }
+
+    /// 环境变量只给了 `socks://`：同样是"显式但没有可用地址"，错误括注要说明。
+    #[test]
+    fn a_socks_only_environment_proxy_explains_itself_too() {
+        let env = EnvironmentView {
+            all_proxy: Some("socks5://127.0.0.1:1080".to_string()),
+            ..Default::default()
+        };
+        match plan_from(&env, None) {
+            ProxyPlan::Explicit(proxy) => {
+                assert_eq!(proxy.source, ProxySource::Environment);
+                assert!(proxy.display_url().is_none());
+                assert_eq!(
+                    proxy.unsupported,
+                    vec!["all=socks5://127.0.0.1:1080".to_string()]
+                );
+            }
+            other => panic!("应当报出来而不是静默直连，实际 {other:?}"),
+        }
     }
 
     #[test]
@@ -709,14 +641,7 @@ mod tests {
     /// 负对照：把 `is_loopback` 换成"回环 + 私有网段"，下面第二条断言就红。
     #[test]
     fn only_loopback_bypasses_without_a_pattern() {
-        for host in [
-            "127.0.0.1",
-            "127.1.2.3",
-            "localhost",
-            "LOCALHOST",
-            "::1",
-            "[::1]",
-        ] {
+        for host in ["127.0.0.1", "127.1.2.3", "localhost", "LOCALHOST", "::1", "[::1]"] {
             assert!(bypasses(host, &[], false), "回环必须直连：{host}");
         }
         for host in [
@@ -747,43 +672,11 @@ mod tests {
         );
     }
 
-    /// 本机回环代理的识别：**只有回环**才算（远程/公司代理不猜）。
-    ///
-    /// 负对照：把 `is_loopback` 换成"只要有地址就算" ⇒ 第二条断言红。
-    #[test]
-    fn only_a_loopback_proxy_counts_as_a_local_one() {
-        let local = parse_registry_proxy("127.0.0.1:7897", "");
-        assert!(local.is_loopback_only(), "127.0.0.1 是本地代理");
-
-        let remote = parse_registry_proxy("http=10.0.0.9:8080;https=proxy.corp.example:8080", "");
-        assert!(!remote.is_loopback_only(), "远程/公司代理不能被当成'本地没开'");
-
-        let mixed = parse_registry_proxy("http=127.0.0.1:7890;https=proxy.corp.example:8080", "");
-        assert!(!mixed.is_loopback_only(), "只要有一段不是回环，就不能下那个结论");
-
-        let mut v6 = ExplicitProxy::new(ProxySource::System);
-        v6.all = Some("http://[::1]:7897".to_string());
-        assert!(v6.is_loopback_only(), "IPv6 字面量也要认");
-    }
-
-    /// 提示只在该出现的时候出现。
-    ///
-    /// 这里**不锁具体值**（取决于这台机器开没开代理）：只锁"要么空、要么是那句条件句"。
-    #[test]
-    fn the_local_proxy_hint_is_a_conditional_sentence_or_nothing() {
-        let hint = local_proxy_hint();
-        assert!(
-            hint.is_empty()
-                || (hint.starts_with("（如果代理软件没在跑") && hint.ends_with('）')),
-            "实际：{hint}"
-        );
-    }
-
     /// 环境里的 `NO_PROXY` 要并进系统代理的绕过表。
     ///
     /// 为什么：`NO_PROXY` 是**跨工具通用**的约定（curl / git / npm 都认），而 Windows 的
     /// `ProxyOverride` 只管得到用它自己那份配置的应用。用户写了一份"这些别走代理"，
-    /// 不该因为"我们这次读的是注册表"就失效。
+    /// 不该因为"我们这次读的是注册表"而失效。
     #[test]
     fn no_proxy_is_merged_into_the_system_bypass_list() {
         let system = parse_registry_proxy(REAL_SERVER, "localhost");
@@ -822,7 +715,10 @@ mod tests {
         assert!(bypasses("exact.test", &patterns, false));
         assert!(bypasses("172.16.9.9", &patterns, false));
         assert!(!bypasses("notexample.com", &patterns, false));
-        assert!(!bypasses("exact.test.evil.com", &patterns, false), "精确名不该变成后缀匹配");
+        assert!(
+            !bypasses("exact.test.evil.com", &patterns, false),
+            "精确名不该变成后缀匹配"
+        );
     }
 
     #[test]
@@ -832,52 +728,56 @@ mod tests {
         assert!(!bypasses("gpu-box.home.arpa", &[], true), "带点的不是内网短名");
     }
 
+    /// 环境变量优先于系统代理，**并且回环豁免对它同样生效**。
+    ///
+    /// 后半句是 2026-10-26 那次修复的核心：以前环境变量这一半交给 reqwest 自己读，
+    /// 于是"设着 HTTPS_PROXY 的机器上，本机 ComfyUI 也被交给代理"。现在两个来源落成
+    /// 同一份判据，回环不看来源下菜。
     #[test]
-    fn environment_proxy_wins_over_the_system_proxy() {
+    fn environment_proxy_wins_and_still_bypasses_loopback() {
         let env = EnvironmentView {
             https_proxy: Some("http://env-proxy:8080".to_string()),
+            no_proxy: Some("*.internal".to_string()),
             ..Default::default()
         };
         let system = Some(parse_registry_proxy(REAL_SERVER, REAL_OVERRIDE));
-        assert_eq!(plan_from(&env, system), ProxyPlan::Environment);
-    }
-
-    #[test]
-    fn a_manual_override_beats_everything() {
-        let env = EnvironmentView {
-            renderloft_proxy: Some("http://manual:1234".to_string()),
-            https_proxy: Some("http://env-proxy:8080".to_string()),
-            no_proxy: Some("localhost,*.internal".to_string()),
-            ..Default::default()
-        };
-        let plan = plan_from(&env, Some(parse_registry_proxy(REAL_SERVER, REAL_OVERRIDE)));
-        match plan {
+        match plan_from(&env, system) {
             ProxyPlan::Explicit(proxy) => {
-                assert_eq!(proxy.source, ProxySource::Manual);
-                assert_eq!(proxy.display_url(), Some("http://manual:1234"));
-                assert!(
-                    proxy.proxy_for("https", "api.internal").is_none(),
-                    "手工指定时 NO_PROXY 也要生效"
+                assert_eq!(proxy.source, ProxySource::Environment);
+                assert_eq!(proxy.proxy_for("https", "www.runninghub.cn"), Some("http://env-proxy:8080"));
+                assert_eq!(
+                    proxy.proxy_for("https", "127.0.0.1"),
+                    None,
+                    "环境变量代理也不能把回环带走——本机 ComfyUI 就在那儿"
+                );
+                assert_eq!(
+                    proxy.proxy_for("https", "api.internal"),
+                    None,
+                    "环境变量里的 NO_PROXY 必须生效"
                 );
             }
-            other => panic!("应当是手工代理，实际 {other:?}"),
+            other => panic!("应当是环境变量代理，实际 {other:?}"),
+        }
+    }
+
+    /// 只给了 `ALL_PROXY` 时所有协议都走它（curl 的语义）。
+    #[test]
+    fn all_proxy_covers_every_scheme() {        let env = EnvironmentView {
+            all_proxy: Some("127.0.0.1:7897".to_string()),
+            ..Default::default()
+        };
+        match plan_from(&env, None) {
+            ProxyPlan::Explicit(proxy) => {
+                assert_eq!(proxy.proxy_for("http", "a.com"), Some("http://127.0.0.1:7897"));
+                assert_eq!(proxy.proxy_for("https", "a.com"), Some("http://127.0.0.1:7897"));
+            }
+            other => panic!("应当是环境变量代理，实际 {other:?}"),
         }
     }
 
     #[test]
-    fn off_switch_disables_the_environment_proxy_too() {
-        let env = EnvironmentView {
-            renderloft_proxy: Some("off".to_string()),
-            https_proxy: Some("http://env-proxy:8080".to_string()),
-            ..Default::default()
-        };
-        assert_eq!(plan_from(&env, None), ProxyPlan::Off { disabled: true });
-    }
-
-    #[test]
     fn without_any_proxy_the_plan_is_direct() {
-        let plan = plan_from(&EnvironmentView::default(), None);
-        assert_eq!(plan, ProxyPlan::Off { disabled: false });
+        assert_eq!(plan_from(&EnvironmentView::default(), None), ProxyPlan::Off);
     }
 
     #[test]
@@ -892,7 +792,7 @@ mod tests {
         }
     }
 
-    /// 括注只有两种形态：空串，或者"（出网代理 … · 来源）"。
+    /// 括注只有三种形态：空串、"（出网代理 … · 来源）"、"（系统代理 只给了 …，用不了）"。
     ///
     /// 这里**故意不 set_var**：环境变量是进程级的、测试是并行跑的，改了会让别的用例看到
     /// 假事实（本仓库至今没有一处测试这么干，别开这个头）。所以只锁形态，不锁具体值。
@@ -901,14 +801,14 @@ mod tests {
         let suffix = proxy_suffix();
         assert!(
             suffix.is_empty()
-                || suffix == "（出网代理已关闭）"
-                || (suffix.starts_with("（出网代理 ") && suffix.ends_with('）')),
+                || (suffix.starts_with("（出网代理 ") && suffix.ends_with('）'))
+                || (suffix.starts_with("（系统代理 只给了 ") && suffix.ends_with("，用不了）")),
             "实际：{suffix}"
         );
         match configured_proxy() {
             Some(proxy) => assert!(suffix.contains(&proxy), "括注里必须有那个地址：{suffix}"),
             None => assert!(
-                suffix.is_empty() || suffix == "（出网代理已关闭）",
+                suffix.is_empty() || suffix.starts_with("（系统代理 只给了 "),
                 "没有地址时不该报地址：{suffix}"
             ),
         }
@@ -928,7 +828,7 @@ mod tests {
             https_proxy: Some("   ".to_string()),
             ..Default::default()
         };
-        assert_eq!(plan_from(&env, None), ProxyPlan::Off { disabled: false });
+        assert_eq!(plan_from(&env, None), ProxyPlan::Off);
         let system = Some(parse_registry_proxy(REAL_SERVER, REAL_OVERRIDE));
         assert!(
             matches!(plan_from(&env, system), ProxyPlan::Explicit(_)),

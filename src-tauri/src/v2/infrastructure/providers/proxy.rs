@@ -16,44 +16,28 @@ use std::sync::OnceLock;
 /// 建一个**认代理**的客户端 builder。
 pub fn configure(builder: reqwest::ClientBuilder) -> reqwest::ClientBuilder {
     log_once();
-    apply_with(builder, &crate::v2::outbound::resolve(), crate::v2::outbound::resolve)
+    apply_with(builder, crate::v2::outbound::resolve)
 }
 
-/// 装上某个方案。`resolver` 让判据能单测：真实路径传 `outbound::resolve`，
-/// 测试传一个"随时会变"的闭包。
-pub fn apply(builder: reqwest::ClientBuilder, plan: &ProxyPlan) -> reqwest::ClientBuilder {
-    apply_with(builder, plan, crate::v2::outbound::resolve)
-}
-
-pub fn apply_with<F>(
-    builder: reqwest::ClientBuilder,
-    plan: &ProxyPlan,
-    resolver: F,
-) -> reqwest::ClientBuilder
+/// 装上"**每一次请求都重新问一次**"的代理判据。
+///
+/// 用闭包而不是建客户端时算一次：系统代理是活的（用户很可能先开应用、后开代理软件），
+/// 浏览器改完设置下一次请求就跟上，我们也一样。
+///
+/// 而且**装了自定义代理之后 reqwest 就不再读环境变量**（`auto_sys_proxy` 被关掉）——
+/// 这正是我们要的：环境变量由 `outbound` 自己解析，和系统代理合成**同一份**判据，
+/// "这次用的哪个代理"只有一份答案。没有代理时闭包返回 `None`，那就是真直连。
+/// `resolver` 让判据能单测：真实路径传 `outbound::resolve`，测试传一个"随时会变"的闭包。
+pub fn apply_with<F>(builder: reqwest::ClientBuilder, resolver: F) -> reqwest::ClientBuilder
 where
     F: Fn() -> ProxyPlan + Send + Sync + 'static,
 {
-    match plan {
-        // 交给 reqwest：环境变量代理（连同 `NO_PROXY`）由它自己处理。进程环境不会中途变，
-        // 所以这里没有"动态"的必要；插一脚反而会丢掉它认识的写法。
-        ProxyPlan::Environment => builder,
-        // `no_proxy()` 会**连环境变量里的代理一起压掉**——这是 `RENDERLOFT_PROXY=off`
-        // 能救回"环境里有个死代理"那种现场的机制，必须是个静态决定。
-        ProxyPlan::Off { disabled: true } => builder.no_proxy(),
-        // 其余（系统代理 / 手工指定 / 暂时没有代理）都装同一个动态闭包：
-        // 没有代理时它返回 `None`，而**装了自定义代理之后 reqwest 就不再读环境变量**
-        // （`client.rs` 里 `auto_sys_proxy` 被关掉），所以"返回 None"是**真直连**，
-        // 不会偷偷回落到环境变量里的那个死代理。
-        _ => builder.proxy(reqwest::Proxy::custom(move |url| {
-            let plan = resolver();
-            match plan {
-                ProxyPlan::Explicit(proxy) => proxy
-                    .proxy_for(url.scheme(), url.host_str().unwrap_or_default())
-                    .map(str::to_string),
-                _ => None,
-            }
-        })),
-    }
+    builder.proxy(reqwest::Proxy::custom(move |url| match resolver() {
+        ProxyPlan::Explicit(proxy) => proxy
+            .proxy_for(url.scheme(), url.host_str().unwrap_or_default())
+            .map(str::to_string),
+        ProxyPlan::Off => None,
+    }))
 }
 
 /// 第一次建客户端时打一行"它到底走了哪条路"。
@@ -131,7 +115,7 @@ mod tests {
         let (proxy_url, handle) = fake_proxy();
         let plan = plan_with(ProxySource::System, proxy_url);
         let resolver = plan.clone();
-        let client = apply_with(reqwest::Client::builder(), &plan, move || resolver.clone())
+        let client = apply_with(reqwest::Client::builder(), move || resolver.clone())
             .build()
             .expect("建客户端");
         let response = client
@@ -147,14 +131,11 @@ mod tests {
             "绝对形式的 URI 说明它发给了代理，实际：{request}"
         );
 
-        // ② 明确关掉 ⇒ 同一个地址不会打到代理（`example.invalid` 按 RFC 2606 不该被解析）。
+        // ② 没有代理 ⇒ 同一个地址不会打到代理（`example.invalid` 按 RFC 2606 不该被解析）。
         let (_proxy_url, handle) = fake_proxy();
-        let client = apply(
-            reqwest::Client::builder(),
-            &ProxyPlan::Off { disabled: true },
-        )
-        .build()
-        .expect("建客户端");
+        let client = apply_with(reqwest::Client::builder(), || ProxyPlan::Off)
+            .build()
+            .expect("建客户端");
         let _ = client
             .get("http://example.invalid/probe")
             .timeout(Duration::from_secs(2))
@@ -162,7 +143,7 @@ mod tests {
             .await;
         assert!(
             handle.join().expect("代理线程").is_none(),
-            "关掉代理之后不该有任何连接打到代理"
+            "没有代理时不该有任何连接打到代理"
         );
     }
 
@@ -178,20 +159,14 @@ mod tests {
     #[tokio::test]
     async fn a_proxy_that_appears_later_is_picked_up_without_rebuilding() {
         let (proxy_url, handle) = fake_proxy();
-        let current = std::sync::Arc::new(std::sync::Mutex::new(ProxyPlan::Off {
-            disabled: false,
-        }));
+        let current = std::sync::Arc::new(std::sync::Mutex::new(ProxyPlan::Off));
         let resolver = {
             let current = current.clone();
             move || current.lock().unwrap().clone()
         };
-        let client = apply_with(
-            reqwest::Client::builder(),
-            &ProxyPlan::Off { disabled: false },
-            resolver,
-        )
-        .build()
-        .expect("建客户端");
+        let client = apply_with(reqwest::Client::builder(), resolver)
+            .build()
+            .expect("建客户端");
 
         // ① 代理还没开：这次请求走直连（`example.invalid` 解析不了，失败也算过关）。
         let _ = client
@@ -283,7 +258,7 @@ mod tests {
 
         let plan = plan_with(ProxySource::System, proxy_url);
         let resolver = plan.clone();
-        let client = apply_with(reqwest::Client::builder(), &plan, move || resolver.clone())
+        let client = apply_with(reqwest::Client::builder(), move || resolver.clone())
             .build()
             .expect("建客户端");
         let response = client

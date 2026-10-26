@@ -347,15 +347,6 @@ const messages = {
     'settings.apiKeyConfigured': 'API Key 已配置',
     'settings.outboundProxy': '出网代理',
     /*
-     * 代理的**来源**：光报地址不够。看到"系统代理"会去关代理软件，看到"环境变量"会去查
-     * shell——两件事的下一步动作完全不同。
-     */
-    'settings.proxySourceSystem': '系统代理',
-    'settings.proxySourceEnvironment': '环境变量',
-    'settings.proxySourceManual': '手工设置',
-    'settings.proxySourceSuffix': '（{source}）',
-    'settings.outboundProxyUnsupported': '用不了（这一版只支持 http/https）',
-    /*
      * 运行参数：这一块的存在理由只有一个——**出问题时用户能自己改**。
      * 所以每一条都必须回答三件事：叫什么、现在生效的值是什么、**改哪个变量**。
      * 只说"值是什么"等于没帮上忙（这些值本来就是 daemon 自己算的）。
@@ -371,8 +362,6 @@ const messages = {
     'settings.runtimeUiOriginEmpty': '（未设置：使用程序自带的界面）',
     'settings.runtimeDistDir': '界面资源目录',
     'settings.runtimeOutboundProxyEmpty': '（未设置：直连）',
-    'settings.runtimeOutboundProxyOff': '（已关闭：RENDERLOFT_PROXY=off）',
-    'settings.runtimeOutboundProxySystemUnusable': '（系统代理不可用：只支持 http/https）',
     'settings.defaultRequestTimeout': '默认请求超时',
     'settings.defaultTrackingDeadline': '默认跟踪上限',
     'settings.secondsValue': '{value} 秒',
@@ -1229,11 +1218,6 @@ const messages = {
     'settings.serviceHost': 'Service host',
     'settings.apiKeyConfigured': 'API key configured',
     'settings.outboundProxy': 'Outbound proxy',
-    'settings.proxySourceSystem': 'system proxy',
-    'settings.proxySourceEnvironment': 'environment',
-    'settings.proxySourceManual': 'manual',
-    'settings.proxySourceSuffix': ' ({source})',
-    'settings.outboundProxyUnsupported': 'unsupported (this build only does http/https)',
     'settings.runtimeParams': 'Runtime parameters',
     'settings.runtimeParamsHint':
       'These are the values the daemon is actually using (from environment variables or program location). When something breaks, set the variable in the "Change it here" column and restart the daemon.',
@@ -1245,9 +1229,6 @@ const messages = {
     'settings.runtimeUiOriginEmpty': '(unset: the bundled UI)',
     'settings.runtimeDistDir': 'UI asset directory',
     'settings.runtimeOutboundProxyEmpty': '(unset: direct connection)',
-    'settings.runtimeOutboundProxyOff': '(disabled: RENDERLOFT_PROXY=off)',
-    'settings.runtimeOutboundProxySystemUnusable':
-      '(system proxy unusable: only http/https is supported)',
     'settings.defaultRequestTimeout': 'Default request timeout',
     'settings.defaultTrackingDeadline': 'Default tracking limit',
     'settings.secondsValue': '{value} s',

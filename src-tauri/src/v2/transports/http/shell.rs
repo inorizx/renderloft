@@ -111,13 +111,9 @@ pub async fn diagnostics(
         "apiKeyConfigured": api_key_configured,
         // 出网代理：reqwest 默认会用它，而它在界面上是**看不见**的——代理软件关掉之后
         // 应用表现为"连不上平台 / key 好像坏了"。把它写进诊断，这类问题一眼可见。
-        //
-        // 三格分开报：地址、**是谁给的**（`system` 会让人去关代理软件，`environment`
-        // 会让人去查 shell）、以及认得出但这一版用不了的形态（socks / PAC ——
-        // 静默退回直连是最坏的一种"看起来正常"）。
+        // 只报**实际会用的那个地址**；来源与用不了的形态由错误信息里的括注负责，
+        // 不再多开两格（没有消费方，多一格就是一份要跟着改的契约）。
         "outboundProxy": crate::v2::outbound::configured_proxy(),
-        "outboundProxySource": crate::v2::outbound::proxy_source(),
-        "outboundProxyUnsupported": crate::v2::outbound::unsupported_proxy_entries(),
         // **当前生效的运行参数**：这些值全都来自环境变量或 exe 位置，因此"出问题时能不能
         // 自己改"完全取决于它们**看不看得见**——只写在 NEXT.md（维护者文件）里等于没有。
         // 判据是"报**服务实际用的那个值**"，所以取的是 `v2::environment`（所有者），

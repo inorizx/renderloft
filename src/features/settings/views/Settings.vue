@@ -252,44 +252,15 @@ const formatRelative = (millis: number): string => {
 /**
  * 出网代理：它是"连不上平台 / key 好像坏了"的常见原因，而它**默认是不可见的**。
  *
- * 2026-10-26 起 daemon 自己读 Windows 系统代理（reqwest 不读），所以这一格要回答
- * **两件事**：用的是哪个地址、**这个代理是谁给的**——看到"系统代理"会去关代理软件，
- * 看到"环境变量"会去查 shell。只报地址等于让人继续猜。
+ * 2026-10-26 起 daemon 自己读 Windows 系统代理（reqwest 不读）。界面**不为它单开一行**：
+ * 它是环境的事，不是一个可以在设置页里调的参数。这里只留一份文本，供"复制诊断"用——
+ * 出问题时贴给别人的那一段里，它往往才是决定性的那一句。
  *
  * 没配时显示**空态的含义**（"未设置：直连"），而不是留一格空白——空白看起来像"读不到"。
  */
-const proxySourceLabelOf = (source: DiagnosticInfo['outboundProxySource']) => {
-  switch (source) {
-    case 'system':
-      return t('settings.proxySourceSystem')
-    case 'environment':
-      return t('settings.proxySourceEnvironment')
-    case 'manual':
-      return t('settings.proxySourceManual')
-    default:
-      return ''
-  }
-}
-/**
- * 把诊断里的三格拼成一句人话。**纯函数**：复制诊断那一路拿的是刚拉下来的那一份，
- * 走的是同一段逻辑——否则"界面上写 X、复制出来是 Y"。
- */
-const describeProxy = (info: DiagnosticInfo | undefined): string => {
-  if (!info) return ''
-  const label = proxySourceLabelOf(info.outboundProxySource)
-  if (info.outboundProxy) {
-    return label
-      ? `${info.outboundProxy}${t('settings.proxySourceSuffix', { source: label })}`
-      : info.outboundProxy
-  }
-  // 有代理配置、却没有可用地址：只有 `socks` / PAC 这种我们这一版用不了的形态。
-  if (info.outboundProxySource === 'off') return t('settings.runtimeOutboundProxyOff')
-  if (info.outboundProxySource === 'system') {
-    return t('settings.runtimeOutboundProxySystemUnusable')
-  }
-  return t('settings.runtimeOutboundProxyEmpty')
-}
-const outboundProxyText = computed(() => describeProxy(diagnostics.value))
+const outboundProxyText = computed(
+  () => diagnostics.value?.outboundProxy ?? t('settings.runtimeOutboundProxyEmpty')
+)
 /**
  * 运行参数那张表：每行 = 叫什么 / 现在是什么 / **改哪个变量**。
  *
@@ -313,12 +284,7 @@ const runtimeRows = computed(() => {
       value: current.uiOrigin ?? t('settings.runtimeUiOriginEmpty'),
       where: 'RENDERLOFT_UI_ORIGIN'
     },
-    { label: t('settings.runtimeDistDir'), value: current.distDir, where: 'RENDERLOFT_DIST' },
-    {
-      label: t('settings.outboundProxy'),
-      value: outboundProxyText.value,
-      where: 'RENDERLOFT_PROXY / HTTP(S)_PROXY'
-    }
+    { label: t('settings.runtimeDistDir'), value: current.distDir, where: 'RENDERLOFT_DIST' }
   ]
   return rows
 })
@@ -371,11 +337,7 @@ const handleCopyDiagnostics = async () => {
             `${t('settings.runtimeDistDir')}: ${loaded.runtime.distDir}`
           ]
         : []),
-      `${t('settings.outboundProxy')}: ${describeProxy(loaded)}${
-        (loaded.outboundProxyUnsupported ?? []).length
-          ? ` / ${t('settings.outboundProxyUnsupported')}: ${(loaded.outboundProxyUnsupported ?? []).join('、')}`
-          : ''
-      }`
+      `${t('settings.outboundProxy')}: ${outboundProxyText.value}`
     ].join('\n')
     await navigator.clipboard.writeText(text)
     appStore.showNotification('success', t('settings.diagnosticsCopied'))
