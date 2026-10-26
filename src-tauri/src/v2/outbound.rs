@@ -102,6 +102,23 @@ impl ExplicitProxy {
             .or(self.http.as_deref())
     }
 
+    /// 这个代理是不是**只住在本机回环上**（Clash / v2rayN 那种 `127.0.0.1:7897`）。
+    ///
+    /// 只用来决定"连不上时该不该提示代理软件没开"：回环代理连不上，九成就是那个进程
+    /// 没在跑；而远程 / 公司代理连不上，原因可能在网络那边，乱猜只会误导。
+    pub fn is_loopback_only(&self) -> bool {
+        let urls = [&self.all, &self.http, &self.https];
+        let mut seen = false;
+        for url in urls.into_iter().flatten() {
+            seen = true;
+            let host = proxy_url_host(url);
+            if !is_loopback(host) {
+                return false;
+            }
+        }
+        seen
+    }
+
     /// **这条请求要不要走代理、走哪个**（`None` = 直连）。纯判据，可单测。
     pub fn proxy_for(&self, scheme: &str, host: &str) -> Option<&str> {
         if bypasses(host, &self.bypass, self.bypass_local) {
@@ -112,6 +129,20 @@ impl ExplicitProxy {
             "http" => self.http.as_deref().or(self.all.as_deref()),
             _ => self.all.as_deref(),
         }
+    }
+}
+
+/// 从 `http://user@127.0.0.1:7897/` 这种串里取出主机名（够用就行，不引 URL 解析器：
+/// `outbound` 这一层刻意不依赖 reqwest）。
+fn proxy_url_host(url: &str) -> &str {
+    let rest = url.split_once("://").map(|(_, rest)| rest).unwrap_or(url);
+    let authority = rest.split('/').next().unwrap_or(rest);
+    let authority = authority.rsplit_once('@').map(|(_, host)| host).unwrap_or(authority);
+    if authority.starts_with('[') {
+        // IPv6 字面量：`[::1]:7897`
+        authority.split(']').next().unwrap_or(authority).trim_start_matches('[')
+    } else {
+        authority.split(':').next().unwrap_or(authority)
     }
 }
 
@@ -580,6 +611,21 @@ pub fn describe() -> String {
     }
 }
 
+/// 连不上时追加的一句**可操作**提示（只在用本机回环代理时才给）。
+///
+/// 浏览器在代理连不上时给的是专门的错误页（"检查代理服务器、防火墙"），而不是一句
+/// "无法访问此网站"；这条是同一用意的本地版本。措辞是**条件句**而不是断言——我们只知道
+/// "配着回环代理 + 这次连不上"，不知道到底是代理软件没开还是平台挂了。
+pub fn local_proxy_hint() -> String {
+    match resolve() {
+        ProxyPlan::Explicit(proxy) if proxy.is_loopback_only() => format!(
+            "（如果代理软件没在跑，请求会停在 {} 这一跳：关掉系统代理，或设 RENDERLOFT_PROXY=off 后重启）",
+            proxy.display_url().unwrap_or("本地代理")
+        ),
+        _ => String::new(),
+    }
+}
+
 /// 给错误信息用的一小段括注；没有代理时是空串（不给自己加戏）。
 ///
 /// 带上来源是刻意的：用户看到"系统代理"会去关代理软件，看到"环境变量"会去查 shell。
@@ -698,6 +744,38 @@ mod tests {
         assert!(
             !bypasses("www.runninghub.cn", &patterns, local),
             "公网地址不在列表里，必须走代理"
+        );
+    }
+
+    /// 本机回环代理的识别：**只有回环**才算（远程/公司代理不猜）。
+    ///
+    /// 负对照：把 `is_loopback` 换成"只要有地址就算" ⇒ 第二条断言红。
+    #[test]
+    fn only_a_loopback_proxy_counts_as_a_local_one() {
+        let local = parse_registry_proxy("127.0.0.1:7897", "");
+        assert!(local.is_loopback_only(), "127.0.0.1 是本地代理");
+
+        let remote = parse_registry_proxy("http=10.0.0.9:8080;https=proxy.corp.example:8080", "");
+        assert!(!remote.is_loopback_only(), "远程/公司代理不能被当成'本地没开'");
+
+        let mixed = parse_registry_proxy("http=127.0.0.1:7890;https=proxy.corp.example:8080", "");
+        assert!(!mixed.is_loopback_only(), "只要有一段不是回环，就不能下那个结论");
+
+        let mut v6 = ExplicitProxy::new(ProxySource::System);
+        v6.all = Some("http://[::1]:7897".to_string());
+        assert!(v6.is_loopback_only(), "IPv6 字面量也要认");
+    }
+
+    /// 提示只在该出现的时候出现。
+    ///
+    /// 这里**不锁具体值**（取决于这台机器开没开代理）：只锁"要么空、要么是那句条件句"。
+    #[test]
+    fn the_local_proxy_hint_is_a_conditional_sentence_or_nothing() {
+        let hint = local_proxy_hint();
+        assert!(
+            hint.is_empty()
+                || (hint.starts_with("（如果代理软件没在跑") && hint.ends_with('）')),
+            "实际：{hint}"
         );
     }
 

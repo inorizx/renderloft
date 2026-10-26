@@ -248,10 +248,19 @@ pub fn map_network_error(error: &reqwest::Error, operation: &str) -> SafeError {
             details,
         }
     } else if error.is_connect() || error.is_request() {
+        // 连不上时，如果配着**本机**代理，就把话说到那份配置上：那种失败九成是代理软件
+        // 没在跑（注册表还开着、进程已经没了），而用户看到的只会是"连不上平台"。
+        // 有提示时不再叠一条"（出网代理 …）"——提示里已经点了名。
+        let hint = crate::v2::outbound::local_proxy_hint();
+        let message = if hint.is_empty() {
+            format!("连不上 {operation}{note}")
+        } else {
+            format!("连不上 {operation}{hint}")
+        };
         SafeError {
             code: format!("PROVIDER_UNREACHABLE_{}", operation.to_uppercase()),
             kind: ErrorKind::Network,
-            message: format!("连不上 {operation}{note}"),
+            message,
             retryable: true,
             details,
         }
