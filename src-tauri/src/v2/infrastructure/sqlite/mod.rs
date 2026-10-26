@@ -2447,4 +2447,158 @@ mod tests {
             .unwrap();
         assert_eq!(count, 1, "迁移不该动到行数");
     }
+
+    /// 每个用例一个独立目录（测试并行跑，别互相踩）。
+    fn temp_dir(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "renderloft-sqlite-{tag}-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&dir).expect("建临时目录");
+        dir
+    }
+
+    /// **URL 型产物取的字节要落盘**，并把 `byteSize` 从"未知"刷成真实大小。
+    ///
+    /// 为什么落在真库上：缓存写的是**文件**（`artifacts\<id>`），替身没有目录可写，
+    /// 这条路径的全部价值恰好在"文件真的在、下次真的读得到"。
+    ///
+    /// 负对照：删掉 `cache_bytes` 里写文件那一步 ⇒ 第一条断言红；删掉那条
+    /// `byte_size = 0` 的 UPDATE ⇒ 最后一条红。
+    #[tokio::test]
+    async fn cached_artifact_bytes_land_on_disk_and_refresh_the_real_size() {
+        use crate::v2::domain::ids::ArtifactId;
+        use crate::v2::ports::stores::{ArtifactObject, ArtifactStore};
+
+        let workspace = temp_dir("artifact-cache");
+        let repositories =
+            SqliteRepositories::open(&workspace.join("renderloft.db")).expect("开库");
+        repositories
+            .store(ArtifactObject {
+                id: ArtifactId(42),
+                run_id: Some(1),
+                filename: "860.png".to_string(),
+                mime_type: "image/png".to_string(),
+                // URL 型产物：只知道字节在平台上，大小与字节都是空的。
+                byte_size: 0,
+                checksum: "sum-42".to_string(),
+                storage_key: "42".to_string(),
+                url: Some("https://cdn.example.com/860.png".to_string()),
+                bytes: Vec::new(),
+            })
+            .await
+            .expect("种产物");
+
+        assert!(
+            repositories
+                .read_bytes(ArtifactId(42))
+                .await
+                .expect("读缓存")
+                .is_none(),
+            "还没取过就不该有缓存"
+        );
+        assert_eq!(
+            repositories
+                .load(ArtifactId(42))
+                .await
+                .expect("读产物")
+                .expect("存在")
+                .byte_size,
+            0,
+            "取之前大小未知"
+        );
+
+        let payload = b"png-bytes";
+        repositories
+            .cache_bytes(ArtifactId(42), payload)
+            .await
+            .expect("写缓存");
+
+        assert_eq!(
+            std::fs::read(workspace.join("artifacts").join("42")).expect("缓存文件应当已落盘"),
+            payload,
+            "字节要进 artifacts 目录"
+        );
+        assert_eq!(
+            repositories
+                .read_bytes(ArtifactId(42))
+                .await
+                .expect("读缓存")
+                .expect("命中"),
+            payload,
+            "第二次必须命中本地缓存"
+        );
+        assert_eq!(
+            repositories
+                .load(ArtifactId(42))
+                .await
+                .expect("读产物")
+                .expect("存在")
+                .byte_size,
+            payload.len() as u64,
+            "取到之后 byteSize 必须是真实大小"
+        );
+
+        let _ = std::fs::remove_dir_all(&workspace);
+    }
+
+    /// **删任务要连产物缓存文件一起删**：此前只删库里的行，`artifacts\` 里的图片
+    /// 没人认领、也永远没人删——30 天清扫把行清掉了，文件还躺着（工作区只增不减）。
+    ///
+    /// 负对照：把 `delete_operations` 末尾那段 `remove_file` 删掉 ⇒ 这条红。
+    #[tokio::test]
+    async fn deleting_an_operation_removes_its_cached_artifact_files() {
+        use crate::v2::domain::ids::ArtifactId;
+        use crate::v2::ports::stores::{ArtifactObject, ArtifactStore};
+
+        let workspace = temp_dir("artifact-cleanup");
+        let repositories =
+            SqliteRepositories::open(&workspace.join("renderloft.db")).expect("开库");
+        {
+            let connection = repositories
+                .connection
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            seed_connection(&connection);
+            seed_recipe(&connection);
+        }
+
+        let persisted = repositories
+            .create_operation(new_operation(actor()))
+            .await
+            .expect("建任务");
+        let operation_id = persisted.operation.id;
+        let run_id = persisted.runs[0].id;
+
+        repositories
+            .store(ArtifactObject {
+                id: ArtifactId(9001),
+                run_id: Some(run_id.0),
+                filename: "9001.png".to_string(),
+                mime_type: "image/png".to_string(),
+                byte_size: 9,
+                checksum: "sum-9001".to_string(),
+                storage_key: "9001".to_string(),
+                url: None,
+                bytes: b"png-bytes".to_vec(),
+            })
+            .await
+            .expect("种产物");
+        let path = workspace.join("artifacts").join("9001");
+        assert!(path.is_file(), "有字节的产物应当已落盘：{path:?}");
+
+        assert_eq!(
+            repositories
+                .delete_operations(&[operation_id])
+                .await
+                .expect("删任务"),
+            1
+        );
+        assert!(
+            !path.exists(),
+            "任务删了，缓存文件必须一起走（否则工作区只增不减）：{path:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(&workspace);
+    }
 }

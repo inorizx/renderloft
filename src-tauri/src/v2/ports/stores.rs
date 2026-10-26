@@ -27,6 +27,15 @@ pub trait ArtifactStore: Send + Sync {
     async fn load(&self, id: ArtifactId) -> DomainResult<Option<ArtifactObject>>;
     /// 读取本地缓存的文件字节（仅 url 为 None 的产物）。
     async fn read_bytes(&self, id: ArtifactId) -> DomainResult<Option<Vec<u8>>>;
+    /// 把**按需取到**的字节写进本地缓存（读穿透缓存）。
+    ///
+    /// 为什么需要这个口子：`url` 型产物（RunningHub 只给 URL 不给字节）此前每次请求都
+    /// 回源拉一遍——界面每画一次缩略图、每次重启都重下一遍，而本地缓存目录一直都在，
+    /// 只是从来没有人往里写。落盘之后 `read_bytes` 直接命中。
+    ///
+    /// 语义：**只写缓存，不动业务状态**。顺带把 `byteSize` 从 0 刷成真实大小——
+    /// 0 的含义因此从"字节在平台上"变成"还没取过"（见 README「产物怎么拿到手」）。
+    async fn cache_bytes(&self, id: ArtifactId, bytes: &[u8]) -> DomainResult<()>;
     async fn exists(&self, checksum: &str) -> DomainResult<bool>;
 }
 
@@ -53,6 +62,9 @@ impl ArtifactStore for Arc<dyn ArtifactStore> {
     }
     async fn read_bytes(&self, id: ArtifactId) -> DomainResult<Option<Vec<u8>>> {
         self.as_ref().read_bytes(id).await
+    }
+    async fn cache_bytes(&self, id: ArtifactId, bytes: &[u8]) -> DomainResult<()> {
+        self.as_ref().cache_bytes(id, bytes).await
     }
     async fn exists(&self, checksum: &str) -> DomainResult<bool> {
         self.as_ref().exists(checksum).await

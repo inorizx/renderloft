@@ -1792,6 +1792,17 @@ impl ArtifactStore for InMemoryRepositories {
             }))
     }
 
+    async fn cache_bytes(&self, id: ArtifactId, bytes: &[u8]) -> DomainResult<()> {
+        let mut state = self.state.lock().unwrap();
+        if let Some(artifact) = state.artifacts.get_mut(&id) {
+            artifact.bytes = bytes.to_vec();
+            if artifact.byte_size == 0 {
+                artifact.byte_size = bytes.len() as u64;
+            }
+        }
+        Ok(())
+    }
+
     async fn exists(&self, checksum: &str) -> DomainResult<bool> {
         Ok(self
             .state

@@ -1726,18 +1726,11 @@ pub async fn save_artifact(
         .await
         .map_err(domain_error)?
         .ok_or_else(|| error::not_found("ARTIFACT_NOT_FOUND", "Artifact 不存在"))?;
-    // 与 /bytes 同一条取字节的路（远端 URL 按需拉取，否则读本地缓存）。
-    let bytes = match artifact.url.as_deref() {
-        Some(url) => fetch_artifact_remote(state.safe_http.as_ref(), url)
-            .await
-            .map_err(domain_error)?,
-        None => state
-            .artifacts
-            .read_bytes(id)
-            .await
-            .map_err(domain_error)?
-            .ok_or_else(|| error::not_found("ARTIFACT_BYTES_MISSING", "产物字节不可用"))?,
-    };
+    // 与 /bytes 共用同一条取字节的路：本地缓存优先，回源命中后就地落盘。
+    let bytes = artifact_bytes(&state, &artifact)
+        .await
+        .map_err(domain_error)?
+        .ok_or_else(|| error::not_found("ARTIFACT_BYTES_MISSING", "产物字节不可用"))?;
     let settings = state.settings.view().await.map_err(domain_error)?;
     let directory = if settings.download_dir.trim().is_empty() {
         crate::v2::application::settings::default_download_dir()
@@ -1799,6 +1792,7 @@ pub async fn get_artifact_bytes(
     State(state): State<Arc<V2HttpState>>,
     Extension(actor): Extension<ActorRef>,
     Path(artifact_id): Path<u64>,
+    headers: axum::http::HeaderMap,
 ) -> axum::response::Response {
     if require_scope(&actor, Scope::ArtifactsRead).is_err() {
         return error::forbidden("缺少 artifacts:read 权限");
@@ -1809,29 +1803,97 @@ pub async fn get_artifact_bytes(
         Ok(None) => return error::not_found("ARTIFACT_NOT_FOUND", "Artifact 不存在"),
         Err(error) => return error::error_response(error),
     };
-    // 中转站定位：产物记录远端 URL 时按需拉取；否则读本地缓存文件。
-    let bytes = match artifact.url.as_deref() {
-        Some(url) => match fetch_artifact_remote(state.safe_http.as_ref(), url).await {
-            Ok(bytes) => bytes,
-            Err(error) => return error::error_response(error),
-        },
-        None => match state.artifacts.read_bytes(id).await {
-            Ok(Some(bytes)) => bytes,
-            Ok(None) => return error::not_found("ARTIFACT_BYTES_MISSING", "产物字节不可用"),
-            Err(error) => return error::error_response(error),
-        },
+    let bytes = match artifact_bytes(&state, &artifact).await {
+        Ok(Some(bytes)) => bytes,
+        Ok(None) => return error::not_found("ARTIFACT_BYTES_MISSING", "产物字节不可用"),
+        Err(error) => return error::error_response(error),
     };
+    let etag = artifact_etag(&artifact);
+    // 同一个 artifact id 的内容是不变的（名字在落库前就定了，字节也不再变），
+    // 所以可以给一个永不过期的强校验器：界面反复画缩略图时 WebView 直接命中本地缓存。
+    if headers
+        .get(axum::http::header::IF_NONE_MATCH)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| value.split(',').any(|candidate| candidate.trim() == etag))
+    {
+        return axum::response::Response::builder()
+            .status(axum::http::StatusCode::NOT_MODIFIED)
+            .header(axum::http::header::ETAG, &etag)
+            .header(axum::http::header::CACHE_CONTROL, ARTIFACT_CACHE_CONTROL)
+            .header(axum::http::header::VARY, "Authorization")
+            .body(axum::body::Body::empty())
+            .unwrap_or_else(|_| error::error_response(
+                crate::v2::domain::errors::SafeError::internal("无法生成 Artifact 响应"),
+            ));
+    }
     let filename = content_disposition(&artifact.filename);
     axum::response::Response::builder()
         .header(axum::http::header::CONTENT_TYPE, artifact.mime_type)
         .header(axum::http::header::CONTENT_DISPOSITION, filename)
         .header(axum::http::header::CONTENT_LENGTH, bytes.len().to_string())
+        .header(axum::http::header::ETAG, etag)
+        .header(axum::http::header::CACHE_CONTROL, ARTIFACT_CACHE_CONTROL)
+        .header(axum::http::header::VARY, "Authorization")
         .body(axum::body::Body::from(bytes))
         .unwrap_or_else(|_| {
             error::error_response(crate::v2::domain::errors::SafeError::internal(
                 "无法生成 Artifact 响应",
             ))
         })
+}
+
+/// 产物字节的缓存策略：内容按 id 不可变，所以给一年 + `immutable`。
+///
+/// `private` 是因为产物只属于这台机器（本机 daemon 的字节，不该被任何共享缓存留存）；
+/// 加 `Vary: Authorization` 是因为同一个 URL 在换令牌前后代表同一份内容——不声明的话
+/// 中间层可能按"令牌不同"缓存两份。
+const ARTIFACT_CACHE_CONTROL: &str = "private, max-age=31536000, immutable";
+
+/// 强校验器：有 checksum 用它（内容地址），没有就用 id（同一 id 的字节不会变）。
+///
+/// checksum 来自驱动：正常是十六进制摘要，但它是**自由字符串**——含 `"` 或控制字符时
+/// 当 ETag 会生成一个畸形头，所以那种情况退回 id，不冒险拼一个非法头。
+pub(crate) fn artifact_etag(artifact: &crate::v2::ports::stores::ArtifactObject) -> String {
+    let checksum = artifact.checksum.trim();
+    let usable =
+        !checksum.is_empty() && !checksum.chars().any(|c| c == '"' || c == '\\' || c.is_control());
+    if usable {
+        format!("\"{checksum}\"")
+    } else {
+        format!("\"artifact-{}\"", artifact.id.0)
+    }
+}
+
+/// 取一条产物的字节：**本地缓存优先**，没有才回源；回源成功后就地落盘。
+///
+/// 为什么把顺序反过来（2026-10-26）：`url` 型产物（RunningHub 只给 URL 不给字节）此前
+/// 每次请求都回源——界面每画一次缩略图、每次重启都重下一遍，而本地缓存目录一直都在，
+/// 只是**从来没有人往里写**。落盘之后 `read_bytes` 直接命中；顺带的好处是平台那条链接
+/// 过期之后，已经看过的图也不会忽然打不开。
+///
+/// 返回 `Ok(None)` 表示"既没有缓存、也没有 URL"——那是 404，不是错误。
+async fn artifact_bytes(
+    state: &V2HttpState,
+    artifact: &crate::v2::ports::stores::ArtifactObject,
+) -> Result<Option<Vec<u8>>, crate::v2::domain::errors::SafeError> {
+    if let Some(bytes) = state.artifacts.read_bytes(artifact.id).await? {
+        return Ok(Some(bytes));
+    }
+    let Some(url) = artifact.url.as_deref() else {
+        return Ok(None);
+    };
+    let bytes = fetch_artifact_remote(state.safe_http.as_ref(), url).await?;
+    // 缓存写失败**不该**让一次预览变成错误：字节已经在手上，用户要的是图。
+    // 但要留一行日志——"下次还得再下一遍"这件事，出问题时得能看出来。
+    if let Err(error) = state.artifacts.cache_bytes(artifact.id, &bytes).await {
+        crate::v2::logging::log_failure(
+            "artifact",
+            &format!("id={}", artifact.id.0),
+            "ARTIFACT_CACHE_WRITE_FAILED",
+            &error.message,
+        );
+    }
+    Ok(Some(bytes))
 }
 
 /// 按远端结果 URL 拉取产物字节（SSRF 与重定向校验由 `SafeHttpClient` 实现侧负责）。

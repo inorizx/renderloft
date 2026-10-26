@@ -1661,6 +1661,10 @@ impl OperationRepository for SqliteRepositories {
             .unchecked_transaction()
             .map_err(|_| SafeError::storage("无法开始 V2 事务"))?;
         let mut deleted = 0usize;
+        // 产物缓存文件的 id：**行删了、文件还在**是这条路径此前的漏——库清了，
+        // `artifacts\` 里那些图片没人认领，也永远没人删（只增不减）。所以先记下 id，
+        // 事务提交之后再删文件。
+        let mut orphan_files: Vec<i64> = Vec::new();
         for id in operation_ids {
             let exists = transaction
                 .query_row(
@@ -1673,6 +1677,22 @@ impl OperationRepository for SqliteRepositories {
                 .unwrap_or(false);
             if !exists {
                 continue;
+            }
+            // 顺序要紧：这条 SELECT 必须在下面那条 DELETE 之前——删完就问不出来了。
+            {
+                let mut statement = transaction
+                    .prepare(
+                        "SELECT id FROM v2_assets
+                         WHERE kind = 'artifact'
+                           AND run_id IN (SELECT id FROM v2_runs WHERE operation_id = ?1)",
+                    )
+                    .map_err(|_| SafeError::storage("无法读取产物清单"))?;
+                let rows = statement
+                    .query_map(params![id.0], |row| row.get::<_, i64>(0))
+                    .map_err(|_| SafeError::storage("无法读取产物清单"))?;
+                for row in rows {
+                    orphan_files.push(row.map_err(|_| SafeError::storage("无法读取产物清单"))?);
+                }
             }
             transaction
                 .execute(
@@ -1711,6 +1731,14 @@ impl OperationRepository for SqliteRepositories {
         transaction
             .commit()
             .map_err(|_| SafeError::storage("无法提交 V2 事务"))?;
+        // 提交之后才删文件：反过来（先删文件、事务回滚）等于把还能用的缓存丢掉了；
+        // 这个顺序最坏只是留下一个孤儿文件——而 `remove_file` 失败**不会重试**（没有清扫循环），
+        // 所以宁可留着也不先删：留下的是空间，删错的是数据。
+        if let Some(dir) = &self.artifact_dir {
+            for artifact_id in &orphan_files {
+                let _ = std::fs::remove_file(dir.join(artifact_id.to_string()));
+            }
+        }
         Ok(deleted)
     }
 }
@@ -2394,6 +2422,39 @@ impl ArtifactStore for SqliteRepositories {
             .optional()
             .map_err(|_| SafeError::storage("无法读取 Artifact 字节"))?;
         Ok(bytes.filter(|bytes| !bytes.is_empty()))
+    }
+
+    async fn cache_bytes(&self, id: ArtifactId, bytes: &[u8]) -> DomainResult<()> {
+        // 与 `read_bytes` 的读取顺序**对称**：有缓存目录就落文件（大字节不进库），
+        // 没有目录（内存库 / 测试）就退回库里的 bytes 列。
+        match &self.artifact_dir {
+            Some(dir) => {
+                std::fs::create_dir_all(dir)
+                    .map_err(|_| SafeError::storage("无法创建产物缓存目录"))?;
+                std::fs::write(dir.join(id.0.to_string()), bytes)
+                    .map_err(|_| SafeError::storage("无法写入产物缓存文件"))?;
+            }
+            None => {
+                let connection = self.connection.lock().unwrap_or_else(|e| e.into_inner());
+                connection
+                    .execute(
+                        "UPDATE v2_assets SET bytes = ?2 WHERE id = ?1 AND kind = 'artifact'",
+                        params![id.0, bytes],
+                    )
+                    .map_err(|_| SafeError::storage("无法写入产物字节"))?;
+            }
+        }
+        // 字节到手了才刷新大小：`byte_size = 0` 原本的意思是"只知道字节在平台上"，
+        // 现在它的意思是"还没取过"。已有大小（>0）不动——那是平台当时的报价。
+        let connection = self.connection.lock().unwrap_or_else(|e| e.into_inner());
+        connection
+            .execute(
+                "UPDATE v2_assets SET byte_size = ?2
+                 WHERE id = ?1 AND kind = 'artifact' AND byte_size = 0",
+                params![id.0, bytes.len() as i64],
+            )
+            .map_err(|_| SafeError::storage("无法更新产物大小"))?;
+        Ok(())
     }
 
     async fn exists(&self, checksum: &str) -> DomainResult<bool> {

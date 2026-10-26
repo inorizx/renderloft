@@ -504,6 +504,22 @@ mod tests {
 
     /// 用给定的仓库与驱动注册表装配 state（要换驱动时用它，别复制一整套）。
     fn test_state(repositories: InMemoryRepositories, drivers: DriverRegistry) -> Arc<V2HttpState> {
+        test_state_with_http(
+            repositories,
+            drivers,
+            std::sync::Arc::new(
+                crate::v2::infrastructure::providers::safety::ReqwestSafeHttpClient,
+            ),
+        )
+    }
+
+    /// 同上，但**换掉**取远端字节的客户端——产物缓存的判据要数「回源了几次」，
+    /// 真客户端会真的去连网。
+    fn test_state_with_http(
+        repositories: InMemoryRepositories,
+        drivers: DriverRegistry,
+        safe_http: std::sync::Arc<dyn crate::v2::ports::safety::SafeHttpClient>,
+    ) -> Arc<V2HttpState> {
         let create = std::sync::Arc::new(CreateOperation::new(
             Repositories {
                 recipes: Box::new(repositories.clone()),
@@ -564,9 +580,7 @@ mod tests {
             settings,
             status,
             import_service,
-            std::sync::Arc::new(
-                crate::v2::infrastructure::providers::safety::ReqwestSafeHttpClient,
-            ),
+            safe_http,
             workspace_backup,
         ))
     }
@@ -676,6 +690,67 @@ mod tests {
             status,
             serde_json::from_slice(&bytes).unwrap_or(Value::Null),
         )
+    }
+
+    /// 一条**假的**远端字节服务：只把"回源了几次"数下来。
+    ///
+    /// 产物缓存的判据就是它——第一次 200 要回源、第二次 200 必须**不**回源。
+    struct CountingHttpClient {
+        calls: std::sync::atomic::AtomicUsize,
+        payload: Vec<u8>,
+    }
+
+    impl CountingHttpClient {
+        fn new(payload: &[u8]) -> Self {
+            Self {
+                calls: std::sync::atomic::AtomicUsize::new(0),
+                payload: payload.to_vec(),
+            }
+        }
+
+        fn calls(&self) -> usize {
+            self.calls.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl crate::v2::ports::safety::SafeHttpClient for CountingHttpClient {
+        async fn fetch_limited(
+            &self,
+            _url: &str,
+            _max_bytes: usize,
+        ) -> crate::v2::domain::errors::DomainResult<Vec<u8>> {
+            self.calls
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(self.payload.clone())
+        }
+
+        fn max_result_bytes(&self) -> usize {
+            10 * 1024 * 1024
+        }
+    }
+
+    /// 取**原始字节 + 响应头**（`get_json` 会把非 JSON 的响应体吞成 `Value::Null`）。
+    async fn get_raw(
+        app: &Router,
+        uri: &str,
+        token: &str,
+        extra: &[(axum::http::HeaderName, String)],
+    ) -> (StatusCode, axum::http::HeaderMap, Vec<u8>) {
+        let mut builder = Request::builder()
+            .uri(uri)
+            .header(header::AUTHORIZATION, format!("Bearer {token}"));
+        for (name, value) in extra {
+            builder = builder.header(name, value);
+        }
+        let request = builder.body(Body::empty()).unwrap();
+        let response = app.clone().oneshot(request).await.unwrap();
+        let status = response.status();
+        let headers = response.headers().clone();
+        let bytes = axum::body::to_bytes(response.into_body(), 64 * 1024 * 1024)
+            .await
+            .unwrap();
+        (status, headers, bytes.to_vec())
     }
 
     fn create_operation_body(key: &str) -> Value {
@@ -3061,6 +3136,136 @@ mod tests {
         let (status, body) = get_json(&app, "/api/v1/artifacts?order=desc&after=1", &token).await;
         assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
         assert_eq!(body["error"]["code"], "CURSOR_CONFLICT", "{body}");
+    }
+
+    /// **URL 型产物只回源一次**：第一次取字节要下载 + 落缓存，第二次直接命中本地。
+    ///
+    /// 为什么这条值得单独立一把尺子：界面的「结果」页与任务画廊都是一屏几十张缩略图，
+    /// 每张都会打一次 `/artifacts/{id}/bytes`。RunningHub 只给 URL 不给字节，所以
+    /// 改之前**每看一次就重下一遍**（重启后再来一遍）——而本地缓存目录一直都在，
+    /// 只是没人往里写。判据只有一条：同一个产物的第二次请求**不许再回源**。
+    ///
+    /// 顺带钉住两件小事：① 回源成功要把 `byteSize` 从 0 刷成真实大小；
+    /// ② 响应带 `ETag` + 长缓存，`If-None-Match` 命中时是 304（WebView 反复画同一张图时
+    /// 连本地传输都省了）。
+    ///
+    /// 负对照：把 `artifact_bytes` 里"先读本地缓存"那一步删掉 ⇒ 第 2 次请求的回源计数变 2，红。
+    #[tokio::test]
+    async fn artifact_bytes_are_downloaded_once_and_cached() {
+        use crate::v2::domain::ids::ArtifactId;
+        use crate::v2::ports::stores::{ArtifactObject, ArtifactStore};
+
+        let repositories = InMemoryRepositories::new();
+        seed_environment(&repositories);
+        ArtifactStore::store(
+            &repositories,
+            ArtifactObject {
+                id: ArtifactId(77),
+                run_id: Some(1),
+                filename: "860.png".to_string(),
+                mime_type: "image/png".to_string(),
+                // URL 型产物：只记 URL，不记字节（平台那边才有）。
+                byte_size: 0,
+                checksum: "sum-77".to_string(),
+                storage_key: "77".to_string(),
+                url: Some("https://cdn.example.com/860.png".to_string()),
+                bytes: Vec::new(),
+            },
+        )
+        .await
+        .expect("种产物");
+
+        let http = std::sync::Arc::new(CountingHttpClient::new(b"png-bytes"));
+        let state = test_state_with_http(
+            repositories.clone(),
+            DriverRegistry::new(),
+            http.clone() as std::sync::Arc<dyn crate::v2::ports::safety::SafeHttpClient>,
+        );
+        let app = build_router(state.clone());
+        let token = issue_token(&repositories, &["artifacts:read"]).await;
+
+        let (status, headers, body) =
+            get_raw(&app, "/api/v1/artifacts/77/bytes", &token, &[]).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body, b"png-bytes");
+        assert_eq!(http.calls(), 1, "第一次必须回源一次");
+        let etag = headers
+            .get(header::ETAG)
+            .expect("响应要带 ETag")
+            .to_str()
+            .unwrap()
+            .to_string();
+        assert_eq!(etag, "\"sum-77\"", "有 checksum 就用内容地址当校验器");
+        assert!(
+            headers
+                .get(header::CACHE_CONTROL)
+                .and_then(|value| value.to_str().ok())
+                .is_some_and(|value| value.contains("immutable")),
+            "产物字节按 id 不可变，应当允许长缓存"
+        );
+
+        // ② 第二次：字节从本地缓存来，**不许再回源**。
+        let (status, _headers, body) =
+            get_raw(&app, "/api/v1/artifacts/77/bytes", &token, &[]).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body, b"png-bytes");
+        assert_eq!(
+            http.calls(),
+            1,
+            "第二次必须命中本地缓存（回源计数不该涨）"
+        );
+
+        // ③ 取到之后大小就从"未知"变成真的了。
+        let artifact = state
+            .artifacts
+            .load(ArtifactId(77))
+            .await
+            .expect("读产物")
+            .expect("存在");
+        assert_eq!(artifact.byte_size, 9, "byteSize 该从 0 刷成真实大小");
+
+        // ④ 带 If-None-Match 回来 ⇒ 304，且仍然不回源。
+        let (status, _headers, body) = get_raw(
+            &app,
+            "/api/v1/artifacts/77/bytes",
+            &token,
+            &[(header::IF_NONE_MATCH, etag.clone())],
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_MODIFIED);
+        assert!(body.is_empty(), "304 不带响应体");
+        assert_eq!(http.calls(), 1, "304 也不该回源");
+    }
+
+    /// ETag 的兜底：checksum 是驱动给的**自由字符串**，含引号/控制字符时拼进头就是畸形头，
+    /// 所以那种情况退回 `artifact-<id>`。
+    #[test]
+    fn artifact_etag_falls_back_to_the_id_when_the_checksum_is_not_header_safe() {
+        use crate::v2::ports::stores::ArtifactObject;
+
+        let artifact = |checksum: &str| ArtifactObject {
+            id: crate::v2::domain::ids::ArtifactId(77),
+            run_id: None,
+            filename: "860.png".to_string(),
+            mime_type: "image/png".to_string(),
+            byte_size: 0,
+            checksum: checksum.to_string(),
+            storage_key: "77".to_string(),
+            url: None,
+            bytes: Vec::new(),
+        };
+
+        assert_eq!(handlers::artifact_etag(&artifact("sum-77")), "\"sum-77\"");
+        assert_eq!(
+            handlers::artifact_etag(&artifact("bad\"quote")),
+            "\"artifact-77\"",
+            "含引号的 checksum 会把 ETag 拼成畸形头"
+        );
+        assert_eq!(
+            handlers::artifact_etag(&artifact("   ")),
+            "\"artifact-77\"",
+            "空 checksum 用 id"
+        );
     }
 
     #[tokio::test]

@@ -252,6 +252,23 @@
   平台会拒，而 RunningHub 的拒绝（`TASK_QUEUE_MAXED`，实测"拒了一分钱没花"）本来就是可重试的
   ⇒ 退避 30 秒自动重试。对账队列（`list_active_runs`）**照旧**包含不确定的 run，否则它永远不会
   被确认。
+- **产物字节取一次就留在本地**（2026-10-26）：RunningHub 只给 URL 不给字节，于是此前
+  **每看一次图就回源下一次** —— 「结果」页一屏几十张缩略图就是几十次下载，重启后再来一遍；
+  而本地缓存目录一直都在，只是**从来没有人往里写**。
+  现在 `/artifacts/{id}/bytes` 与「另存到下载目录」共用同一条取字节的路：**本地缓存优先**，
+  回源命中后就地落盘（`artifacts\<id>`），第二次直接命中；`byteSize` 也从 0 刷成真实大小
+  （0 的含义因此从"字节在平台上"变成"还没取过"，README 与 cookbook 两处说法已同步）。
+  响应带 `ETag`（有 checksum 用它，没有用 `artifact-<id>`）+ `Cache-Control: private,
+  max-age=31536000, immutable` + `Vary: Authorization`，`If-None-Match` 命中回 **304** ——
+  WebView 反复画同一张缩略图时连本地传输都省了。
+  顺带补掉一处**只增不减**：`delete_operations`（界面删任务与 30 天清扫）现在把对应产物的
+  缓存文件也删掉 —— 此前只删库里的行，`artifacts\` 里的图片永远留在磁盘上。
+  判据三条，各自做过负对照（分别停用"本地优先"、"落盘"、"删文件"，实测都会变红）：
+  `artifact_bytes_are_downloaded_once_and_cached`（数回源次数）、
+  `cached_artifact_bytes_land_on_disk_and_refresh_the_real_size`、
+  `deleting_an_operation_removes_its_cached_artifact_files`。
+  刻意**不做**缩略图生成：那要给 daemon 加图像解码依赖（编译与内存都变重），而字节已经
+  在本地了，渲染一张 PNG 的瓶颈不在传输。
 
 ## 当前进行中
 

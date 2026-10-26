@@ -210,6 +210,10 @@ renderloft-cli artifact download --artifact 999002000 --to D:\pics\        # 给
 renderloft-cli artifact download --artifact 999002000 --to D:\pics\cat.png # 或指定文件
 ```
 
+> 取过一次之后（界面预览或上面这条命令），字节会缓存在工作区的 `artifacts\` 目录里，
+> `byteSize` 也变成真实大小——**同一个产物不会再回平台取第二次**。所以 `byteSize` 为 0
+> 的准确含义是「还没取过」，不是「文件是空的」。
+
 **文件名一律照抄平台给的**（浏览器、`curl -O`、`wget` 都不改名）。但**往一个目录里收一批**时会撞名：
 RunningHub 按输出节点命名，同一个应用的每个 run 都产出 `870.png`。所以目录落点带冲突策略——
 默认 `rename`，加序号（`870.png` → `870 (1).png`，与浏览器 / yt-dlp 同形），并在输出里说明改存到哪：
@@ -330,7 +334,7 @@ renderloft-cli recipe describe --recipe 1             # 拿 currentRevisionId �
 renderloft-cli operation run --recipe-revision 1 --input cat.json --idempotency-key daily-2026-10-09
 renderloft-cli operation run --recipe-revision 1 --input attrs.json --asset '475::image=person.png'   # 带图（先上传后提交）
 renderloft-cli operation wait --operation 70 --interval 5 --timeout 600
-renderloft-cli artifact list                          # 产物（byteSize 0 = 字节还在平台上，不是空文件）
+renderloft-cli artifact list                          # 产物（byteSize 0 = 字节还在平台上、还没取过，不是空文件）
 ```
 
 因为是普通的命令行程序，它也能被任何调度器调用——例如「每天 9 点生成一张」用 Windows 任务计划即可。
