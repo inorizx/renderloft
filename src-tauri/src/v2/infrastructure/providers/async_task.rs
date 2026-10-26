@@ -198,7 +198,8 @@ pub struct AsyncTaskDriver {
 
 impl AsyncTaskDriver {
     pub fn new(secrets: Box<dyn SecretStore>) -> Self {
-        let client = Client::builder()
+        // 出网客户端一律经 `proxy::configure`（见 `providers/proxy.rs`）。
+        let client = super::proxy::configure(Client::builder())
             .redirect(reqwest::redirect::Policy::none())
             .timeout(std::time::Duration::from_secs(180))
             .build()

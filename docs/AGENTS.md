@@ -155,6 +155,10 @@ cargo clippy --offline --manifest-path src-tauri/Cargo.toml --all-targets -- -D 
 - 不得让前端/CLI/MCP 直接读写 SQLite 或 keyring。
 - 不得在 transports 里编排多步持久化（写端点用例化）。
 - 不得绕过 scheduler 直投 provider。
+- **不得裸建 reqwest 客户端**：出网的一律经
+  `infrastructure::providers::proxy::configure()`（Windows 系统代理只在那里装上车），
+  刻意直连的必须写 `.no_proxy()` 并在旁边说明理由 —— `scripts/check-layers.mjs`
+  有机器守门，例外名单要写清原因。
 - 不要删除工作区里**未被跟踪**的本地目录（维护者的笔记与跨会话上下文，不在版本库里）。
 
 ## 当前状态

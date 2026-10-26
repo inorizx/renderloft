@@ -1,6 +1,7 @@
 pub mod async_task;
 pub mod comfyui;
 pub mod openai_images;
+pub mod proxy;
 pub mod runninghub;
 pub mod safety;
 

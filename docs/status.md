@@ -269,6 +269,35 @@
   `deleting_an_operation_removes_its_cached_artifact_files`。
   刻意**不做**缩略图生成：那要给 daemon 加图像解码依赖（编译与内存都变重），而字节已经
   在本地了，渲染一张 PNG 的瓶颈不在传输。
+- **Windows 的系统代理现在真的会生效**（2026-10-26）：reqwest 只认 `HTTP(S)_PROXY`，
+  **不读** Windows「Internet 选项」里的系统代理 —— 而 Clash / v2rayN 默认只改注册表、
+  不改环境变量。实测（本机，2026-10-26）：`ProxyEnable=1 / ProxyServer=127.0.0.1:7897`、
+  环境变量全空；直连 `google.com` 超时、走代理 302 ⇒ 在"平台必须经代理才到得了"的机器上，
+  RenderLoft **根本够不着**，而界面只会说"连接测试失败"。
+  现在 `v2/outbound.rs` 只给**一份**方案（优先级：`RENDERLOFT_PROXY` > 环境变量 >
+  系统代理 > 直连），四个 driver 与产物拉取统一经
+  `infrastructure/providers/proxy.rs::configure()` 装配 —— **只装一处**，
+  否则"提交走了代理、查询没走"会变成新的悬案。
+  三处刻意的取舍：① **回环与私有网段永远直连**（`127.*` / `10.*` / `192.168.*` /
+  `172.16–31.*` / `.local` / 无点短名）—— 公网代理到不了它们，硬走只会把"本机 ComfyUI
+  明明是绿的"变成红的；② 系统代理的 `ProxyOverride` 按 `*` 通配匹配，`*.example.com`
+  同时匹配裸域（**人的直觉优先于 WinINET 的字面语义**：多绕过一台比"写了却仍走代理"轻）；
+  ③ **socks 与 PAC 认得出但不支持**，进诊断的 `outboundProxyUnsupported`，
+  绝不静默退回直连。
+  诊断补两格：`outboundProxySource`（`system`/`environment`/`manual`/`off`/`none`）与
+  `outboundProxyUnsupported`；界面「运行参数」把来源写在地址后面，错误信息的括注也带来源
+  （看到"系统代理"会去关代理软件，看到"环境变量"会去查 shell —— 下一步动作完全不同）。
+  `RENDERLOFT_PROXY=off` 会**连环境变量里的代理一起压掉**：那是 2026-10-12 那个
+  "环境里有个死代理"现场的正解。
+  **完成回调刻意不走代理**：回调地址是用户自己的内网服务，塞进公网代理只会让它失败。
+  判据：`outbound.rs` 12 条纯逻辑用例（注册表两种写法、socks 记账、`<local>`、通配/裸域、
+  四条优先级、空白值）+ `proxy.rs` 2 条装配用例（假代理数请求行、回环必须直连），
+  外加一条 `#[ignore]` 的 live 用例（**直连必须失败、经代理必须成功**；本机 2026-10-26
+  实测 `200 OK`）。负对照两条都实测变红：不装代理 ⇒ 假代理收不到请求；不判直连 ⇒
+  回环流量打进了代理。
+  ⚠️ **边界**：代理只影响**出站连接**；域名的本地解析与 SSRF 校验（`validate_resolved_url`）
+  仍在本地做——所以"只有代理那头才解析得了"的域名会先在 `PROVIDER_URL_UNRESOLVABLE`
+  被拦住，那是安全边界，不是这一版要放开的东西。
 
 ## 当前进行中
 

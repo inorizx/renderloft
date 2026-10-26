@@ -428,7 +428,9 @@ impl crate::v2::ports::safety::SafeHttpClient for ReqwestSafeHttpClient {
     async fn fetch_limited(&self, url: &str, max_bytes: usize) -> Result<Vec<u8>, SafeError> {
         let parsed = validate_base_url(url, NetworkPolicy::STRICT)?;
         validate_resolved_url(&parsed, NetworkPolicy::STRICT).await?;
-        let client = reqwest::Client::builder()
+        // 产物 URL 是平台 CDN 给的（公网）——**要**走代理；`NetworkPolicy::STRICT` 已经
+        // 把内网/回环挡在前面，所以这里不需要再考虑"本机 ComfyUI"那种例外。
+        let client = super::proxy::configure(reqwest::Client::builder())
             .redirect(reqwest::redirect::Policy::none())
             .timeout(std::time::Duration::from_secs(120))
             .build()

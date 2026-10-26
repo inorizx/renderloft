@@ -24,12 +24,26 @@ export interface DiagnosticInfo {
   serviceHost: string
   apiKeyConfigured: boolean
   /**
-   * 环境里配着的出网代理（没配就是 null）。
+   * 实际会用的出网代理（没配就是 null）。
    *
-   * 为什么值得显示：reqwest 默认会读 `HTTP(S)_PROXY` 并静默使用它。代理软件关掉之后，
-   * 应用表现为"连不上平台 / key 好像坏了"，而界面上看不出任何与代理有关的线索。
+   * 为什么值得显示：reqwest 默认会读 `HTTP(S)_PROXY` 并静默使用它；而 Windows 的
+   * **系统代理**（注册表）reqwest 根本不读，所以 2026-10-26 起由 daemon 自己读、
+   * 自己装到客户端上。代理软件关掉之后，应用表现为"连不上平台 / key 好像坏了"，
+   * 而界面上看不出任何与代理有关的线索。
    */
   outboundProxy?: string | null
+  /**
+   * 这个代理**是谁给的**：`system`（Windows 系统代理）/ `environment`（环境变量）/
+   * `manual`（`RENDERLOFT_PROXY`）/ `off`（被明确关掉）/ `none`（没有代理，直连）。
+   *
+   * 分开报的理由很实际：看到 `system` 会去关代理软件，看到 `environment` 会去查 shell。
+   */
+  outboundProxySource?: 'system' | 'environment' | 'manual' | 'off' | 'none'
+  /**
+   * 认得出、但这一版用不了的代理形态（`socks=…`、`pac`）。**静默退回直连是最坏的**：
+   * 用户以为代理生效了，然后看着它连不上。
+   */
+  outboundProxyUnsupported?: string[]
   /**
    * **当前生效的运行参数**（daemon 实际用的那些值，不是界面自己猜的）。
    *

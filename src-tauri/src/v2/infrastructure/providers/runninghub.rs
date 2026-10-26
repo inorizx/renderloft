@@ -72,7 +72,9 @@ pub struct RunningHubDriver {
 
 impl RunningHubDriver {
     pub fn new(secrets: Box<dyn SecretStore>) -> Self {
-        let client = Client::builder()
+        // 出网客户端一律经 `proxy::configure`：系统代理（Windows 注册表）与
+        // `RENDERLOFT_PROXY` 都在那一处决定，别让某个驱动漏掉。
+        let client = super::proxy::configure(Client::builder())
             .redirect(reqwest::redirect::Policy::none())
             .timeout(std::time::Duration::from_secs(120))
             .build()

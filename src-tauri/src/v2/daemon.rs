@@ -1225,8 +1225,11 @@ mod e2e {
     async fn live_comfyui_full_chain() {
         const COMFYUI_BASE: &str = "http://127.0.0.1:8188";
 
-        // 探测可用性
-        let probe = reqwest::Client::new()
+        // 探测可用性。`no_proxy()`：探的是本机回环，不该被机器上开着的代理带偏。
+        let probe = reqwest::Client::builder()
+            .no_proxy()
+            .build()
+            .expect("建探活客户端")
             .get(format!("{COMFYUI_BASE}/system_stats"))
             .send()
             .await;

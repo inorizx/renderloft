@@ -250,11 +250,49 @@ const formatRelative = (millis: number): string => {
   return t('settings.logsHoursAgo', { n: Math.round(minutes / 60) })
 }
 /**
- * 出网代理：它是"连不上平台 / key 好像坏了"的常见原因，而 reqwest 默认会静默使用它。
+ * 出网代理：它是"连不上平台 / key 好像坏了"的常见原因，而它**默认是不可见的**。
+ *
+ * 2026-10-26 起 daemon 自己读 Windows 系统代理（reqwest 不读），所以这一格要回答
+ * **两件事**：用的是哪个地址、**这个代理是谁给的**——看到"系统代理"会去关代理软件，
+ * 看到"环境变量"会去查 shell。只报地址等于让人继续猜。
+ *
  * 没配时显示**空态的含义**（"未设置：直连"），而不是留一格空白——空白看起来像"读不到"。
  */
-const outboundProxyText = computed(
-  () => diagnostics.value?.outboundProxy ?? t('settings.runtimeOutboundProxyEmpty')
+const proxySourceLabelOf = (source: DiagnosticInfo['outboundProxySource']) => {
+  switch (source) {
+    case 'system':
+      return t('settings.proxySourceSystem')
+    case 'environment':
+      return t('settings.proxySourceEnvironment')
+    case 'manual':
+      return t('settings.proxySourceManual')
+    default:
+      return ''
+  }
+}
+/**
+ * 把诊断里的三格拼成一句人话。**纯函数**：复制诊断那一路拿的是刚拉下来的那一份，
+ * 走的是同一段逻辑——否则"界面上写 X、复制出来是 Y"。
+ */
+const describeProxy = (info: DiagnosticInfo | undefined): string => {
+  if (!info) return ''
+  const label = proxySourceLabelOf(info.outboundProxySource)
+  if (info.outboundProxy) {
+    return label
+      ? `${info.outboundProxy}${t('settings.proxySourceSuffix', { source: label })}`
+      : info.outboundProxy
+  }
+  // 有代理配置、却没有可用地址：只有 `socks` / PAC 这种我们这一版用不了的形态。
+  if (info.outboundProxySource === 'off') return t('settings.runtimeOutboundProxyOff')
+  if (info.outboundProxySource === 'system') {
+    return t('settings.runtimeOutboundProxySystemUnusable')
+  }
+  return t('settings.runtimeOutboundProxyEmpty')
+}
+const outboundProxyText = computed(() => describeProxy(diagnostics.value))
+/** 认得出、但这一版用不了的（`socks=…` / `pac`）。静默退回直连是最坏的，所以要**报**。 */
+const unsupportedProxyText = computed(() =>
+  (diagnostics.value?.outboundProxyUnsupported ?? []).join('、')
 )
 /**
  * 运行参数那张表：每行 = 叫什么 / 现在是什么 / **改哪个变量**。
@@ -265,7 +303,7 @@ const outboundProxyText = computed(
 const runtimeRows = computed(() => {
   const current = runtime.value
   if (!current) return []
-  return [
+  const rows = [
     { label: t('settings.runtimeBind'), value: current.bind, where: 'RENDERLOFT_BIND' },
     {
       label: t('settings.runtimeAllowedHosts'),
@@ -283,9 +321,17 @@ const runtimeRows = computed(() => {
     {
       label: t('settings.outboundProxy'),
       value: outboundProxyText.value,
-      where: 'HTTP_PROXY / HTTPS_PROXY'
+      where: 'RENDERLOFT_PROXY / HTTP(S)_PROXY'
     }
   ]
+  if (unsupportedProxyText.value) {
+    rows.push({
+      label: t('settings.outboundProxyUnsupported'),
+      value: unsupportedProxyText.value,
+      where: ''
+    })
+  }
+  return rows
 })
 /*
  * 这一页只管**本地偏好**：界面、主题、更新与诊断。
@@ -336,7 +382,11 @@ const handleCopyDiagnostics = async () => {
             `${t('settings.runtimeDistDir')}: ${loaded.runtime.distDir}`
           ]
         : []),
-      `${t('settings.outboundProxy')}: ${loaded.outboundProxy ?? '-'}`
+      `${t('settings.outboundProxy')}: ${describeProxy(loaded)}${
+        (loaded.outboundProxyUnsupported ?? []).length
+          ? ` / ${t('settings.outboundProxyUnsupported')}: ${(loaded.outboundProxyUnsupported ?? []).join('、')}`
+          : ''
+      }`
     ].join('\n')
     await navigator.clipboard.writeText(text)
     appStore.showNotification('success', t('settings.diagnosticsCopied'))
