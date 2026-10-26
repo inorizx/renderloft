@@ -1167,6 +1167,16 @@ pub async fn list_operations(
     ))
 }
 
+/// 这条连接**当前修订**是否被冻结（换过 key 的旧冻结自然不生效）。
+fn paused_reason_of(state: &V2HttpState, current_revision_id: u64) -> Option<String> {
+    state
+        .paused
+        .snapshot()
+        .into_iter()
+        .find(|(revision_id, _)| *revision_id == current_revision_id)
+        .map(|(_, reason)| reason)
+}
+
 /// connection revision → (connectionId, 账号名)。查不到就是 `None`（不编造名字）。
 async fn resolve_connection_label(
     connections: &Arc<dyn crate::v2::ports::repositories::ConnectionRepository>,
@@ -1968,7 +1978,10 @@ pub async fn get_artifact(
 
 // ---------- connections ----------
 
-fn connection_summary(connection: &crate::v2::domain::model::Connection) -> Value {
+fn connection_summary(
+    connection: &crate::v2::domain::model::Connection,
+    paused_reason: Option<&str>,
+) -> Value {
     json!({
         "connectionId": connection.id.0,
         "vendor": connection.vendor,
@@ -1976,6 +1989,9 @@ fn connection_summary(connection: &crate::v2::domain::model::Connection) -> Valu
         "displayName": connection.display_name,
         "currentRevisionId": connection.current_revision_id.0,
         "status": connection.status,
+        // 被冻结时非空：key 失效 / 余额不足，调度器暂时不让它接新单。
+        // 界面必须能看见——否则用户只会看到"任务莫名不动"。
+        "pausedReason": paused_reason,
     })
 }
 
@@ -1989,11 +2005,21 @@ pub async fn list_connections(
         .list_connections()
         .await
         .map_err(domain_error)?;
+    // 冻结是按 connection revision 记的：拿当前修订去对，换过 key 的旧冻结自然不生效。
+    let paused: std::collections::HashMap<u64, String> =
+        state.paused.snapshot().into_iter().collect();
     Ok(Json(
         serde_json::to_value(Envelope::new(
             connections
                 .iter()
-                .map(connection_summary)
+                .map(|connection| {
+                    connection_summary(
+                        connection,
+                        paused
+                            .get(&connection.current_revision_id.0)
+                            .map(String::as_str),
+                    )
+                })
                 .collect::<Vec<_>>(),
         ))
         .unwrap(),
@@ -2070,7 +2096,10 @@ pub async fn get_connection(
     };
     Ok(Json(
         serde_json::to_value(Envelope::new(json!({
-            "connection": connection_summary(&connection),
+            "connection": connection_summary(
+                &connection,
+                paused_reason_of(&state, connection.current_revision_id.0).as_deref(),
+            ),
             "config": revision.as_ref().map(|revision| revision.config.clone()).unwrap_or_default(),
             "secretBindings": revision.as_ref().map(|revision| revision.secret_bindings.clone()).unwrap_or_default(),
             "secretHint": secret_hint,
@@ -2147,7 +2176,11 @@ pub async fn update_connection(
     });
     let connection = use_case.execute(request).await.map_err(domain_error)?;
     Ok(Json(
-        serde_json::to_value(Envelope::new(connection_summary(&connection))).unwrap(),
+        serde_json::to_value(Envelope::new(connection_summary(
+            &connection,
+            paused_reason_of(&state, connection.current_revision_id.0).as_deref(),
+        )))
+        .unwrap(),
     ))
 }
 

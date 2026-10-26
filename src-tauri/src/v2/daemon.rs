@@ -216,9 +216,10 @@ impl V2Runtime {
             connections: connections.clone(),
             drivers: drivers.clone(),
         });
+        let paused = Arc::new(crate::v2::application::scheduler::PausedAccounts::default());
         let scheduler = Arc::new(SchedulerService {
             capacity: Default::default(),
-            paused: Default::default(),
+            paused: paused.clone(),
             owner: "v2-scheduler".to_string(),
             repositories: operations.clone(),
             leases,
@@ -285,6 +286,7 @@ impl V2Runtime {
             import_service,
             Arc::new(crate::v2::infrastructure::providers::safety::ReqwestSafeHttpClient),
             workspace_backup,
+            paused.clone(),
         ));
 
         let bootstrap_token = ensure_bootstrap_token(data_dir, &state).await?;

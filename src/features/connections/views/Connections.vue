@@ -61,6 +61,8 @@ interface ConnItem {
   protocol: string
   displayName: string
   status: string
+  /** 被冻结的原因（key 失效 / 余额不足）。有值时状态显示「已暂停接单」。 */
+  pausedReason?: string
   baseUrl: string
   apiKeyConfigured: boolean
   detailsAvailable: boolean
@@ -371,6 +373,7 @@ const loadConnections = async () => {
           protocol: item.protocol,
           displayName: item.displayName,
           status: item.status,
+          pausedReason: item.pausedReason ?? undefined,
           baseUrl: String(config.baseUrl ?? ''),
           apiKeyConfigured,
           detailsAvailable,
@@ -421,6 +424,8 @@ const statusOf = (
   if (conn.checking) return { status: 'neutral', label: t('connections.testing') }
   if (!conn.detailsAvailable) return { status: 'neutral', label: t('connections.statusUnknown') }
   if (conn.status !== 'active') return { status: 'warning', label: t('connections.statusDisabled') }
+  // 冻结比"已配置"更要紧：用户看到的是"任务莫名不动"，这里必须说清为什么。
+  if (conn.pausedReason) return { status: 'warning', label: t('connections.statusPaused') }
   if (conn.healthOk === false)
     return { status: 'warning', label: t('connections.statusTestFailed') }
   // 手动测试通过：给一个留在行内的肯定答复（自动健康检查通过时不抢这个位置）。
@@ -1128,6 +1133,13 @@ onMounted(() => {
                       :label="statusOf(conn, def).label"
                     />
                   </div>
+                  <p
+                    v-if="conn.pausedReason"
+                    class="mt-0.5 truncate text-xs text-amber-700 dark:text-amber-400"
+                    :title="conn.pausedReason"
+                  >
+                    {{ t('connections.statusPausedHint', { reason: conn.pausedReason }) }}
+                  </p>
                   <p class="mt-0.5 truncate text-xs text-muted-foreground">
                     {{ conn.baseUrl ? endpointLabel(conn) : def.description }}
                   </p>

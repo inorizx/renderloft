@@ -52,6 +52,8 @@ pub struct V2HttpState {
     pub safe_http: Arc<dyn SafeHttpClient>,
     /// 迁移/备份：把工作区一致地导出一份（见 `application/workspace_backup.rs`）。
     pub workspace_backup: Arc<WorkspaceBackupService>,
+    /// 被冻结的连接（key 失效/余额不足时暂停接单）：与调度器**共享同一份**。
+    pub paused: Arc<crate::v2::application::scheduler::PausedAccounts>,
 }
 
 impl V2HttpState {
@@ -75,6 +77,7 @@ impl V2HttpState {
         import_service: Arc<RecipeImportService>,
         safe_http: Arc<dyn SafeHttpClient>,
         workspace_backup: Arc<WorkspaceBackupService>,
+        paused: Arc<crate::v2::application::scheduler::PausedAccounts>,
     ) -> Self {
         Self {
             tokens,
@@ -95,6 +98,7 @@ impl V2HttpState {
             import_service,
             safe_http,
             workspace_backup,
+            paused,
         }
     }
 }
@@ -582,6 +586,7 @@ mod tests {
             import_service,
             safe_http,
             workspace_backup,
+            Default::default(),
         ))
     }
 
@@ -2112,6 +2117,7 @@ mod tests {
                 crate::v2::infrastructure::providers::safety::ReqwestSafeHttpClient,
             ),
             workspace_backup,
+            Default::default(),
         ))
     }
 

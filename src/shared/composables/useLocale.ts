@@ -863,6 +863,8 @@ const messages = {
     'connections.statusTestFailed': '连接测试失败',
     'connections.statusTested': '连接正常',
     'connections.statusIncomplete': '配置不完整',
+    'connections.statusPaused': '已暂停接单',
+    'connections.statusPausedHint': '已暂停接单：{reason}',
     'connections.statusMissingKey': '缺少密钥',
     'connections.statusConfigured': '已配置',
     /*
@@ -1657,6 +1659,8 @@ const messages = {
     'connections.statusTestFailed': 'Connection test failed',
     'connections.statusTested': 'Connection healthy',
     'connections.statusIncomplete': 'Incomplete configuration',
+    'connections.statusPaused': 'Paused',
+    'connections.statusPausedHint': 'Paused: {reason}',
     'connections.statusMissingKey': 'Missing API key',
     'connections.statusConfigured': 'Configured',
     'connections.facetBalance': 'Balance {value}',

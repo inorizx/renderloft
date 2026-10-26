@@ -46,7 +46,7 @@ pub struct SchedulerService {
     pub artifacts: Arc<dyn ArtifactStore>,
     pub drivers: Arc<DriverRegistry>,
     pub capacity: CapacityCache,
-    pub paused: PausedAccounts,
+    pub paused: Arc<PausedAccounts>,
 }
 
 /// 并发容量是**平台说的事实**，但不必每个 tick 都问一次。

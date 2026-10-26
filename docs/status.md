@@ -4,6 +4,10 @@
 
 ## 已完成
 
+- **被冻结的连接在界面上看得见**（2026-10-27）：`GET /api/v1/connections` 每条连接多一个
+  `pausedReason`（冻结时非空），连接页状态显示「已暂停接单」并附上原因。冻结按**当前修订**匹配，
+  换过 key 的旧冻结自然失效。判据：`an_account_fault_pauses_that_connection_until_the_key_is_fixed`
+  （调度侧）；HTTP 字段是纯映射，未做真机验证（要触发一次鉴权失败，会留下一条失败 run）。
 - **结果里能看见"这条 run 用的哪个账号"**（2026-10-27）：`GET /api/v1/operations/{id}` 与
   `GET /api/v1/runs/{id}` 的每条 run 多两个字段 `connectionId` / `connectionName`（按
   connection revision 缓存反查，查不到就是 `null`——不编造名字）；任务中心的两处 run 行

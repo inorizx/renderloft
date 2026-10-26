@@ -574,6 +574,8 @@ export const v2 = {
       displayName: string
       currentRevisionId: number
       status: string
+      /** 被冻结时非空（key 失效 / 余额不足，调度器暂停它接新单）。 */
+      pausedReason?: string | null
     }>
   > {
     return this.get('/api/v1/connections')
