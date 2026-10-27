@@ -32,6 +32,21 @@ pub const MAX_AUTONOMOUS_CONCURRENT_OPERATIONS: usize = 4;
 /// 清单允许一个必然失败的规模）。清单与代码没有编译期联系，所以只能靠判据测试。
 pub const MAX_RUNS_PER_OPERATION: usize = 100;
 
+/// 每个调用方**每分钟**最多新建多少个 Operation（防"脚本跑飞"）。
+///
+/// 它与 `MAX_AUTONOMOUS_CONCURRENT_OPERATIONS` 管的是两件事：那个管"同时进行中的任务数"、
+/// 且只对 `mcp` 生效；这道闸管**提交频率**、对所有通道生效（`http` / `cli` 此前完全没有上限）。
+/// 一个写错的循环能在几秒内铺出上千条 run——钱是按平台并发慢慢花出去的，人却已经拦不住了。
+///
+/// 为什么是 60：一次最多 100 条 run ⇒ 60 次/分钟 = 6000 runs/分钟，远超任何正常用法
+/// （界面手点、脚本批量都在个位数到十几次/分钟）。正常的"一口气提交 20 个批次"在一秒内
+/// 完成，碰不到它。
+pub const MAX_SUBMISSIONS_PER_MINUTE: usize = 60;
+
+/// 频率闸的窗口长度。固定窗口是**刻意**选的简单：滑动窗口/漏桶要为一个本地单用户进程
+/// 引入计时器与并发结构，而这道闸的唯一目标是"别让循环在几秒内发出上千次"。
+const SUBMISSION_WINDOW_MILLIS: u64 = 60_000;
+
 /// 这个 `origin` 是不是"自主、且没有别的闸门"的调用方。
 ///
 /// ⚠️ 这个判断的**边界就是安全边界**，所以要写清楚为什么是这几个、不是什么：
@@ -83,6 +98,11 @@ pub struct CreateOperation {
     pub repositories: Repositories,
     pub authorization: Box<dyn AuthorizationPolicy>,
     pub schema_validator: Box<dyn SchemaValidator>,
+    /// 提交频率闸：每个 actor 一个 60 秒窗口。
+    ///
+    /// 内存态：重启清零是**刻意的**——重启本身已经是"从头再来"，把上一轮的计数带回来
+    /// 只会误伤刚重启后的第一次提交。
+    submissions: std::sync::Mutex<std::collections::HashMap<String, (u64, usize)>>,
 }
 
 impl CreateOperation {
@@ -95,7 +115,45 @@ impl CreateOperation {
             repositories,
             authorization,
             schema_validator,
+            submissions: Default::default(),
         }
+    }
+
+    /// 每个调用方每 60 秒最多 `MAX_SUBMISSIONS_PER_MINUTE` 次提交。
+    ///
+    /// 放在 `execute` 的最前面（授权之后）：这是**花钱入口**的第一道闸，预检
+    /// （`preflight`）不经过它——只读的预检不该被限速，否则"先验一遍再提交"的正常用法
+    /// 会自相矛盾。
+    fn guard_submission_rate(&self, actor: &ActorRef) -> DomainResult<()> {
+        let now = Timestamp::now_millis();
+        let key = format!("{}:{}", actor.id, actor.client_id.0);
+        let mut windows = self
+            .submissions
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let window = windows.entry(key).or_insert((now, 0));
+        if now.saturating_sub(window.0) >= SUBMISSION_WINDOW_MILLIS {
+            *window = (now, 0);
+        }
+        window.1 += 1;
+        if window.1 <= MAX_SUBMISSIONS_PER_MINUTE {
+            return Ok(());
+        }
+        let retry_after_seconds =
+            SUBMISSION_WINDOW_MILLIS.saturating_sub(now.saturating_sub(window.0)) / 1000 + 1;
+        Err(SafeError::retryable(
+            "SUBMISSION_RATE_LIMITED",
+            format!(
+                "提交太频繁：每 60 秒最多 {MAX_SUBMISSIONS_PER_MINUTE} 次（本窗口已 {} 次）。\
+                 等 {retry_after_seconds} 秒再试。这是本地闸门，不是平台拒绝——它防的是\
+                 脚本跑飞把队列和余额一起铺开。",
+                window.1
+            ),
+        )
+        .with_details(std::collections::BTreeMap::from([(
+            "retryAfterSeconds".to_string(),
+            serde_json::json!(retry_after_seconds),
+        )])))
     }
 
     pub async fn execute(
@@ -103,6 +161,8 @@ impl CreateOperation {
         request: CreateOperationRequest,
     ) -> DomainResult<PersistedOperation> {
         self.authorize(&request.actor).await?;
+        // 花钱入口的第一道闸：频率（对所有通道生效，见 `MAX_SUBMISSIONS_PER_MINUTE`）。
+        self.guard_submission_rate(&request.actor)?;
         // ⚠️ **花钱的闸门放在这里**——副作用真正发生的地方，而不是某个客户端的包装层。
         //
         // 为什么必须有：MCP 那条路是**自动批准**的——一个跑偏的模型能在一条对话里无限提交
@@ -827,6 +887,44 @@ mod tests {
             .await
             .expect_err("撞名应在提交前被拒");
         assert_eq!(error.code, "DUPLICATE_CLIENT_RUN_ID", "{error:?}");
+    }
+
+    /// 提交频率闸：同一个调用方 60 秒内第 61 次被拒，**换个 actor 不受影响**。
+    ///
+    /// 判别点三条：限额内全部成功（不能把正常用法误杀）；超了给 `SUBMISSION_RATE_LIMITED`
+    /// 且 `retryable`（等几秒就能继续）；闸是**按调用方**算的，不是全局的。
+    #[tokio::test]
+    async fn submissions_are_rate_limited_per_actor() {
+        let repositories = InMemoryRepositories::new();
+        seed_environment(&repositories);
+        let use_case = use_case(repositories);
+        for index in 0..MAX_SUBMISSIONS_PER_MINUTE {
+            let mut request = request(actor(vec![Scope::OperationsExecute]));
+            request.origin = "http".to_string();
+            request.idempotency_key = IdempotencyKey(format!("rate-key-{index}"));
+            use_case
+                .execute(request)
+                .await
+                .expect("限额内的提交必须全部成功");
+        }
+
+        let mut over = request(actor(vec![Scope::OperationsExecute]));
+        over.origin = "http".to_string();
+        over.idempotency_key = IdempotencyKey("rate-key-over".to_string());
+        let error = use_case.execute(over).await.expect_err("超过频率应被拒");
+        assert_eq!(error.code, "SUBMISSION_RATE_LIMITED");
+        assert!(error.retryable, "这是「等一会儿就好」，不是永久失败");
+        assert!(
+            error.details.contains_key("retryAfterSeconds"),
+            "调用方需要知道等多久"
+        );
+
+        // 换一个调用方：闸是按 actor 算的，不该牵连别人。
+        let mut other = request(actor(vec![Scope::OperationsExecute]));
+        other.actor.id = "actor-2".to_string();
+        other.origin = "http".to_string();
+        other.idempotency_key = IdempotencyKey("other-key".to_string());
+        use_case.execute(other).await.expect("别的调用方不该被牵连");
     }
 
     #[tokio::test]

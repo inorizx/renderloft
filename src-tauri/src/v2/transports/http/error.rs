@@ -7,7 +7,7 @@ pub fn status_for(error: &SafeError) -> StatusCode {
     match error.code.as_str() {
         "IDEMPOTENCY_CONFLICT" | "LEASE_BUSY" | "LEASE_LOST" => StatusCode::CONFLICT,
         "SCHEMA_CHANGED" => StatusCode::PRECONDITION_FAILED,
-        "PROVIDER_RATE_LIMITED" => StatusCode::TOO_MANY_REQUESTS,
+        "PROVIDER_RATE_LIMITED" | "SUBMISSION_RATE_LIMITED" => StatusCode::TOO_MANY_REQUESTS,
         "SCOPE_REQUIRED" => StatusCode::FORBIDDEN,
         "TOKEN_INVALID" | "TOKEN_EXPIRED" | "TOKEN_REVOKED" => StatusCode::UNAUTHORIZED,
         _ => match error.kind {
