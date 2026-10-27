@@ -284,12 +284,22 @@ pub fn initialize_schema(connection: &SqliteConnection) -> Result<(), String> {
                 api_base_url TEXT NOT NULL DEFAULT '',
                 llm_base_url TEXT NOT NULL DEFAULT '',
                 llm_model TEXT NOT NULL DEFAULT '',
-                download_dir TEXT NOT NULL DEFAULT ''
+                download_dir TEXT NOT NULL DEFAULT '',
+                -- 历史保留天数：终态操作超过它就整批清理；0 = 永久保留。
+                history_retain_days INTEGER NOT NULL DEFAULT 30
             );
             ",
         )
         .map_err(|error| format!("无法初始化 V2 schema：{error}"))?;
     ensure_column(connection, "v2_assets", "run_id", "INTEGER")?;
+    // 历史保留天数：老库补列时带 DEFAULT 30 ⇒ 既有用户行为不变（仍旧 30 天清理），
+    // 想长期留档的人自己去设置里改（0 = 永久）。
+    ensure_column(
+        connection,
+        "v2_settings",
+        "history_retain_days",
+        "INTEGER NOT NULL DEFAULT 30",
+    )?;
     ensure_column(
         connection,
         "v2_recipes",
@@ -436,11 +446,12 @@ impl SettingsRepository for SqliteRepositories {
             .query_row(
                 // llm_base_url / llm_model 列已废弃（LLM 配置不再走设置页），
                 // 列保留在 schema 中兼容老库，不再读取。
-                "SELECT download_dir FROM v2_settings WHERE id = 1",
+                "SELECT download_dir, history_retain_days FROM v2_settings WHERE id = 1",
                 [],
                 |row| {
                     Ok(SettingsRecord {
                         download_dir: row.get(0)?,
+                        history_retain_days: row.get::<_, i64>(1)?.max(0) as u64,
                     })
                 },
             )
@@ -458,9 +469,10 @@ impl SettingsRepository for SqliteRepositories {
         connection
             .execute(
                 // 废弃列有 DEFAULT ''，INSERT 不再提供。
-                "INSERT INTO v2_settings (id, download_dir) VALUES (1, ?1)
-                 ON CONFLICT(id) DO UPDATE SET download_dir = excluded.download_dir",
-                params![record.download_dir],
+                "INSERT INTO v2_settings (id, download_dir, history_retain_days) VALUES (1, ?1, ?2)
+                 ON CONFLICT(id) DO UPDATE SET download_dir = excluded.download_dir,
+                                              history_retain_days = excluded.history_retain_days",
+                params![record.download_dir, record.history_retain_days as i64],
             )
             .map_err(|_| SafeError::storage("无法保存设置"))?;
         Ok(())

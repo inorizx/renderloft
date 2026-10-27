@@ -4,10 +4,14 @@ import { v2 } from '@/shared/api/v2'
 
 interface SettingsSnapshot {
   downloadDir: string
+  /** 已终态任务保留天数；`0` = 永久保留。 */
+  historyRetainDays: number
 }
 
 export const useSettingsStore = defineStore('settings', () => {
   const downloadDir = ref('')
+  /** 历史保留天数（默认 30）：`0` = 永久保留，见后端 hygiene 的清扫。 */
+  const historyRetainDays = ref(30)
   const defaultAspectRatio = ref('1:1')
   const defaultResolution = ref('1k')
   const autoRefreshApps = ref(true)
@@ -26,12 +30,17 @@ export const useSettingsStore = defineStore('settings', () => {
       })
     )
 
-  // 设置只保存本机偏好（下载目录等）；机密与小配置都归各自的连接（连接页）。
-  const saveSettings = async (downloadDirValue = downloadDir.value) => {
+  // 设置只保存本机偏好（下载目录、历史保留期等）；机密与小配置都归各自的连接（连接页）。
+  const saveSettings = async (
+    downloadDirValue = downloadDir.value,
+    historyRetainDaysValue = historyRetainDays.value
+  ) => {
     const persisted = await v2.put<SettingsSnapshot>('/api/v1/settings', {
-      downloadDir: downloadDirValue
+      downloadDir: downloadDirValue,
+      historyRetainDays: historyRetainDaysValue
     })
     downloadDir.value = persisted.downloadDir
+    historyRetainDays.value = persisted.historyRetainDays ?? 30
     saveLocalPreferences()
   }
 
@@ -50,6 +59,7 @@ export const useSettingsStore = defineStore('settings', () => {
       try {
         const result = await v2.get<SettingsSnapshot>('/api/v1/settings')
         downloadDir.value = result.downloadDir || ''
+        historyRetainDays.value = result.historyRetainDays ?? 30
         loadError.value = ''
         isLoaded.value = true
       } catch (error) {
@@ -71,6 +81,7 @@ export const useSettingsStore = defineStore('settings', () => {
 
   return {
     downloadDir,
+    historyRetainDays,
     defaultAspectRatio,
     defaultResolution,
     autoRefreshApps,

@@ -344,6 +344,10 @@ const messages = {
     'settings.downloadDirDescription':
       '桌面版会将结果保存到这里；浏览器访问时由浏览器下载设置决定。',
     'settings.downloadDirPlaceholder': '例如：D:\\RenderLoft\\Downloads',
+    'settings.historyRetention': '历史保留（天）',
+    'settings.historyRetentionDescription':
+      '已结束的任务超过这个天数会被清理（连带产物记录与事件）；填 0 = 永久保留。',
+    'settings.historyRetentionPlaceholder': '默认 30',
     'settings.openDir': '打开目录',
     'settings.savedConfigHint': '下载目录已保存。',
     'settings.openDownloadDirFailed': '打开下载目录失败：{message}',
@@ -1233,6 +1237,10 @@ const messages = {
     'settings.downloadDirDescription':
       'The desktop app saves results here. Browser access follows the browser download settings.',
     'settings.downloadDirPlaceholder': 'e.g. D:\\RenderLoft\\Downloads',
+    'settings.historyRetention': 'History retention (days)',
+    'settings.historyRetentionDescription':
+      'Finished tasks older than this are cleaned up (including their artifacts and events); 0 = keep forever.',
+    'settings.historyRetentionPlaceholder': 'default 30',
     'settings.openDir': 'Open directory',
     'settings.savedConfigHint': 'Download directory saved.',
     'settings.openDownloadDirFailed': 'Failed to open download directory: {message}',

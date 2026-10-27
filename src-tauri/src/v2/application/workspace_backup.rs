@@ -188,6 +188,7 @@ mod tests {
         repositories
             .save_settings(&SettingsRecord {
                 download_dir: "D:/pics".to_string(),
+                history_retain_days: 30,
             })
             .await
             .expect("写设置");

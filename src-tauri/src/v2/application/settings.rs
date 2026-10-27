@@ -21,6 +21,8 @@ use crate::v2::ports::stores::SecretStore;
 #[serde(rename_all = "camelCase")]
 pub struct SettingsView {
     pub download_dir: String,
+    /// 历史保留天数：终态操作超过它就整批清理；`0` = **永久保留**。
+    pub history_retain_days: u64,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -28,6 +30,9 @@ pub struct SettingsView {
 pub struct SettingsInput {
     #[serde(default)]
     pub download_dir: String,
+    /// `None` = 这次不动它（PUT 是部分更新，没给的键保持原值）。
+    #[serde(default)]
+    pub history_retain_days: Option<u64>,
 }
 
 pub struct SettingsService {
@@ -43,16 +48,27 @@ impl SettingsService {
         let record = self.settings.load_settings().await?;
         Ok(SettingsView {
             download_dir: record.download_dir,
+            history_retain_days: record.history_retain_days,
         })
     }
 
     pub async fn save(&self, input: SettingsInput) -> DomainResult<SettingsView> {
+        let current = self.settings.load_settings().await?;
         let download_dir = if input.download_dir.trim().is_empty() {
             default_download_dir()
         } else {
             input.download_dir.trim().to_string()
         };
-        let record = SettingsRecord { download_dir };
+        // 没给就保持原值：设置是**部分更新**，不能让"只想改下载目录"的人顺手把保留期改回默认。
+        // 上限 100 年只是防手滑（一个 20 位数会算出一个荒谬的 cutoff，行为与 0 相同但难读）。
+        let history_retain_days = match input.history_retain_days {
+            Some(days) => days.min(36_500),
+            None => current.history_retain_days,
+        };
+        let record = SettingsRecord {
+            download_dir,
+            history_retain_days,
+        };
         self.settings.save_settings(&record).await?;
         self.view().await
     }
@@ -491,6 +507,7 @@ mod tests {
         let view = service
             .save(SettingsInput {
                 download_dir: "D:/tmp/downloads".to_string(),
+                history_retain_days: None,
             })
             .await
             .unwrap();
@@ -503,10 +520,48 @@ mod tests {
         let view = service
             .save(SettingsInput {
                 download_dir: "  ".to_string(),
+                history_retain_days: None,
             })
             .await
             .unwrap();
         assert!(!view.download_dir.is_empty());
+    }
+
+    /// 历史保留期：默认 30 天（= 旧行为）、`0` = 永久、**PUT 是部分更新**（没给就不动）。
+    #[tokio::test]
+    async fn history_retention_is_part_of_settings_and_is_a_partial_update() {
+        let service = service();
+        assert_eq!(
+            service.view().await.unwrap().history_retain_days,
+            30,
+            "没改过的人看到的必须是旧行为（30 天）"
+        );
+        let view = service
+            .save(SettingsInput {
+                download_dir: "D:/a".to_string(),
+                history_retain_days: Some(0),
+            })
+            .await
+            .unwrap();
+        assert_eq!(view.history_retain_days, 0, "0 = 永久保留");
+        // 只想改下载目录的人，不该顺手把保留期改回默认。
+        let view = service
+            .save(SettingsInput {
+                download_dir: "D:/b".to_string(),
+                history_retain_days: None,
+            })
+            .await
+            .unwrap();
+        assert_eq!(view.history_retain_days, 0, "没给就保持原值");
+        // 上限只是防手滑，不改变语义（超过 100 年按 100 年算）。
+        let view = service
+            .save(SettingsInput {
+                download_dir: "D:/b".to_string(),
+                history_retain_days: Some(u64::MAX),
+            })
+            .await
+            .unwrap();
+        assert_eq!(view.history_retain_days, 36_500);
     }
 
     #[test]

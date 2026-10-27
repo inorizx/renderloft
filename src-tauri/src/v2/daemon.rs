@@ -234,8 +234,13 @@ impl V2Runtime {
             artifacts: artifacts.clone(),
             drivers: drivers.clone(),
         });
+        // 设置仓储要在清扫服务之前拿到：历史上限（保留天数）是**用户设的策略**，
+        // 清扫每轮都要读它（`0` = 永久保留）。
+        let concrete_settings: Arc<dyn crate::v2::ports::repositories::SettingsRepository> =
+            concrete.clone() as Arc<dyn crate::v2::ports::repositories::SettingsRepository>;
         let hygiene = Arc::new(HygieneService {
             repositories: operations.clone(),
+            settings: concrete_settings.clone(),
         });
         let callbacks = Arc::new(CallbackService {
             repositories: operations.clone(),
@@ -253,8 +258,6 @@ impl V2Runtime {
             secrets.clone(),
         ));
 
-        let concrete_settings: Arc<dyn crate::v2::ports::repositories::SettingsRepository> =
-            concrete.clone() as Arc<dyn crate::v2::ports::repositories::SettingsRepository>;
         let settings = Arc::new(SettingsService::new(concrete_settings));
         let import_service = Arc::new(RecipeImportService::new(
             connections.clone(),

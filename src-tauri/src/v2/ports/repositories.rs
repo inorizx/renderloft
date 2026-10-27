@@ -235,9 +235,25 @@ pub enum ArtifactCursor {
     Before(Option<crate::v2::domain::ids::ArtifactId>),
 }
 
-#[derive(Debug, Clone, Default)]
+/// 历史保留的默认天数：已终态的操作超过它就整批清理；`0` = **永久保留**。
+///
+/// 为什么住在端口层：有两个消费者必须同意这个数——设置页给的默认值、以及清扫服务在
+/// 设置没写时的兜底。两处各写一个 30，迟早会一边改一边忘。
+pub const DEFAULT_HISTORY_RETAIN_DAYS: u64 = 30;
+
+#[derive(Debug, Clone)]
 pub struct SettingsRecord {
     pub download_dir: String,
+    pub history_retain_days: u64,
+}
+
+impl Default for SettingsRecord {
+    fn default() -> Self {
+        Self {
+            download_dir: String::new(),
+            history_retain_days: DEFAULT_HISTORY_RETAIN_DAYS,
+        }
+    }
 }
 
 #[async_trait]

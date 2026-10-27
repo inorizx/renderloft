@@ -24,6 +24,16 @@
               }}</Button>
             </div>
           </FormField>
+          <FormField
+            :label="t('settings.historyRetention')"
+            :description="t('settings.historyRetentionDescription')"
+          >
+            <Input
+              v-model.trim="historyRetainInput"
+              inputmode="numeric"
+              :placeholder="t('settings.historyRetentionPlaceholder')"
+            />
+          </FormField>
           <div class="flex justify-end border-t border-border pt-5">
             <Button class="shrink-0" type="button" :disabled="isSaving" @click="handleSave"
               ><LoaderCircle v-if="isSaving" class="size-4 animate-spin" /><Save
@@ -207,6 +217,8 @@ const saveError = ref('')
 const saveSuccess = ref(false)
 const isDesktop = isDesktopRuntime()
 const downloadDirInput = ref('')
+/** 历史保留天数的输入框（字符串，提交前收成非负整数；`0` = 永久保留）。 */
+const historyRetainInput = ref('30')
 /**
  * daemon **当前生效**的运行参数与默认值（诊断卡片里显示）。
  *
@@ -352,12 +364,18 @@ const handleCopyDiagnostics = async () => {
     isCopyingDiagnostics.value = false
   }
 }
+/** 输入框里的天数 → 非负整数；空/非法就沿用当前值（别让人手滑把历史设成"全删"）。 */
+const historyRetainValue = () => {
+  const parsed = Number.parseInt(historyRetainInput.value, 10)
+  if (!Number.isFinite(parsed) || parsed < 0) return store.historyRetainDays
+  return Math.min(36_500, parsed)
+}
 const handleSave = async () => {
   if (isSaving.value) return
   isSaving.value = true
   clearSaveStatus()
   try {
-    await store.saveSettings(downloadDirInput.value)
+    await store.saveSettings(downloadDirInput.value, historyRetainValue())
     saveSuccess.value = true
     appStore.showNotification('success', t('settings.saveSuccess'))
   } catch (error) {
@@ -392,5 +410,6 @@ onMounted(async () => {
     diagnostics.value = undefined
   }
   downloadDirInput.value = store.downloadDir
+  historyRetainInput.value = String(store.historyRetainDays)
 })
 </script>

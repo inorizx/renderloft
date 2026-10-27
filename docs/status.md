@@ -4,6 +4,15 @@
 
 ## 已完成
 
+- **历史留多久，现在你说了算**（2026-10-27，晚）：设置页多了「历史保留（天）」。默认 **30 天**
+  （= 旧行为；老库由 `ensure_column ... DEFAULT 30` 补齐），填 `0` = **永久保留**。
+  清扫每轮读设置，不再用代码里的常量——"想留多久"是用户的策略，不该由常量替他决定；
+  此前要长期留档的人只能眼看 30 天后记录被清掉。
+  判据：`retention_zero_means_never_and_other_values_become_a_cutoff`（`0` ⇒ 没有截止点；
+  30 天必须等于 30×86400000ms——写成 `24*60*60` 会把保留期变成 43 分钟）、
+  `a_zero_retention_setting_purges_nothing`、`history_retention_is_part_of_settings_and_is_a_partial_update`
+  （只改下载目录的人不会把保留期打回默认）。
+  `GET /settings` 回 `historyRetainDays`；`PUT /settings` 是**部分更新**（没给就不动）。
 - **名字是可选的，而且不是身份**（2026-10-27，晚）：`clientRunId` 不再必填——不填就按序号补
   `run-1`、`run-2`（只保证库内唯一），而且**不进产物文件名**；填了才当前缀。默认产物名因此
   回到中性的 `{应用名}-{artifactId}.{ext}`。重试也照这条：调用方起过名字才带 `-retry-` 后缀，

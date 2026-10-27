@@ -2,13 +2,11 @@ use std::sync::Arc;
 
 use crate::v2::domain::errors::DomainResult;
 use crate::v2::domain::model::Timestamp;
-use crate::v2::ports::repositories::OperationRepository;
+use crate::v2::ports::repositories::{OperationRepository, SettingsRepository};
 
 /// 陈旧未终态操作的清扫时限（操作级兜底，独立于 run 级 tracking_deadline）。
 /// 单任务很少超过 1 小时，但重试/不确定提交可能跨时段，取 6 小时作为"明显已被中断"的判据。
 pub const HYGIENE_STALE_AFTER_MILLIS: u64 = 6 * 60 * 60 * 1000;
-/// 已终态历史操作的保留期限（超期清理，含产物/事件，防止 DB 无限膨胀）。
-pub const HYGIENE_RETAIN_MILLIS: u64 = 30 * 24 * 60 * 60 * 1000;
 /// 每轮清扫上限，避免一轮事务阻塞过久。
 const HYGIENE_SWEEP_LIMIT: usize = 200;
 
@@ -20,6 +18,8 @@ pub struct HygieneResult {
 
 pub struct HygieneService {
     pub repositories: Arc<dyn OperationRepository>,
+    /// 历史保留天数的来源。`0` = **永久保留**（不清理，见 `tick`）。
+    pub settings: Arc<dyn SettingsRepository>,
 }
 
 impl HygieneService {
@@ -54,18 +54,45 @@ impl HygieneService {
             stale_failed += changed;
         }
 
-        let retain_cutoff = Timestamp::from_millis(now.saturating_sub(HYGIENE_RETAIN_MILLIS));
-        let old_terminal = self
-            .repositories
-            .list_old_terminal_operations(retain_cutoff, HYGIENE_SWEEP_LIMIT)
-            .await?;
-        let purged = self.repositories.delete_operations(&old_terminal).await?;
+        // 保留期由**设置**决定（默认 30 天，`0` = 永久保留）：这是"我想留多久"的问题，
+        // 属于用户策略，不该由代码里的常量替用户决定。读到设置失败就按默认走——
+        // 清扫挂掉比多删一点更糟，而默认值与旧行为逐字一致。
+        let retain_days = self
+            .settings
+            .load_settings()
+            .await
+            .map(|record| record.history_retain_days)
+            .unwrap_or(crate::v2::ports::repositories::DEFAULT_HISTORY_RETAIN_DAYS);
+        let purged = match purge_cutoff(now, retain_days) {
+            // `0` = 永久保留：不清理，连查询都不发。
+            None => 0,
+            Some(retain_cutoff) => {
+                let old_terminal = self
+                    .repositories
+                    .list_old_terminal_operations(retain_cutoff, HYGIENE_SWEEP_LIMIT)
+                    .await?;
+                self.repositories.delete_operations(&old_terminal).await?
+            }
+        };
 
         Ok(HygieneResult {
             stale_failed,
             purged,
         })
     }
+}
+
+/// 保留期 → 清理截止点。`0` = **永久保留** ⇒ `None`（一条都不清）。
+///
+/// 为什么抽成纯函数：真库里"30 天前的记录"在测试里造不出来（写入路径会把 `updated_at`
+/// 刷成 now），所以"0 到底是不是不删"这条判据只能落在不需要数据的算术上——
+/// 顺便也让"天 → 毫秒"的那种手滑（写成 24*60*60 而不是 *1000）无处可藏。
+pub fn purge_cutoff(now_millis: u64, retain_days: u64) -> Option<Timestamp> {
+    if retain_days == 0 {
+        return None;
+    }
+    let retain_millis = retain_days.saturating_mul(24 * 60 * 60 * 1000);
+    Some(Timestamp::from_millis(now_millis.saturating_sub(retain_millis)))
 }
 
 #[cfg(test)]
@@ -77,10 +104,10 @@ mod tests {
     };
     use crate::v2::domain::operation::{Operation, OperationStatus, RunStatus};
     use crate::v2::infrastructure::fakes::InMemoryRepositories;
-    use crate::v2::ports::repositories::{NewOperation, NewRun};
+    use crate::v2::ports::repositories::{NewOperation, NewRun, SettingsRecord};
 
     async fn seed(
-        repositories: &Arc<dyn OperationRepository>,
+        repositories: &Arc<InMemoryRepositories>,
         idempotency_key: &str,
     ) -> OperationId {
         let now = Timestamp::now();
@@ -119,20 +146,58 @@ mod tests {
             .id
     }
 
-    fn service(repositories: Arc<dyn OperationRepository>) -> HygieneService {
-        HygieneService { repositories }
+    fn service(repositories: Arc<InMemoryRepositories>) -> HygieneService {
+        HygieneService {
+            repositories: repositories.clone(),
+            settings: repositories,
+        }
+    }
+
+    async fn save_retention(repositories: &Arc<InMemoryRepositories>, days: u64) {
+        repositories
+            .save_settings(&SettingsRecord {
+                download_dir: String::new(),
+                history_retain_days: days,
+            })
+            .await
+            .expect("保存设置应成功");
+    }
+
+    /// "保留多少天"到"截止点在哪"的算术：`0` 必须是 `None`（永久），30 天必须是 30×86400000ms。
+    ///
+    /// 为什么只测这个纯函数：真库里"30 天前的记录"造不出来（写入路径会把 `updated_at`
+    /// 刷成 now），所以"0 到底删不删"这条判据只能落在这里。
+    #[test]
+    fn retention_zero_means_never_and_other_values_become_a_cutoff() {
+        let now = 1_700_000_000_000u64;
+        assert!(
+            purge_cutoff(now, 0).is_none(),
+            "0 = 永久保留，不该算出截止点"
+        );
+        assert_eq!(
+            purge_cutoff(now, 30).unwrap().millis(),
+            now - 30 * 86_400_000,
+            "天 → 毫秒一旦写错（少乘 1000），保留期就从 30 天变成 43 分钟"
+        );
     }
 
     #[tokio::test]
-    async fn empty_repo_tick_is_noop() {
-        let repositories: Arc<dyn OperationRepository> = Arc::new(InMemoryRepositories::default());
+    async fn a_zero_retention_setting_purges_nothing() {
+        let repositories = Arc::new(InMemoryRepositories::default());
+        save_retention(&repositories, 0).await;
+        let out = service(repositories).tick().await.unwrap();
+        assert_eq!(out.purged, 0);
+    }
+
+    #[tokio::test]    async fn empty_repo_tick_is_noop() {
+        let repositories = Arc::new(InMemoryRepositories::default());
         let out = service(repositories).tick().await.unwrap();
         assert_eq!(out, HygieneResult::default());
     }
 
     #[tokio::test]
     async fn fresh_non_terminal_operation_is_not_cleaned() {
-        let repositories: Arc<dyn OperationRepository> = Arc::new(InMemoryRepositories::default());
+        let repositories = Arc::new(InMemoryRepositories::default());
         let operation_id = seed(&repositories, "fresh-key").await;
         let out = service(repositories.clone()).tick().await.unwrap();
         assert_eq!(out.stale_failed, 0);
