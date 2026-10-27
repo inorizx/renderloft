@@ -6,6 +6,17 @@
       :description="t('results.description')"
     >
       <template #actions>
+        <Button v-if="selecting" variant="ghost" size="sm" @click="cancelSelection">{{
+          t('results.cancelSelect')
+        }}</Button>
+        <Button
+          v-else
+          variant="outline"
+          size="sm"
+          :disabled="!items.length"
+          @click="selecting = true"
+          >{{ t('results.select') }}</Button
+        >
         <Button variant="outline" size="sm" :disabled="loading" @click="reload">{{
           t('results.reload')
         }}</Button>
@@ -22,15 +33,40 @@
       <template #icon><Images class="size-5" /></template>
     </EmptyState>
 
-    <div v-else class="results-grid" aria-live="polite">
+    <!--
+      「挑」这一步此前只能靠人肉：20 张里要 5 张，就得下载 20 次、再删 15 个文件。
+      选择模式把"挑选"变成一次点击；导出沿用逐张保存（文件名规则不变）。
+    -->
+    <div
+      v-if="selecting"
+      class="mb-3 flex flex-wrap items-center gap-2 rounded-lg border border-border bg-secondary/50 px-3 py-2 text-sm"
+    >
+      <span class="font-medium">{{
+        t('results.selectedCount', { selected: selected.size, total: items.length })
+      }}</span>
+      <Button variant="ghost" size="sm" @click="selectAll">{{ t('results.selectAll') }}</Button>
+      <Button variant="ghost" size="sm" :disabled="!selected.size" @click="clearSelection">{{
+        t('results.clearSelect')
+      }}</Button>
+      <span class="flex-1"></span>
+      <Button size="sm" :disabled="!selected.size || exporting" @click="exportSelected">{{
+        exporting ? t('results.exporting') : t('results.exportSelected')
+      }}</Button>
+    </div>
+
+    <div v-if="items.length" class="results-grid" aria-live="polite">
       <button
         v-for="(item, index) in items"
         :key="item.artifactId"
         type="button"
         class="result-card"
+        :class="{ 'result-card-selected': selecting && selected.has(item.artifactId) }"
         :aria-label="item.label"
-        @click="openPreview(index)"
+        @click="selecting ? toggleSelect(item.artifactId) : openPreview(index)"
       >
+        <span v-if="selecting" class="result-check" aria-hidden="true">
+          <Check v-if="selected.has(item.artifactId)" class="size-3.5" />
+        </span>
         <span class="result-thumb">
           <img
             v-if="item.kind === 'image' && item.url"
@@ -80,7 +116,7 @@
 
 <script setup lang="ts">
 import { computed, onBeforeUnmount, onMounted, ref } from 'vue'
-import { FileQuestion, Images, LoaderCircle } from '@lucide/vue'
+import { Check, FileQuestion, Images, LoaderCircle } from '@lucide/vue'
 import PageContainer from '@/components/layout/PageContainer.vue'
 import PageHeader from '@/components/PageHeader.vue'
 import Button from '@/components/ui/Button.vue'
@@ -118,6 +154,61 @@ const items = ref<ResultItem[]>([])
 const loading = ref(false)
 const hasMore = ref(false)
 const error = ref('')
+
+/**
+ * 选择模式：点卡片不是预览，而是勾选。
+ *
+ * 为什么需要它：20 张里只要 5 张时，旧路径是"全下 20 个再删 15 个"。
+ * 这里只做"挑 + 导出选中"，命名规则沿用后端（`saveArtifact` 自己定名），
+ * 不再前端另起一套命名——两套命名迟早对不上。
+ */
+const selecting = ref(false)
+const selected = ref(new Set<number>())
+const exporting = ref(false)
+
+const toggleSelect = (artifactId: number) => {
+  if (selected.value.has(artifactId)) selected.value.delete(artifactId)
+  else selected.value.add(artifactId)
+}
+
+const selectAll = () => {
+  for (const item of items.value) selected.value.add(item.artifactId)
+}
+
+const clearSelection = () => selected.value.clear()
+
+const cancelSelection = () => {
+  selecting.value = false
+  selected.value.clear()
+}
+
+async function exportSelected() {
+  if (!selected.value.size || exporting.value) return
+  exporting.value = true
+  const ids = [...selected.value]
+  let done = 0
+  let directory = ''
+  let firstError = ''
+  for (const artifactId of ids) {
+    try {
+      const saved = await v2.saveArtifact(artifactId)
+      done += 1
+      if (!directory) directory = saved.directory
+    } catch (error) {
+      if (!firstError) firstError = error instanceof Error ? error.message : String(error)
+    }
+  }
+  exporting.value = false
+  if (firstError) {
+    appStore.showNotification(
+      'error',
+      t('results.exportPartial', { done, total: ids.length, message: firstError })
+    )
+    return
+  }
+  appStore.showNotification('success', t('results.exported', { count: done, directory }))
+  cancelSelection()
+}
 const previewIndex = ref<number | null>(null)
 const downloadingIndex = ref(-1)
 
@@ -288,6 +379,7 @@ onBeforeUnmount(releaseUrls)
   grid-template-columns: repeat(auto-fill, minmax(9.5rem, 1fr));
 }
 .result-card {
+  position: relative;
   display: flex;
   flex-direction: column;
   overflow: hidden;
@@ -299,6 +391,29 @@ onBeforeUnmount(releaseUrls)
 }
 .result-card:hover {
   border-color: color-mix(in srgb, var(--primary) 40%, var(--border));
+}
+.result-card-selected {
+  border-color: var(--primary);
+  box-shadow: 0 0 0 2px color-mix(in srgb, var(--primary) 30%, transparent);
+}
+.result-check {
+  position: absolute;
+  top: 0.4rem;
+  right: 0.4rem;
+  z-index: 1;
+  display: grid;
+  place-items: center;
+  width: 1.15rem;
+  height: 1.15rem;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--background) 85%, transparent);
+  color: transparent;
+}
+.result-card-selected .result-check {
+  border-color: var(--primary);
+  background: var(--primary);
+  color: var(--primary-foreground);
 }
 .result-thumb {
   display: grid;
