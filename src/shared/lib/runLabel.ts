@@ -10,13 +10,15 @@
 import { LONG_TEXT_HINTS } from './fieldHeuristics'
 
 /**
- * 后端**自动生成**的 `clientRunId` 形态：`run-<32 位十六进制>`
- * （见 `v2/clients/client.rs::run_request`）。
+ * 后端**自动生成**的 `clientRunId` 形态：
+ * * `run-<序号>` —— 调用方没起名字时按序号补的（`v2/domain/operation.rs::auto_client_run_id`）；
+ * * `run-<32 位十六进制>` —— 更早的默认值（uuid），老数据里还有。
  *
- * 要认出来是因为标签的取舍顺序依赖它：调用方**自己**给的 `clientRunId` 是它的标签，优先用；
- * 而后端自动生成的那个（`run-7f3a…`）对"这是哪条输入"一个字都没说，不如输入摘要。
+ * 两种都要认出来，因为标签的取舍顺序依赖它：调用方**自己**给的 `clientRunId` 是它的标签，优先用；
+ * 而自动生成的那个对"这是哪条输入"一个字都没说（它只是库里的唯一标识，后端也不会拿它当
+ * 产物文件名），不如输入摘要。
  */
-const AUTO_CLIENT_RUN_ID = /^run-[0-9a-f]{32}$/
+const AUTO_CLIENT_RUN_ID = /^run-(\d+|[0-9a-f]{32})$/
 
 export const isAutoClientRunId = (clientRunId: string) => AUTO_CLIENT_RUN_ID.test(clientRunId)
 

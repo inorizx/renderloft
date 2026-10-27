@@ -451,9 +451,10 @@ impl SchedulerService {
                     let id = ArtifactId(run_id.0 * 1000 + index as u64);
                     // ⚠️ 名字在**落库前**定下来，不是下载时才定：这样界面、CLI、API 看到的是
                     // 同一个名字，而且它进了库——改名规则要变时只动这一处，不用回头修数据。
+                    // 前缀只用**调用方起的名字**：自动补的 `run-N` 不是名字（见 display_label）。
                     let filename = crate::v2::domain::execution::ArtifactDraft::compose_filename(
                         &claimed.recipe_name,
-                        &claimed.run.client_run_id,
+                        claimed.run.display_label().unwrap_or(""),
                         id,
                         &artifact.filename,
                     );

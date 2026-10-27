@@ -269,10 +269,11 @@ impl ReconcileService {
                         let id = ArtifactId(run_id.0 * 1000 + index as u64);
                         // 与 scheduler 同一条命名规则（两条落库路径都要有，否则"从哪条路完成"
                         // 会决定库里的名字）。见 `ArtifactDraft::compose_filename`。
+                        // 前缀只用**调用方起的名字**：自动补的 `run-N` 不是名字（见 display_label）。
                         let filename =
                             crate::v2::domain::execution::ArtifactDraft::compose_filename(
                                 &active.recipe_name,
-                                &active.run.client_run_id,
+                                active.run.display_label().unwrap_or(""),
                                 id,
                                 &artifact.filename,
                             );

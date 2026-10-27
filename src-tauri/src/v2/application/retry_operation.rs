@@ -64,14 +64,13 @@ impl RetryOperation {
         let runs = selected_runs
             .iter()
             .map(|run| RunRequest {
-                client_run_id: format!(
-                    "{}-retry-{suffix}",
-                    if run.client_run_id.is_empty() {
-                        "run"
-                    } else {
-                        &run.client_run_id
-                    }
-                ),
+                // 只有**调用方起过的名字**才带进重试（`-retry-` 后缀可观察）；没名字的留空，
+                // 由创建用例按序号补 `run-N`——那种 id 不进文件名，重试后的产物也不会突然
+                // 多出一截 `run-3-retry-…` 的前缀。
+                client_run_id: run
+                    .display_label()
+                    .map(|label| format!("{label}-retry-{suffix}"))
+                    .unwrap_or_default(),
                 recipe_revision_id: run.recipe_revision_id,
                 connection_id: None,
                 inputs: run.inputs.clone(),

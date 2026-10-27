@@ -4,6 +4,15 @@
 
 ## 已完成
 
+- **名字是可选的，而且不是身份**（2026-10-27，晚）：`clientRunId` 不再必填——不填就按序号补
+  `run-1`、`run-2`（只保证库内唯一），而且**不进产物文件名**；填了才当前缀。默认产物名因此
+  回到中性的 `{应用名}-{artifactId}.{ext}`。重试也照这条：调用方起过名字才带 `-retry-` 后缀，
+  没名字的重试产物不会突然多一截前缀。
+  判据：`unnamed_runs_are_accepted_and_leave_no_trace_in_the_filename`（没名字也能提交、补出来的是
+  `run-N`、`display_label()` 为 `None`）、`a_named_run_colliding_with_an_auto_id_is_rejected_before_the_database`
+  （显式名字撞上自动编号要在提交前用人话拒，而不是等 SQLite 的唯一约束）。
+  **边界**：命名是调用方的事，引擎只负责生成与交付；身份永远是 `artifactId` / `checksum`，
+  名字只是"给人认"的一层——README 与 cookbook 都写明了别让下游拿文件名对账。
 - **每一条任务可以提前起名**（2026-10-27）：批量表多了「名称」一列。留空仍是「前缀-序号」，
   填了就用它——`SKU135-正面`、`SKU135-背面` 直接成为 `clientRunId`，于是产物文件名、任务页
   标签、结果页分组都照它走，不必等出图后再回头对号。重名在**提交前**拦下（后端也会拒，
@@ -12,8 +21,9 @@
   （理由见 `stores/runner-sessions.ts`）。
 - **`GET /api/v1/operations/{id}/manifest`：一批的交付清单**（2026-10-27）。下游要回答
   "这批跑出了什么、花在哪、文件叫什么都放在哪"，此前得跨三个接口拼（任务 → run → 产物），
-  每条 run 还要再发一次分页请求。现在一次给全：每条 run 的 `label`（就是产物文件名前缀）、
-  状态、账号、`usage`、`inputs`、`error`，以及每个产物的 `filename` / `byteSize` / `checksum` /
+  每条 run 还要再发一次分页请求。现在一次给全：每条 run 的 `label`（调用方起的名字，也就是
+  产物文件名前缀；**没起名字就是 `null`**）、状态、账号、`usage`、`inputs`、`error`，
+  以及每个产物的 `filename` / `byteSize` / `checksum` /
   `remoteUrl` / `bytesPath`（带 token 取字节）/ `savePath`（落盘到下载目录）。
   **两条出口分工**（2026-10-27 改过一次，最初只给本地那条）：
   `remoteUrl` 是平台原始链接（RunningHub 那种"只给链接不给字节"的才有，`byteSize` 为 0），
@@ -34,6 +44,7 @@
   判据：`artifact_names_carry_the_run_label_and_the_recipe`（含非法字符、结尾点、超长、
   空标签退回原名）+ `reconcile_persists_artifact_names_composed_from_the_recipe`
   （对账那条落库路径也带上标签）。
+  ⚠️ **2026-10-27 晚改了口径**：标签不再是必填，自动补的 `run-N` 也不算名字（见最上面那条）。
 - **结果可以挑着导**（2026-10-27）：结果页多一个「选择」模式——点卡片是勾选而不是预览，
   工具条显示「已选 N / M」，支持全选本页 / 清空 / 导出选中。导出沿用后端的逐张保存
   （命名规则只有一份，不在前端另起）。此前 20 张里要 5 张 = 全下 20 个再删 15 个。

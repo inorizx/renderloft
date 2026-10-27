@@ -241,6 +241,17 @@ impl CreateOperation {
                     .await?,
             );
         }
+        // 名字定下来之后再查重：显式名字可能撞上自动编号（有人把第 1 条起名叫 `run-2`）。
+        // 不查就要等 SQLite 的唯一约束来报——那条错误里没有"是哪几个"，也不说人话。
+        let mut seen = std::collections::HashSet::new();
+        for run in &resolved {
+            if !seen.insert(run.client_run_id.as_str()) {
+                return Err(SafeError::validation(
+                    "DUPLICATE_CLIENT_RUN_ID",
+                    format!("clientRunId 重复：{}", run.client_run_id),
+                ));
+            }
+        }
         Ok(resolved)
     }
 
@@ -375,7 +386,12 @@ impl CreateOperation {
         Ok(ResolvedRun {
             recipe_revision_id: revision.id,
             connection_revision_id: connection_revision.id,
-            client_run_id: request.client_run_id.clone(),
+            // 没起名字 = 按序号补 `run-N`。它只保证库里唯一（`UNIQUE(operation_id, client_run_id)`），
+            // 不是名字——`Run::display_label` 会把它挡在文件名之外。
+            client_run_id: match request.client_run_id.trim() {
+                "" => crate::v2::domain::operation::auto_client_run_id(sequence),
+                _ => request.client_run_id.clone(),
+            },
             inputs: request.inputs.clone(),
             assets,
             sequence,
@@ -429,13 +445,14 @@ fn validate_run_shape(runs: &[RunRequest]) -> DomainResult<()> {
             format!("单个 Operation 最多 {MAX_RUNS_PER_OPERATION} 个 Run"),
         ));
     }
+    // 名字是**可选的**：没填就让服务端按序号补 `run-N`（见 `resolve_run`）——
+    // 名字只影响"给人看的标签"，不该变成提交的前置条件（引擎只管生成，命名是调用方自己的事）。
+    // 重名仍然要拦，但要在自动编号补齐之后查（见 `resolve_runs`），否则拿原始字符串比
+    // 会把两条没名字的 run 误判成重名。
     let mut seen_run_ids = std::collections::HashSet::new();
     for run in runs {
         if run.client_run_id.trim().is_empty() {
-            return Err(SafeError::validation(
-                "CLIENT_RUN_ID_REQUIRED",
-                "每个 Run 必须包含 clientRunId",
-            ));
+            continue;
         }
         if !seen_run_ids.insert(run.client_run_id.clone()) {
             return Err(SafeError::validation(
@@ -741,6 +758,75 @@ mod tests {
             persisted.runs[0].connection_revision_id,
             ConnectionRevisionId(1)
         );
+    }
+
+    /// **名字是可选的**（2026-10-27）：不填就按序号补 `run-N`，而且它**不是名字**。
+    ///
+    /// 判别点三条：
+    /// 1. 不填 `clientRunId` 也能提交（此前会被 `CLIENT_RUN_ID_REQUIRED` 拦下——命名成了前置条件）；
+    /// 2. 补出来的 id 是 `run-1` / `run-2`（序号 0 基 +1），库内唯一；
+    /// 3. `display_label()` 对它们全返回 `None` ⇒ 产物文件名只剩「应用名-id」。
+    #[tokio::test]
+    async fn unnamed_runs_are_accepted_and_leave_no_trace_in_the_filename() {
+        let repositories = InMemoryRepositories::new();
+        seed_environment(&repositories);
+        let use_case = use_case(repositories);
+        let mut request = request(actor(vec![Scope::OperationsExecute]));
+        request.runs = (0..2)
+            .map(|index| RunRequest {
+                client_run_id: String::new(),
+                recipe_revision_id: RecipeRevisionId(1),
+                connection_id: None,
+                inputs: BTreeMap::from([("prompt".to_string(), json!(format!("p{index}")))]),
+                assets: vec![],
+            })
+            .collect();
+        let persisted = use_case.execute(request).await.expect("没名字也该能提交");
+        let ids = persisted
+            .runs
+            .iter()
+            .map(|run| run.client_run_id.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(ids, vec!["run-1", "run-2"], "按序号补，且库内唯一");
+        assert!(
+            persisted
+                .runs
+                .iter()
+                .all(|run| run.display_label().is_none()),
+            "自动补的 id 不是名字——它不该变成产物文件名的前缀"
+        );
+    }
+
+    /// 显式名字撞上自动编号：要在**提交前**用能看懂的话拒掉，别等 SQLite 的唯一约束。
+    #[tokio::test]
+    async fn a_named_run_colliding_with_an_auto_id_is_rejected_before_the_database() {
+        let repositories = InMemoryRepositories::new();
+        seed_environment(&repositories);
+        let use_case = use_case(repositories);
+        let mut request = request(actor(vec![Scope::OperationsExecute]));
+        request.runs = vec![
+            RunRequest {
+                // 第 0 条起名叫 `run-2`……
+                client_run_id: "run-2".to_string(),
+                recipe_revision_id: RecipeRevisionId(1),
+                connection_id: None,
+                inputs: BTreeMap::from([("prompt".to_string(), json!("a red house"))]),
+                assets: vec![],
+            },
+            RunRequest {
+                // ……第 1 条没名字，自动补出来正好也是 `run-2`。
+                client_run_id: String::new(),
+                recipe_revision_id: RecipeRevisionId(1),
+                connection_id: None,
+                inputs: BTreeMap::from([("prompt".to_string(), json!("a blue house"))]),
+                assets: vec![],
+            },
+        ];
+        let error = use_case
+            .execute(request)
+            .await
+            .expect_err("撞名应在提交前被拒");
+        assert_eq!(error.code, "DUPLICATE_CLIENT_RUN_ID", "{error:?}");
     }
 
     #[tokio::test]

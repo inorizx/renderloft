@@ -235,6 +235,28 @@ pub struct Run {
     pub updated_at: Timestamp,
 }
 
+/// 「调用方没起名字」时的自动 id：`run-1`、`run-2`……（序号 0 基存储、1 基展示）。
+/// 它的用途只有一个：**唯一性与追踪**（库里有 `UNIQUE(operation_id, client_run_id)`）。
+/// 它**不是名字**——`Run::display_label` 会把它认出来并挡在产物文件名之外，
+/// 否则每个没起名的产物都会变成 `run-1-应用名-123.png`，那是噪音不是信息。
+pub fn auto_client_run_id(sequence: u32) -> String {
+    format!("run-{}", sequence + 1)
+}
+
+impl Run {
+    /// 这一条 run 的**显示名**：调用方自己起的才算，自动补的 `run-{序号}` 不算。
+    ///
+    /// 唯一消费者是"给人看/给人认"的那两处：产物文件名前缀、交付清单的 `label`。
+    /// 身份永远是 `artifactId` / `runId`，**不要**让调用方拿名字对账。
+    pub fn display_label(&self) -> Option<&str> {
+        let value = self.client_run_id.trim();
+        if value.is_empty() || value == auto_client_run_id(self.sequence) {
+            return None;
+        }
+        Some(value)
+    }
+}
+
 /// 「为什么没在动」的**唯一一张阶梯表**：`(状态, 稳定原因码, 严重度)`。
 ///
 /// 为什么是一张表而不是几处 `match`：这张表有**三个**消费者，它们必须给出同一个答案——

@@ -749,13 +749,15 @@ const run = async () => {
     const fileFields = fields.value.filter((field) => field.format === 'file')
     // 每行显式生成 clientRunId：行↔run 映射用它对齐，不依赖返回数组顺序。
     const prefix = namePrefix.value.trim()
-    // run 名会**进产物文件名**（后端 `compose_filename` 拿它当标签）。所以：
-    // 逐条给了名字就用它（`SKU135-正面`）；否则用「前缀-序号」；都没有就用序号本身
-    // ——别把内部 token 写进交付物。
+    // run 名会**进产物文件名**（后端 `compose_filename` 拿它当前缀）。所以：
+    // 逐条给了名字就用它（`SKU135-正面`）；有前缀用「前缀-序号」；
+    // 都没有就发 `run-N` —— 那是后端的**自动编号形态**：只保证库内唯一，
+    // 不会被当成名字写进文件名（后端 `Run::display_label` 认得它）。
     const clientRunIds = rows.map((row, index) => {
       const named = (row.name ?? '').trim()
       if (named) return named
-      return prefix ? (rows.length === 1 ? prefix : `${prefix}-${index + 1}`) : `${index + 1}`
+      if (prefix) return rows.length === 1 ? prefix : `${prefix}-${index + 1}`
+      return `run-${index + 1}`
     })
     // 名字是幂等/对齐用的键，重名会让"这一行对应哪条 run"失去意义（后端也会拒）。
     // 与其等后端报 `clientRunId 重复`，不如在花钱之前点名是哪几个。

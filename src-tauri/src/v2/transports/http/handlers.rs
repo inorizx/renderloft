@@ -1218,8 +1218,9 @@ pub async fn operation_manifest(
         artifact_count += artifacts.len();
         runs.push(json!({
             "runId": run.id.0,
-            // 提交时给的名字：产物文件名就是照它起的，下游按它对齐自己的记录。
-            "label": run.client_run_id,
+            // 提交时给的名字（**只有调用方自己起的才算**；自动补的 run-N 不是名字，给 null）。
+            // 它是"给人对号"的标签，不是身份——身份是 runId / artifactId。
+            "label": run.display_label(),
             "sequence": run.sequence,
             "status": run.status.as_str(),
             "connectionId": connection.as_ref().map(|(id, _)| *id),

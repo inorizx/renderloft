@@ -126,6 +126,11 @@ pub struct ValidateOperationRequestDto {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct RunRequestDto {
+    /// **可选**：名字只影响"给人看的标签"（产物文件名前缀、交付清单的 `label`）。
+    ///
+    /// 不填就由服务端按序号补 `run-N`（只保证库内唯一，**不会**进文件名）。
+    /// 好在哪：调用方不必先想名字才能提交——命名是它自己的事，引擎只管生成。
+    #[serde(default)]
     pub client_run_id: String,
     pub recipe_revision_id: u64,
     #[serde(default)]

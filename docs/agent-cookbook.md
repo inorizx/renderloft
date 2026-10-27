@@ -115,8 +115,11 @@ renderloft_call { "verb": "operation.run", "args": {
 } }
 ```
 
-CLI 一次一个任务；批量走 MCP 的 `runs`（或 GUI 运行页的「批量运行」模式）。`clientRunId` 是你的对齐锚，
-不依赖返回顺序。
+CLI 一次一个任务；批量走 MCP 的 `runs`（或 GUI 运行页的「批量运行」模式）。
+
+`clientRunId` 是**可选的**：填了它就当这条 run 的名字（进产物文件名、也在交付清单的 `label` 里），
+不填由服务端按序号补 `run-N`——那种 id **不进文件名**（它只是库内唯一标识）。
+它方便你"按名字对齐自己的记录"，但**不是身份**：对账请用 `runId` / `artifactId` / `checksum`。
 
 ---
 
