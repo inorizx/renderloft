@@ -272,6 +272,7 @@ impl ReconcileService {
                         let filename =
                             crate::v2::domain::execution::ArtifactDraft::compose_filename(
                                 &active.recipe_name,
+                                &active.run.client_run_id,
                                 id,
                                 &artifact.filename,
                             );
@@ -726,10 +727,12 @@ mod tests {
             .map(|artifact| artifact.filename)
             .collect();
         names.sort();
+        // 名字带**调用方给的 run 标签**（`image-1`）：这是对账那条路也把标签传下去的证据
+        // ——两条落库路径（直接完成 / 事后对账）给出同一个名字，否则"从哪条路完成"会改文件名。
         assert_eq!(
             names,
-            ["Image Recipe-1000.png", "Image Recipe-1001.png"],
-            "名字应当是「应用名-artifactId」，既认得出来、也不可能撞"
+            ["image-1-Image Recipe-1000.png", "image-1-Image Recipe-1001.png"],
+            "名字应当是「run 标签-应用名-artifactId」，既认得出来、也不可能撞"
         );
     }
 

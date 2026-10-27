@@ -618,9 +618,19 @@ pub fn is_terminal_status(status: &str) -> bool {
     matches!(status, "SUCCEEDED" | "FAILED" | "CANCELLED")
 }
 
-pub fn run_request(recipe_revision_id: u64, inputs: Value, assets: Option<Value>) -> Value {
+/// 造一条 `runs[]` 请求。
+///
+/// `index` 只决定默认的 `clientRunId`：调用方不填时用 `run-1`、`run-2`……而不是 uuid
+/// ——这个值会**进产物文件名**（`compose_filename` 拿它当 run 标签），uuid 放进去只是噪音。
+pub fn run_request(
+    recipe_revision_id: u64,
+    index: Option<usize>,
+    inputs: Value,
+    assets: Option<Value>,
+) -> Value {
+    let label = index.map(|index| index + 1).unwrap_or(1);
     let mut run = json!({
-        "clientRunId": format!("run-{}", uuid::Uuid::new_v4().simple()),
+        "clientRunId": format!("run-{label}"),
         "recipeRevisionId": recipe_revision_id,
         "inputs": inputs,
     });
@@ -928,7 +938,7 @@ mod tests {
     /// 给了就原样带上（keyed 对象）。
     #[test]
     fn run_request_uses_supplied_revision() {
-        let request = run_request(7, json!({ "prompt": "a cat" }), None);
+        let request = run_request(7, None, json!({ "prompt": "a cat" }), None);
         assert_eq!(request[0]["recipeRevisionId"], 7);
         assert_eq!(request[0]["inputs"]["prompt"], "a cat");
         assert!(request[0]["clientRunId"]
@@ -941,7 +951,7 @@ mod tests {
         );
 
         let assets = json!({ "475::image": { "assetId": 12, "checksum": "sha1-x" } });
-        let request = run_request(7, json!({ "prompt": "a cat" }), Some(assets.clone()));
+        let request = run_request(7, None, json!({ "prompt": "a cat" }), Some(assets.clone()));
         assert_eq!(request[0]["assets"], assets, "资产必须真的进请求体");
     }
 

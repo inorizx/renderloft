@@ -52,13 +52,50 @@ impl ArtifactDraft {
     ///
     /// 扩展名从原名取（png / jpg / mp4 是真的信息，要留着）。应用名里可能带路径分隔符
     /// （用户自己起的名字），落进文件名会变成一个意外的子目录，所以换成 `-`。
-    pub fn compose_filename(recipe_name: &str, artifact_id: ArtifactId, original: &str) -> String {
-        let recipe_name = recipe_name.trim();
-        if recipe_name.is_empty() {
-            // 查不到应用名（理论上不该发生）时**退回原名**：不发明，也不丢东西。
-            return original.to_string();
-        }
-        let stem = recipe_name.replace(['/', '\\'], "-");
+    /// 把"人给的一段名字"变成能当文件名的样子。
+    ///
+    /// 为什么必须做：`clientRunId` 是调用方填的（`SKU/135 正面` 这种写法很自然），
+    /// 而 Windows 不允许 `< > : " / \ | ? *`，路径分隔符还会把文件写进子目录。
+    /// 规则：非法字符换成 `-`、去掉首尾空白与结尾的点（Windows 会吃掉结尾点）、
+    /// 截到 40 个字符（再长只是徒增路径长度）、去掉首尾的 `-`。
+    pub fn sanitize_name_part(value: &str) -> String {
+        const MAX_CHARS: usize = 40;
+        let replaced: String = value
+            .chars()
+            .map(|character| match character {
+                '<' | '>' | ':' | '"' | '/' | '\\' | '|' | '?' | '*' => '-',
+                other if other.is_control() => '-',
+                other => other,
+            })
+            .collect();
+        replaced
+            .trim()
+            .trim_matches('.')
+            .trim_matches('-')
+            .trim()
+            .chars()
+            .take(MAX_CHARS)
+            .collect::<String>()
+            .trim_matches('-')
+            .trim()
+            .to_string()
+    }
+
+    pub fn compose_filename(
+        recipe_name: &str,
+        run_label: &str,
+        artifact_id: ArtifactId,
+        original: &str,
+    ) -> String {
+        let recipe_name = Self::sanitize_name_part(recipe_name);
+        let run_label = Self::sanitize_name_part(run_label);
+        let stem = match (run_label.is_empty(), recipe_name.is_empty()) {
+            // 两个都没有（理论上不该发生）时**退回原名**：不发明，也不丢东西。
+            (true, true) => return original.to_string(),
+            (true, false) => recipe_name,
+            (false, true) => run_label,
+            (false, false) => format!("{run_label}-{recipe_name}"),
+        };
         match std::path::Path::new(original)
             .extension()
             .map(|value| value.to_string_lossy().into_owned())
@@ -196,43 +233,55 @@ mod tests {
             .collect()
     }
 
-    /// 产物名的规则：`{应用名}-{artifactId}.{ext}`。
+    /// 产物名的规则：`{run 标签}-{应用名}-{artifactId}.{ext}`。
     ///
     /// 这条钉的是"**人能不能在文件夹里认出它**"：平台给的名字（`870.png` 是输出节点 id、
-    /// `output.png` 是兜底）都不行，而"哪个应用跑的"只有我们知道。
+    /// `output.png` 是兜底）都不行，"哪个应用跑的"只有我们知道，而"哪一条任务出的"
+    /// 只有调用方知道——这个软件是素材流水线里的一环，下游要能凭文件名对上号。
     #[test]
-    fn artifact_names_carry_the_recipe_and_stay_unique_by_construction() {
-        let compose = |recipe: &str, id: u64, original: &str| {
-            ArtifactDraft::compose_filename(recipe, ArtifactId(id), original)
+    fn artifact_names_carry_the_run_label_and_the_recipe() {
+        let compose = |recipe: &str, label: &str, id: u64, original: &str| {
+            ArtifactDraft::compose_filename(recipe, label, ArtifactId(id), original)
         };
 
-        // 正常路径：应用名 + artifactId，扩展名留着（png/jpg/mp4 是真信息）。
+        // 没有标签：行为与从前逐字一致（老数据、CLI 不填标签时不受影响）。
         assert_eq!(
-            compose("Krea2-turbo-文生图", 1000, "870.png"),
+            compose("Krea2-turbo-文生图", "", 1000, "870.png"),
             "Krea2-turbo-文生图-1000.png"
         );
+        assert_eq!(compose("My App", "", 7, "output.mp4"), "My App-7.mp4");
+
+        // 有标签：标签在前——下游先看"哪一条"，再看"哪个应用"。
         assert_eq!(
-            compose("Krea2-turbo-文生图", 1001, "870.png"),
-            "Krea2-turbo-文生图-1001.png"
+            compose("Krea2", "SKU135-正面", 1000, "870.png"),
+            "SKU135-正面-Krea2-1000.png"
         );
-        assert_eq!(compose("My App", 7, "output.mp4"), "My App-7.mp4");
 
-        // ⚠️ 同一批的两张图**同名也没关系**：artifactId 不同 ⇒ 结果不同。
-        // 这是"从根上消掉撞名"，不是"撞了再补救"。
+        // 非法字符（路径分隔符、Windows 保留符）一律换成 `-`，不会写出子目录。
+        assert_eq!(
+            compose("a/b\\c", "x:y*z?", 5, "870.png"),
+            "x-y-z-a-b-c-5.png"
+        );
+
+        // 结尾的点与首尾空白/横线都清掉（Windows 会吃掉结尾点，留着等于改了名）。
+        assert_eq!(compose("Krea2", "  ..sku-1..  ", 5, "x.png"), "sku-1-Krea2-5.png");
+
+        // 超长标签截到 40 个字符，不让路径越来越长。
+        let long = "长".repeat(80);
+        let name = compose("Krea2", &long, 5, "x.png");
+        assert_eq!(name, format!("{}-Krea2-5.png", "长".repeat(40)));
+
+        // 同一批的两张图**同名也没关系**：artifactId 不同 ⇒ 结果不同。
         assert_ne!(
-            compose("Krea2", 1000, "870.png"),
-            compose("Krea2", 1001, "870.png")
+            compose("Krea2", "sku", 1000, "870.png"),
+            compose("Krea2", "sku", 1001, "870.png")
         );
 
-        // 应用名里有路径分隔符（用户自己起的名字）不能变成子目录。
-        assert_eq!(compose("a/b\\c", 5, "x.png"), "a-b-c-5.png");
-
-        // 查不到应用名 ⇒ **退回原名**，不发明、也不丢东西。
-        assert_eq!(compose("", 5, "870.png"), "870.png");
-        assert_eq!(compose("   ", 5, "870.png"), "870.png");
+        // 两个都空 ⇒ 退回原名，不发明、也不丢东西。
+        assert_eq!(compose("", "", 5, "870.png"), "870.png");
 
         // 原名没有扩展名时也要能拼（`artifact.bin` 这类兜底名）。
-        assert_eq!(compose("App", 5, "artifact"), "App-5");
+        assert_eq!(compose("App", "", 5, "artifact"), "App-5");
     }
 
     /// 同一个 run 内必须能一件件区分开：RunningHub 按输出节点命名，一个节点吐多张图就会撞。

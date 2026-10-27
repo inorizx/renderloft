@@ -453,6 +453,7 @@ impl SchedulerService {
                     // 同一个名字，而且它进了库——改名规则要变时只动这一处，不用回头修数据。
                     let filename = crate::v2::domain::execution::ArtifactDraft::compose_filename(
                         &claimed.recipe_name,
+                        &claimed.run.client_run_id,
                         id,
                         &artifact.filename,
                     );

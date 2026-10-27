@@ -493,6 +493,8 @@ const messages = {
     'runner.start': '开始生成',
     'runner.dialogAddTitle': '一次添加多条任务',
     'runner.dialogAddDescription': '将以当前统一参数创建新的待提交任务行，可稍后在表格中逐行调整。',
+    'runner.namePrefix': '命名',
+    'runner.namePrefixPlaceholder': '如 SKU135（产物文件名）',
     'runner.countLabel': '任务数量',
     'runner.addCount': '添加 {count} 条',
     'runner.dialogClearTitle': '清空待处理任务？',
@@ -1361,7 +1363,9 @@ const messages = {
     'runner.dialogAddTitle': 'Add multiple tasks',
     'runner.dialogAddDescription':
       'Creates new pending rows from the current shared settings; adjust them row by row afterwards.',
+    'runner.namePrefix': 'Name',
     'runner.countLabel': 'Task count',
+    'runner.namePrefixPlaceholder': 'e.g. SKU135 (file name)',
     'runner.addCount': 'Add {count}',
     'runner.dialogClearTitle': 'Clear pending tasks?',
     'runner.dialogClearDescription':

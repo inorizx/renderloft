@@ -139,6 +139,13 @@ interface BatchRow {
 const variableKeys = ref<string[]>([])
 const batchRows = ref<BatchRow[]>([])
 const batchAddCount = ref('3')
+/**
+ * 命名前缀：产物文件名会用它开头（`SKU135-1-应用名-1234.png`）。
+ *
+ * 为什么要它：这个软件是素材流水线里的一环，下游按文件名对号入座。
+ * 让调用方**提交前**给名字，比事后改名靠谱——事后改名还得回头找对应关系。
+ */
+const namePrefix = ref('')
 /** 「一次添加多条」弹窗。 */
 const showBatchAddDialog = ref(false)
 /** 「清空待处理」确认弹窗。 */
@@ -733,8 +740,12 @@ const run = async () => {
 
     const fileFields = fields.value.filter((field) => field.format === 'file')
     // 每行显式生成 clientRunId：行↔run 映射用它对齐，不依赖返回数组顺序。
-    const submitToken = Date.now().toString(36)
-    const clientRunIds = rows.map((row) => `row-${row.id}-${submitToken}`)
+    const prefix = namePrefix.value.trim()
+    // run 名会**进产物文件名**（后端 `compose_filename` 拿它当标签）。所以：
+    // 有前缀用「前缀-序号」，没有就用序号本身——别把内部 token 写进交付物。
+    const clientRunIds = rows.map((_row, index) =>
+      prefix ? (rows.length === 1 ? prefix : `${prefix}-${index + 1}`) : `${index + 1}`
+    )
     const runsPayload = rows.map((row, index) => {
       // 资产按**字段键**定位（field.key，如 "475::image"）：位置数组的语义由上游节点
       // 顺序决定，把它当语义正是图片错位的来源。没选文件的字段直接不进对象（跳过中间
@@ -1160,7 +1171,18 @@ const goEditFields = () => {
       <div
         class="flex flex-col gap-3 border-t border-border pt-4 sm:flex-row sm:items-center sm:justify-between"
       >
-        <p class="text-xs text-muted-foreground">{{ decisionLine }}</p>
+        <div class="flex flex-wrap items-center gap-2">
+          <p class="text-xs text-muted-foreground">{{ decisionLine }}</p>
+          <label class="flex items-center gap-1.5 text-xs text-muted-foreground">
+            <span class="shrink-0">{{ t('runner.namePrefix') }}</span>
+            <input
+              v-model="namePrefix"
+              type="text"
+              class="name-prefix-input"
+              :placeholder="t('runner.namePrefixPlaceholder')"
+            />
+          </label>
+        </div>
         <Button :disabled="submitting" size="lg" @click="run">
           {{
             submitting
@@ -1377,6 +1399,19 @@ const goEditFields = () => {
   padding: 0 0.625rem;
   font-size: 0.8125rem;
   outline: none;
+}
+.name-prefix-input {
+  width: 9rem;
+  height: 1.9rem;
+  border: 1px solid var(--app-border);
+  border-radius: var(--radius-sm);
+  background: var(--app-secondary);
+  padding: 0 0.5rem;
+  font-size: 0.75rem;
+  outline: none;
+}
+.name-prefix-input:focus-visible {
+  border-color: var(--app-ring, var(--app-primary));
 }
 .batch-dialog-input:focus-visible {
   border-color: var(--app-ring, var(--app-primary));

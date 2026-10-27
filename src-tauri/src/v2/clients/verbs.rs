@@ -2008,7 +2008,7 @@ async fn run_operation(client: &V2Client, args: &Args) -> Result<Value, ClientEr
             let inputs = run.get("inputs").cloned().ok_or_else(|| {
                 argument_error("INPUT_REQUIRED", format!("runs[{index}] 缺少 inputs"))
             })?;
-            let mut request = run_request(recipe_revision, inputs, None);
+            let mut request = run_request(recipe_revision, Some(index), inputs, None);
             // 调用方给了 clientRunId 就用它（幂等与追踪都靠它），否则按序号生成。
             if let Some(client_run_id) = run.get("clientRunId").and_then(Value::as_str) {
                 if let Some(entry) = request.get_mut(0) {
@@ -2045,7 +2045,7 @@ async fn run_operation(client: &V2Client, args: &Args) -> Result<Value, ClientEr
             "缺少 inputs（单次）或 runs（批量），至少给一个".to_string(),
         )
     })?;
-    let request = run_request(recipe_revision, inputs, single_assets);
+    let request = run_request(recipe_revision, None, inputs, single_assets);
     if dry_run {
         return client.validate_operation(request).await;
     }
