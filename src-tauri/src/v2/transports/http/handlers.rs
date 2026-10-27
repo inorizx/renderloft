@@ -2469,7 +2469,7 @@ pub async fn list_tokens(
             scopes: record
                 .scopes
                 .iter()
-                .map(|scope| format!("{scope:?}"))
+                .map(|scope| scope.wire_name().to_string())
                 .collect(),
             label: record.label.clone(),
             expires_at: record.expires_at.as_ref().map(|t| t.0.clone()),
@@ -2514,7 +2514,7 @@ pub async fn issue_token(
             scopes: record
                 .scopes
                 .iter()
-                .map(|scope| format!("{scope:?}"))
+                .map(|scope| scope.wire_name().to_string())
                 .collect(),
             expires_at: record.expires_at.as_ref().map(|t| t.0.clone()),
         }))
@@ -2523,32 +2523,11 @@ pub async fn issue_token(
 }
 
 fn parse_scope(raw: &str) -> Result<Scope, axum::response::Response> {
-    Ok(match raw {
-        "recipes:read" => Scope::RecipesRead,
-        "recipes:write" => Scope::RecipesWrite,
-        "operations:read" => Scope::OperationsRead,
-        "operations:execute" => Scope::OperationsExecute,
-        "operations:cancel" => Scope::OperationsCancel,
-        "operations:delete" => Scope::OperationsDelete,
-        "operations:select-connection" => Scope::OperationsSelectConnection,
-        "assets:local-read" => Scope::AssetsLocalRead,
-        "assets:write" => Scope::AssetsWrite,
-        "artifacts:read" => Scope::ArtifactsRead,
-        "connections:read" => Scope::ConnectionsRead,
-        "connections:manage" => Scope::ConnectionsManage,
-        "settings:read" => Scope::SettingsRead,
-        "settings:manage" => Scope::SettingsManage,
-        "diagnostics:read" => Scope::DiagnosticsRead,
-        "actor-tokens:manage" => Scope::ActorTokensManage,
-        _ => {
-            return Err(error::validation(
-                "SCOPE_INVALID",
-                format!("未知 scope：{raw}"),
-            ))
-        }
-    })
+    // 查表而不是再写一份 `match`：入（这里）与出（`wire_name`）必须同源，
+    // 否则会出现"读出来的 scopes 拿去签新 token 却报未知 scope"这种自相矛盾。
+    Scope::parse(raw)
+        .ok_or_else(|| error::validation("SCOPE_INVALID", format!("未知 scope：{raw}")))
 }
-
 pub async fn revoke_token(
     State(state): State<Arc<V2HttpState>>,
     Extension(actor): Extension<ActorRef>,

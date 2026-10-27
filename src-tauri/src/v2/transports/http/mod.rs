@@ -1725,6 +1725,13 @@ mod tests {
         assert_eq!(status, StatusCode::OK, "{body}");
         let issued = body["data"]["token"].as_str().unwrap();
         assert!(issued.starts_with("rh-"));
+        // 回来的 scopes 必须是**请求里那套写法**：外部最自然的用法是"读一把 token 的
+        // scopes 再拿去签新 token"，回 `"OperationsExecute"` 会把这条路直接堵死。
+        assert_eq!(
+            body["data"]["scopes"],
+            json!(["operations:read", "operations:execute"]),
+            "响应里的 scope 必须与请求里同一个写法（曾经回过 Rust 的 Debug 名）"
+        );
         let token_id = body["data"]["tokenId"].as_i64().unwrap();
         let request = Request::builder()
             .method("DELETE")
