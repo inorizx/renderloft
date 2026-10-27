@@ -25,6 +25,9 @@
   产物文件名前缀；**没起名字就是 `null`**）、状态、账号、`usage`、`inputs`、`error`，
   以及每个产物的 `filename` / `byteSize` / `checksum` /
   `remoteUrl` / `bytesPath`（带 token 取字节）/ `savePath`（落盘到下载目录）。
+  时间戳只给**已有的事实**：`operation.createdAt`、每条 run 的 `createdAt`、每个产物的 `createdAt`。
+  **刻意不给"完成时刻"**——库里没有这个事实（`updatedAt` 会被轮询刷成"最后一次写"），
+  与其编一个，不如让调用方在收到回调时自己盖戳：那本来就是它该记的账。
   **两条出口分工**（2026-10-27 改过一次，最初只给本地那条）：
   `remoteUrl` 是平台原始链接（RunningHub 那种"只给链接不给字节"的才有，`byteSize` 为 0），
   下游拿去转存/上 CDN 最省事——但它**会过期**，是"此刻能取"而不是永久交付地址；

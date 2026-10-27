@@ -3141,6 +3141,12 @@ mod tests {
         assert_eq!(data["runCount"], 1);
         assert_eq!(data["artifactCount"], 2);
         assert_eq!(data["runs"][0]["label"], "image-1", "标签就是提交时的 clientRunId");
+        assert!(
+            data["runs"][0]["createdAt"]
+                .as_str()
+                .is_some_and(|value| !value.is_empty()),
+            "下游算时长要起点：run 落库时刻"
+        );
         assert_eq!(
             data["runs"][0]["artifacts"][0]["filename"],
             "image-1-Image Recipe-90001.png"

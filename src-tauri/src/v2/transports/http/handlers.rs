@@ -1228,6 +1228,10 @@ pub async fn operation_manifest(
             "usage": run.usage,
             "inputs": run.inputs,
             "error": run.error,
+            // 这条 run 落库的时刻（epoch 毫秒）。下游要算"这批跑了多久"，起点在这里。
+            // **不给"完成时刻"**：库里没有这个事实（`updatedAt` 会被轮询刷成"最后一次写"），
+            // 与其编一个，不如让调用方在收到回调时自己盖个戳——那本来也是它该记的账。
+            "createdAt": run.created_at.0,
             "artifacts": artifacts
                 .iter()
                 .map(|artifact| json!({
