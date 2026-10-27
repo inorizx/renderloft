@@ -3121,7 +3121,7 @@ mod tests {
                 filename: "image-1-Image Recipe-90002.png".to_string(),
                 mime_type: "image/png".to_string(),
                 byte_size: 0,
-                checksum: "sum-2".to_string(),
+                checksum: String::new(),
                 storage_key: String::new(),
                 url: Some("https://cdn.example.com/results/90002.png".to_string()),
                 bytes: Vec::new(),
@@ -3167,6 +3167,16 @@ mod tests {
             "平台链接型产物把原始地址给下游（会过期，别当长期交付地址）"
         );
         assert_eq!(data["runs"][0]["artifacts"][1]["byteSize"], 0, "0 = 字节还在平台上");
+        // 空 checksum 对外必须是 `null`：空串会被下游当成"一个真的指纹"，拿去去重就全撞一起。
+        assert_eq!(
+            data["runs"][0]["artifacts"][1]["checksum"],
+            serde_json::Value::Null,
+            "字节没经过我们时，指纹是未知——给 null，不给空串"
+        );
+        assert_eq!(
+            data["runs"][0]["artifacts"][0]["checksum"], "sum",
+            "有指纹的就原样给（别因为另一条是 null 就一起丢掉）"
+        );
         assert!(
             data["runs"][0]["artifacts"][1]["createdAt"]
                 .as_str()

@@ -2556,6 +2556,69 @@ mod tests {
         let _ = std::fs::remove_dir_all(&workspace);
     }
 
+    /// URL 型产物取回字节时**顺手补指纹**：空 checksum 的意思是"字节还没经过我们"，
+    /// 取到那一刻是唯一能算出真指纹的机会（再晚就得重新下载一遍）。
+    ///
+    /// 负对照：把 `cache_bytes` 里那条 `UPDATE ... checksum = ?2` 删掉 ⇒ 第一条断言红。
+    #[tokio::test]
+    async fn caching_url_artifact_bytes_fills_a_missing_checksum() {
+        use crate::v2::domain::ids::ArtifactId;
+        use crate::v2::ports::stores::{ArtifactObject, ArtifactStore};
+
+        let workspace = temp_dir("artifact-checksum");
+        let repositories =
+            SqliteRepositories::open(&workspace.join("renderloft.db")).expect("开库");
+        repositories
+            .store(ArtifactObject {
+                id: ArtifactId(43),
+                run_id: Some(1),
+                filename: "861.png".to_string(),
+                mime_type: "image/png".to_string(),
+                byte_size: 0,
+                // RunningHub 那种"只给 URL、不给指纹"的产物。
+                checksum: String::new(),
+                storage_key: "43".to_string(),
+                url: Some("https://cdn.example.com/861.png".to_string()),
+                bytes: Vec::new(),
+            })
+            .await
+            .expect("种产物");
+
+        let payload = b"png-bytes-43";
+        repositories
+            .cache_bytes(ArtifactId(43), payload)
+            .await
+            .expect("写缓存");
+        assert_eq!(
+            repositories
+                .load(ArtifactId(43))
+                .await
+                .unwrap()
+                .unwrap()
+                .checksum,
+            crate::v2::domain::hash::artifact_checksum(payload),
+            "字节到手就该有真指纹（sha256-…），而不是留着空串"
+        );
+
+        // 再写一次（不同字节）**不覆盖**已有指纹：同一条产物不能有两个"真指纹"。
+        repositories
+            .cache_bytes(ArtifactId(43), b"other-bytes")
+            .await
+            .expect("再写缓存");
+        assert_eq!(
+            repositories
+                .load(ArtifactId(43))
+                .await
+                .unwrap()
+                .unwrap()
+                .checksum,
+            crate::v2::domain::hash::artifact_checksum(payload),
+            "已有指纹不许被后来的字节改写"
+        );
+
+        let _ = std::fs::remove_dir_all(&workspace);
+    }
+
     /// **删任务要连产物缓存文件一起删**：此前只删库里的行，`artifacts\` 里的图片
     /// 没人认领、也永远没人删——30 天清扫把行清掉了，文件还躺着（工作区只增不减）。
     ///

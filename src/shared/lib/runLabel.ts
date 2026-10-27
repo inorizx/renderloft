@@ -63,5 +63,5 @@ export const runGroupLabel = (run: {
 }): string => {
   const clientRunId = (run.clientRunId ?? '').trim()
   if (clientRunId && !isAutoClientRunId(clientRunId)) return clientRunId
-  return inputDigest(run.inputs) ?? `run#${run.sequence}`
+  return inputDigest(run.inputs) ?? `run#${run.sequence + 1}`
 }

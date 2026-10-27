@@ -2570,6 +2570,20 @@ impl ArtifactStore for SqliteRepositories {
                 params![id.0, bytes.len() as i64],
             )
             .map_err(|_| SafeError::storage("无法更新产物大小"))?;
+        // 字节到手了，顺手把**指纹**补上：空 checksum 的意思是"字节还没经过我们"，
+        // 现在它经过了——这是唯一能算出真指纹的时刻（再晚就要重新下载一遍）。
+        // 只在原来为空时写：驱动自己报过 checksum 的（ComfyUI / OpenAI 老格式 `sha1-…`）
+        // 不覆盖，免得同一个字段里出现两份互相矛盾的指纹。
+        connection
+            .execute(
+                "UPDATE v2_assets SET checksum = ?2
+                 WHERE id = ?1 AND kind = 'artifact' AND checksum = ''",
+                params![
+                    id.0,
+                    crate::v2::domain::hash::artifact_checksum(bytes)
+                ],
+            )
+            .map_err(|_| SafeError::storage("无法更新产物指纹"))?;
         Ok(())
     }
 

@@ -4,6 +4,16 @@
 
 ## 已完成
 
+- **产物指纹：只在字节经过我们时才算，且不再用空串冒充"未知"**（2026-10-27，晚）：
+  URL 型产物（RunningHub 只给链接不给你字节）在**取字节那一刻**顺手算 `sha256-<hex>` 落库；
+  没取过的对外给 `checksum: null`（原来给 `""`——下游拿去去重会把所有"还没算过"的产物
+  撞成同一个）。已经有指纹的（驱动报的 `sha1-…` 老格式，实为 64 位 FNV）**不覆盖**：
+  同一个字段里不能出现两份互相矛盾的指纹。
+  刻意**不**为了算指纹把产物全下载一遍——那会把流量与磁盘的成本从下游搬回引擎。
+  顺手把界面的 `run#0` 改成 `run#1`（`sequence` 的契约仍是 0 基，不动）。
+  判据：`artifact_checksum_is_sha256_and_content_addressed`、
+  `caching_url_artifact_bytes_fills_a_missing_checksum`（负对照：删掉 cache_bytes 里那条
+  `UPDATE ... checksum` ⇒ 红）、manifest 测试断言"未知给 null、已知照给"。
 - **提交有了频率闸**（2026-10-27，晚）：每个调用方每 60 秒最多新建 **60 个 Operation**
   （`SUBMISSION_RATE_LIMITED`，HTTP 429 + `retryAfterSeconds`）。此前只有 `mcp` 那条路有闸
   （同时进行中 4 个任务），`http` / `cli` **完全没有上限**——流水线里一个写错的循环能在几秒内

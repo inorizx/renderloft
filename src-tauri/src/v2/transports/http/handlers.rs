@@ -1239,7 +1239,7 @@ pub async fn operation_manifest(
                     "filename": artifact.filename,
                     "mimeType": artifact.mime_type,
                     "byteSize": artifact.byte_size,
-                    "checksum": artifact.checksum,
+                    "checksum": optional_checksum(&artifact.checksum),
                     // 平台原始链接：能直接取，但会过期（见上面那段说明）。
                     "remoteUrl": artifact.url,
                     // 这条产物**落库的时刻**（epoch 毫秒）。平台链接的年龄从这里算——
@@ -1264,6 +1264,15 @@ pub async fn operation_manifest(
         })))
         .unwrap(),
     ))
+}
+
+/// 产物指纹：空字符串对外一律给 `null`。
+///
+/// 为什么不能原样给 `''`：空串会被下游当成**一个真的指纹**（所有"还没算过"的产物都长一样），
+/// 拿它去重/校验就会全部撞在一起。`null` 至少诚实地说了"不知道"。
+fn optional_checksum(checksum: &str) -> Option<&str> {
+    let trimmed = checksum.trim();
+    (!trimmed.is_empty()).then_some(trimmed)
 }
 
 /// 这条连接**当前修订**是否被冻结（换过 key 的旧冻结自然不生效）。
@@ -1840,7 +1849,7 @@ pub async fn list_artifacts(
                         "filename": summary.filename,
                         "mimeType": summary.mime_type,
                         "byteSize": summary.byte_size,
-                        "checksum": summary.checksum,
+                        "checksum": optional_checksum(&summary.checksum),
                         // 平台给的原始地址（可能为 null：本地字节型产物没有它）。
                         // ⚠️ 会过期，别当永久交付地址；稳定出口是 /artifacts/{id}/bytes。
                         "remoteUrl": summary.url,
@@ -2074,7 +2083,7 @@ pub async fn get_artifact(
             "filename": artifact.filename,
             "mimeType": artifact.mime_type,
             "byteSize": artifact.byte_size,
-            "checksum": artifact.checksum,
+            "checksum": optional_checksum(&artifact.checksum),
             // 平台原始地址（RunningHub 那种"只给链接"的产物才有）；会过期，见 manifest 的说明。
             "remoteUrl": artifact.url,
         })))

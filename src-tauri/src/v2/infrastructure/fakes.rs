@@ -1928,6 +1928,10 @@ impl ArtifactStore for InMemoryRepositories {
             if artifact.byte_size == 0 {
                 artifact.byte_size = bytes.len() as u64;
             }
+            // 与 sqlite 同语义：字节经过我们 → 补指纹；已有的（驱动报的）不覆盖。
+            if artifact.checksum.is_empty() {
+                artifact.checksum = crate::v2::domain::hash::artifact_checksum(bytes);
+            }
         }
         Ok(())
     }
