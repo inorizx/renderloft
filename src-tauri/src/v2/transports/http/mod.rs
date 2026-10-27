@@ -3073,7 +3073,10 @@ mod tests {
     /// 交付清单：一次给出「这一批跑出了什么」。
     ///
     /// 判别点：run 的 `label`（提交时的 clientRunId，也是产物文件名前缀）、账号、产物的
-    /// `filename` 与 `bytesPath` 都在同一份响应里；下游不用再拼三个接口。
+    /// `filename` / `bytesPath` / `remoteUrl` 都在同一份响应里；下游不用再拼三个接口。
+    ///
+    /// 两条出口**分工**要钉住：本地字节型产物 `remoteUrl` 是 null；平台链接型（RunningHub）
+    /// 给链接 + 空字节。测试里两种都种一条，免得日后有人"统一"成只给其中一条。
     #[tokio::test]
     async fn operation_manifest_lists_runs_and_their_artifacts() {
         use crate::v2::domain::ids::ArtifactId;
@@ -3092,6 +3095,7 @@ mod tests {
         let operation_id = body["data"]["operationId"].as_u64().unwrap();
         let run_id = body["data"]["runIds"][0].as_u64().unwrap();
 
+        // ① 本地字节型（ComfyUI / 上传）：没有远端地址。
         ArtifactStore::store(
             &repositories,
             ArtifactObject {
@@ -3108,6 +3112,23 @@ mod tests {
         )
         .await
         .expect("种产物");
+        // ② 平台链接型（RunningHub 只给 URL）：字节还没下来，`byteSize` 是 0。
+        ArtifactStore::store(
+            &repositories,
+            ArtifactObject {
+                id: ArtifactId(90002),
+                run_id: Some(run_id),
+                filename: "image-1-Image Recipe-90002.png".to_string(),
+                mime_type: "image/png".to_string(),
+                byte_size: 0,
+                checksum: "sum-2".to_string(),
+                storage_key: String::new(),
+                url: Some("https://cdn.example.com/results/90002.png".to_string()),
+                bytes: Vec::new(),
+            },
+        )
+        .await
+        .expect("种远端产物");
 
         let (status, body) = get_json(
             &app,
@@ -3118,7 +3139,7 @@ mod tests {
         assert_eq!(status, StatusCode::OK, "{body}");
         let data = &body["data"];
         assert_eq!(data["runCount"], 1);
-        assert_eq!(data["artifactCount"], 1);
+        assert_eq!(data["artifactCount"], 2);
         assert_eq!(data["runs"][0]["label"], "image-1", "标签就是提交时的 clientRunId");
         assert_eq!(
             data["runs"][0]["artifacts"][0]["filename"],
@@ -3129,6 +3150,17 @@ mod tests {
             "/api/v1/artifacts/90001/bytes",
             "下游拿这一条去取字节，不用自己拼 id"
         );
+        assert_eq!(
+            data["runs"][0]["artifacts"][0]["remoteUrl"],
+            serde_json::Value::Null,
+            "本地字节型产物没有远端地址——别在这里编一个"
+        );
+        assert_eq!(
+            data["runs"][0]["artifacts"][1]["remoteUrl"],
+            "https://cdn.example.com/results/90002.png",
+            "平台链接型产物把原始地址给下游（会过期，别当长期交付地址）"
+        );
+        assert_eq!(data["runs"][0]["artifacts"][1]["byteSize"], 0, "0 = 字节还在平台上");
     }
 
     /// **产物列表的第二个方向**：`before` = "比这个 id 更旧的，最新在前"。

@@ -2098,7 +2098,7 @@ impl crate::v2::ports::repositories::ArtifactRepository for SqliteRepositories {
         let connection = self.connection.lock().unwrap_or_else(|e| e.into_inner());
         let mut statement = connection
             .prepare(
-                "SELECT id, run_id, filename, mime_type, byte_size, checksum, created_at
+                "SELECT id, run_id, filename, mime_type, byte_size, checksum, created_at, url
                  FROM v2_assets WHERE kind = 'artifact' AND run_id = ?1 ORDER BY id ASC",
             )
             .map_err(|_| SafeError::storage("无法读取 Artifacts"))?;
@@ -2112,6 +2112,7 @@ impl crate::v2::ports::repositories::ArtifactRepository for SqliteRepositories {
                     row.get::<_, i64>(4)?,
                     row.get::<_, String>(5)?,
                     row.get::<_, String>(6)?,
+                    row.get::<_, Option<String>>(7)?,
                 ))
             })
             .map_err(|_| SafeError::storage("无法读取 Artifacts"))?
@@ -2120,7 +2121,7 @@ impl crate::v2::ports::repositories::ArtifactRepository for SqliteRepositories {
         Ok(rows
             .into_iter()
             .map(
-                |(id, artifact_run_id, filename, mime_type, byte_size, checksum, created_at)| {
+                |(id, artifact_run_id, filename, mime_type, byte_size, checksum, created_at, url)| {
                     crate::v2::ports::repositories::ArtifactSummary {
                         id: ArtifactId(id as u64),
                         run_id: RunId(artifact_run_id.unwrap_or_default() as u64),
@@ -2128,6 +2129,7 @@ impl crate::v2::ports::repositories::ArtifactRepository for SqliteRepositories {
                         mime_type,
                         byte_size: byte_size as u64,
                         checksum,
+                        url,
                         created_at: Timestamp(created_at),
                     }
                 },
@@ -2145,13 +2147,13 @@ impl crate::v2::ports::repositories::ArtifactRepository for SqliteRepositories {
         // 必须一起变**，拆开写反而容易配错（比如 `id > ?` 配 `ORDER BY id DESC` 会给出最旧的一批）。
         let (sql, bound) = match cursor {
             ArtifactCursor::After(after) => (
-                "SELECT id, run_id, filename, mime_type, byte_size, checksum, created_at
+                "SELECT id, run_id, filename, mime_type, byte_size, checksum, created_at, url
                  FROM v2_assets WHERE kind = 'artifact' AND (?1 IS NULL OR id > ?1)
                  ORDER BY id ASC LIMIT ?2",
                 after,
             ),
             ArtifactCursor::Before(before) => (
-                "SELECT id, run_id, filename, mime_type, byte_size, checksum, created_at
+                "SELECT id, run_id, filename, mime_type, byte_size, checksum, created_at, url
                  FROM v2_assets WHERE kind = 'artifact' AND (?1 IS NULL OR id < ?1)
                  ORDER BY id DESC LIMIT ?2",
                 before,
@@ -2171,6 +2173,7 @@ impl crate::v2::ports::repositories::ArtifactRepository for SqliteRepositories {
                     row.get::<_, i64>(4)?,
                     row.get::<_, String>(5)?,
                     row.get::<_, String>(6)?,
+                    row.get::<_, Option<String>>(7)?,
                 ))
             })
             .map_err(|_| SafeError::storage("无法读取 Artifacts"))?
@@ -2179,7 +2182,7 @@ impl crate::v2::ports::repositories::ArtifactRepository for SqliteRepositories {
         Ok(rows
             .into_iter()
             .map(
-                |(id, artifact_run_id, filename, mime_type, byte_size, checksum, created_at)| {
+                |(id, artifact_run_id, filename, mime_type, byte_size, checksum, created_at, url)| {
                     crate::v2::ports::repositories::ArtifactSummary {
                         id: ArtifactId(id as u64),
                         run_id: RunId(artifact_run_id.unwrap_or_default() as u64),
@@ -2187,6 +2190,7 @@ impl crate::v2::ports::repositories::ArtifactRepository for SqliteRepositories {
                         mime_type,
                         byte_size: byte_size as u64,
                         checksum,
+                        url,
                         created_at: Timestamp(created_at),
                     }
                 },

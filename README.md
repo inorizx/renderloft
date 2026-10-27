@@ -171,6 +171,11 @@ RenderLoft 自带一个 MCP 服务器（stdio），把本机 daemon 的能力暴
 
 > **取过一次就落到本地了**：在界面里看一眼（或命令行下载一次）之后，那份字节会缓存在工作区的 `artifacts\` 目录里，之后不再回平台取——`byteSize` 也随之变成真实大小（0 的含义因此是"还没取过"）。任务被删/被 30 天清扫时，缓存文件跟着一起删。
 
+接你自己的流水线时，产物有**两条出口**（`GET /operations/{id}/manifest`、`GET /artifacts` 里都给）：
+
+- `remoteUrl`：平台给的原始链接（RunningHub 那种"只给链接、不给字节"的产物才有，此时 `byteSize` 是 0）。下游直接拿去转存或上 CDN 最省事，不必先绕一圈本机——但它**会过期**，是"此刻能取"，别当长期交付地址存着。
+- `bytesPath` / `savePath`：稳定出口。`bytes` 带 token 就能取（没有本地缓存时会回源并落盘），`save` 直接落下载目录。
+
 > 撞名策略（`--on-conflict`）、`--name-template`、同 run 内重名、定时收图脚本与两个实测坑，都在 [`docs/agent-cookbook.md`](docs/agent-cookbook.md)。
 
 ## 用命令行（可选）

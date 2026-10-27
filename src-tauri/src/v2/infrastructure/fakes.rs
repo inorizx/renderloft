@@ -1718,6 +1718,7 @@ impl crate::v2::ports::repositories::ArtifactRepository for InMemoryRepositories
                 mime_type: artifact.mime_type.clone(),
                 byte_size: artifact.byte_size,
                 checksum: artifact.checksum.clone(),
+                url: artifact.url.clone(),
                 created_at: Timestamp::now(),
             })
             .collect())
@@ -1744,6 +1745,7 @@ impl crate::v2::ports::repositories::ArtifactRepository for InMemoryRepositories
                 mime_type: artifact.mime_type.clone(),
                 byte_size: artifact.byte_size,
                 checksum: artifact.checksum.clone(),
+                url: artifact.url.clone(),
                 created_at: Timestamp::now(),
             })
             .collect();

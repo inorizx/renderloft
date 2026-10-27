@@ -199,6 +199,11 @@ pub struct ArtifactSummary {
     pub mime_type: String,
     pub byte_size: u64,
     pub checksum: String,
+    /// 平台给的原始结果地址（`url` 型产物才有；本地字节型是 `None`）。
+    ///
+    /// ⚠️ **会过期**：它是平台的签名链接，不是交付地址。给调用方是为了"就地取用"
+    /// （下游直接拿去转存/CDN，不必先绕一圈本机）。稳定的出口永远是 `bytes`。
+    pub url: Option<String>,
     pub created_at: Timestamp,
 }
 

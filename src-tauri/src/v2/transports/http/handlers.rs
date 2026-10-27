@@ -1174,8 +1174,14 @@ pub async fn list_operations(
 /// 从哪取字节"。现在得跨三个接口拼（任务 → run → 产物），每条 run 还得再发一次分页请求。
 /// 一份清单一次给全，顺序与提交顺序一致。
 ///
-/// 刻意**不返回远端 URL**：平台的链接会过期，拿它当交付地址迟早 404。给的是本地
-/// `bytesPath`（带 token 就能取字节）与 `savePath`（落盘到下载目录），这两条是稳定的。
+/// 两条出口都给出，各管一段：
+/// * `remoteUrl` —— 平台给的原始地址（RunningHub 那种"只给链接、不给字节"的产物才有）。
+///   下游拿去转存或上 CDN 最省事，不必先绕一圈本机；但它**会过期**，是"此刻能取"而不是
+///   "永久交付地址"，别把它当长期入口存下来。
+/// * `bytesPath`（带 token 取字节，必要时回源并落本地缓存）/ `savePath`（落盘到下载目录）
+///   —— 稳定出口：平台那条链接烂了，取过一次的也还能取。
+///
+/// `byteSize == 0` 表示字节还没落本地（"在平台上"），与 README「产物怎么拿到手」同一口径。
 pub async fn operation_manifest(
     State(state): State<Arc<V2HttpState>>,
     Extension(actor): Extension<ActorRef>,
@@ -1229,6 +1235,8 @@ pub async fn operation_manifest(
                     "mimeType": artifact.mime_type,
                     "byteSize": artifact.byte_size,
                     "checksum": artifact.checksum,
+                    // 平台原始链接：能直接取，但会过期（见上面那段说明）。
+                    "remoteUrl": artifact.url,
                     "bytesPath": format!("/api/v1/artifacts/{}/bytes", artifact.id.0),
                     "savePath": format!("/api/v1/artifacts/{}/save", artifact.id.0),
                 }))
@@ -1824,6 +1832,9 @@ pub async fn list_artifacts(
                         "mimeType": summary.mime_type,
                         "byteSize": summary.byte_size,
                         "checksum": summary.checksum,
+                        // 平台给的原始地址（可能为 null：本地字节型产物没有它）。
+                        // ⚠️ 会过期，别当永久交付地址；稳定出口是 /artifacts/{id}/bytes。
+                        "remoteUrl": summary.url,
                     })
                 })
                 .collect::<Vec<_>>(),
@@ -2053,6 +2064,8 @@ pub async fn get_artifact(
             "mimeType": artifact.mime_type,
             "byteSize": artifact.byte_size,
             "checksum": artifact.checksum,
+            // 平台原始地址（RunningHub 那种"只给链接"的产物才有）；会过期，见 manifest 的说明。
+            "remoteUrl": artifact.url,
         })))
         .unwrap(),
     ))

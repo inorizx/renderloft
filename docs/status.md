@@ -14,8 +14,12 @@
   "这批跑出了什么、花在哪、文件叫什么都放在哪"，此前得跨三个接口拼（任务 → run → 产物），
   每条 run 还要再发一次分页请求。现在一次给全：每条 run 的 `label`（就是产物文件名前缀）、
   状态、账号、`usage`、`inputs`、`error`，以及每个产物的 `filename` / `byteSize` / `checksum` /
-  `bytesPath`（带 token 取字节）/ `savePath`（落盘到下载目录）。
-  刻意**不返回平台远端 URL**：它会过期，拿它当交付地址迟早 404。
+  `remoteUrl` / `bytesPath`（带 token 取字节）/ `savePath`（落盘到下载目录）。
+  **两条出口分工**（2026-10-27 改过一次，最初只给本地那条）：
+  `remoteUrl` 是平台原始链接（RunningHub 那种"只给链接不给字节"的才有，`byteSize` 为 0），
+  下游拿去转存/上 CDN 最省事——但它**会过期**，是"此刻能取"而不是永久交付地址；
+  `bytesPath` / `savePath` 是稳定出口（必要时回源并落本地缓存，平台链接烂了也还在）。
+  `GET /artifacts` 与 `GET /artifacts/{id}` 同批带上 `remoteUrl`（`ArtifactSummary` 加了这一列）。
   真机：`operation 35` 返回 1 条 run + 1 个产物（`SKU135-1-…-56000.png`）。
 - **产物文件名带上"这一条任务叫什么"**（2026-10-27）：规则从 `{应用名}-{产物id}` 变成
   **`{run 标签}-{应用名}-{产物id}.{ext}`**。标签就是调用方提交时的 `clientRunId`——界面加了
