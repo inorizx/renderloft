@@ -127,6 +127,14 @@ interface BatchRow {
   id: number
   values: Record<string, unknown>
   files: Record<string, { assetId: number; checksum: string; filename: string }>
+  /**
+   * 这一条**自己的名字**（可选）。留空就用「前缀-序号」。
+   *
+   * 为什么要逐条：一批 20 张里常常是"同一批货的不同角度/不同款式"，下游按 `SKU135-正面`、
+   * `SKU135-背面` 对号入座；只给前缀的话，产物文件名里只有 `-1`、`-2`，谁是谁得回界面查。
+   * 它最终就是 `clientRunId`（进文件名、进任务页标签），清洗规则在后端（非法字符换 `-`）。
+   */
+  name?: string
   /** 提交后的行级执行状态（未提交/草稿行为 pending）。 */
   status?: RowStatus
   /** 提交时随 payload 生成的显式 id：行↔run 映射以此为准，不依赖数组下标。 */
@@ -742,10 +750,21 @@ const run = async () => {
     // 每行显式生成 clientRunId：行↔run 映射用它对齐，不依赖返回数组顺序。
     const prefix = namePrefix.value.trim()
     // run 名会**进产物文件名**（后端 `compose_filename` 拿它当标签）。所以：
-    // 有前缀用「前缀-序号」，没有就用序号本身——别把内部 token 写进交付物。
-    const clientRunIds = rows.map((_row, index) =>
-      prefix ? (rows.length === 1 ? prefix : `${prefix}-${index + 1}`) : `${index + 1}`
-    )
+    // 逐条给了名字就用它（`SKU135-正面`）；否则用「前缀-序号」；都没有就用序号本身
+    // ——别把内部 token 写进交付物。
+    const clientRunIds = rows.map((row, index) => {
+      const named = (row.name ?? '').trim()
+      if (named) return named
+      return prefix ? (rows.length === 1 ? prefix : `${prefix}-${index + 1}`) : `${index + 1}`
+    })
+    // 名字是幂等/对齐用的键，重名会让"这一行对应哪条 run"失去意义（后端也会拒）。
+    // 与其等后端报 `clientRunId 重复`，不如在花钱之前点名是哪几个。
+    const duplicated = [...new Set(clientRunIds.filter((id, i) => clientRunIds.indexOf(id) !== i))]
+    if (duplicated.length) {
+      throw new Error(
+        t('runner.duplicateNames', { names: duplicated.join(t('common.listSeparator')) })
+      )
+    }
     const runsPayload = rows.map((row, index) => {
       // 资产按**字段键**定位（field.key，如 "475::image"）：位置数组的语义由上游节点
       // 顺序决定，把它当语义正是图片错位的来源。没选文件的字段直接不进对象（跳过中间
@@ -1014,6 +1033,7 @@ const goEditFields = () => {
             <thead>
               <tr>
                 <th class="batch-index-column">#</th>
+                <th class="batch-name-column">{{ t('runner.colName') }}</th>
                 <th class="batch-status-column">{{ t('runner.colStatus') }}</th>
                 <th v-for="field in variableFields" :key="field.key">
                   {{ field.description || field.key }}
@@ -1024,6 +1044,15 @@ const goEditFields = () => {
             <tbody>
               <tr v-for="(row, index) in batchRows" :key="row.id">
                 <td class="batch-index-column">{{ index + 1 }}</td>
+                <td class="batch-name-column">
+                  <input
+                    v-model="row.name"
+                    type="text"
+                    maxlength="40"
+                    class="batch-cell-input"
+                    :placeholder="t('runner.rowNamePlaceholder')"
+                  />
+                </td>
                 <td class="batch-status-column">
                   <StatusBadge :status="rowStatusBadge(row.status).tone">{{
                     rowStatusBadge(row.status).label
@@ -1442,6 +1471,9 @@ const goEditFields = () => {
   width: 3rem;
   color: var(--app-muted-foreground);
   font-variant-numeric: tabular-nums;
+}
+.batch-name-column {
+  width: 11rem;
 }
 .batch-status-column {
   width: 6.5rem;

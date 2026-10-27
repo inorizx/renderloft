@@ -25,6 +25,13 @@ export interface RunnerBatchRow {
   id: number
   values: Record<string, unknown>
   files: Record<string, RunnerFileRef>
+  /**
+   * 这一条自己的名字（可选，进产物文件名）。
+   *
+   * **只在内存里**（见 `PersistedDraft` 的说明）：它在提交时就是 `clientRunId`，
+   * 而草稿刻意不把参与幂等的标识带回下一次会话。
+   */
+  name?: string
   /** 提交后的行级执行状态（草稿行无）。 */
   status?: 'pending' | 'queued' | 'running' | 'succeeded' | 'failed' | 'cancelled'
   /** 提交时生成的显式 id，行↔run 映射以此为准。 */
