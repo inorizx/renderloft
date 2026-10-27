@@ -173,7 +173,7 @@ RenderLoft 自带一个 MCP 服务器（stdio），把本机 daemon 的能力暴
 
 接你自己的流水线时，产物有**两条出口**（`GET /operations/{id}/manifest`、`GET /artifacts` 里都给）：
 
-- `remoteUrl`：平台给的原始链接（RunningHub 那种"只给链接、不给字节"的产物才有，此时 `byteSize` 是 0）。下游直接拿去转存或上 CDN 最省事，不必先绕一圈本机——但它**会过期**，是"此刻能取"，别当长期交付地址存着。
+- `remoteUrl`：平台给的原始链接（RunningHub 那种"只给链接、不给字节"的产物才有，此时 `byteSize` 是 0）。下游直接拿去转存或上 CDN 最省事，不必先绕一圈本机——但它**会过期**，是"此刻能取"，别当长期交付地址存着。期限平台没在接口里给（按经验**一般两周左右**），所以每条产物还带 `createdAt`（落库时刻，epoch 毫秒），你可以自己算年龄、自己决定什么时候必须转存。
 - `bytesPath` / `savePath`：稳定出口。`bytes` 带 token 就能取（没有本地缓存时会回源并落盘），`save` 直接落下载目录。
 
 > 撞名策略（`--on-conflict`）、`--name-template`、同 run 内重名、定时收图脚本与两个实测坑，都在 [`docs/agent-cookbook.md`](docs/agent-cookbook.md)。

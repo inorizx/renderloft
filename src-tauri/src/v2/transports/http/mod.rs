@@ -3161,6 +3161,12 @@ mod tests {
             "平台链接型产物把原始地址给下游（会过期，别当长期交付地址）"
         );
         assert_eq!(data["runs"][0]["artifacts"][1]["byteSize"], 0, "0 = 字节还在平台上");
+        assert!(
+            data["runs"][0]["artifacts"][1]["createdAt"]
+                .as_str()
+                .is_some_and(|value| !value.is_empty()),
+            "给调用方一个算链接年龄的起点（平台的 TTL 我们不编，给数据）"
+        );
     }
 
     /// **产物列表的第二个方向**：`before` = "比这个 id 更旧的，最新在前"。

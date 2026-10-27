@@ -1237,6 +1237,10 @@ pub async fn operation_manifest(
                     "checksum": artifact.checksum,
                     // 平台原始链接：能直接取，但会过期（见上面那段说明）。
                     "remoteUrl": artifact.url,
+                    // 这条产物**落库的时刻**（epoch 毫秒）。平台链接的年龄从这里算——
+                    // 我们不知道平台的 TTL（实测口径一般是两周左右，但那是经验值，
+                    // 不是接口给的），所以给数据不给结论：调用方自己盯剩余寿命。
+                    "createdAt": artifact.created_at.0,
                     "bytesPath": format!("/api/v1/artifacts/{}/bytes", artifact.id.0),
                     "savePath": format!("/api/v1/artifacts/{}/save", artifact.id.0),
                 }))
@@ -1835,6 +1839,8 @@ pub async fn list_artifacts(
                         // 平台给的原始地址（可能为 null：本地字节型产物没有它）。
                         // ⚠️ 会过期，别当永久交付地址；稳定出口是 /artifacts/{id}/bytes。
                         "remoteUrl": summary.url,
+                        // 落库时刻（epoch 毫秒）：链接年龄的起点，见 manifest 的同名字段。
+                        "createdAt": summary.created_at.0,
                     })
                 })
                 .collect::<Vec<_>>(),
