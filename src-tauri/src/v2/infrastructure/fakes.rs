@@ -1707,7 +1707,7 @@ impl crate::v2::ports::repositories::ArtifactRepository for InMemoryRepositories
         run_id: RunId,
     ) -> DomainResult<Vec<crate::v2::ports::repositories::ArtifactSummary>> {
         let state = self.state.lock().unwrap();
-        Ok(state
+        let mut summaries = state
             .artifacts
             .values()
             .filter(|artifact| artifact.run_id == Some(run_id.0))
@@ -1721,7 +1721,12 @@ impl crate::v2::ports::repositories::ArtifactRepository for InMemoryRepositories
                 url: artifact.url.clone(),
                 created_at: Timestamp::now(),
             })
-            .collect())
+            .collect::<Vec<_>>();
+        // 必须与 sqlite 对齐：那边是 `ORDER BY id ASC`，而这里是 HashMap——不排序就
+        // **顺序随机**。它不会让测试红，只会让断言偶尔红（实测：manifest 的两条产物
+        // 第一次跑是 90001、第二次是 90002），这类"绿得看运气"最费时间。
+        summaries.sort_by_key(|summary| summary.id);
+        Ok(summaries)
     }
 
     async fn list(
