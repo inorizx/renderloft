@@ -4,6 +4,18 @@
 
 ## 已完成
 
+- **`docs/http-api.md`：把"当后端"的契约写成一页**（2026-10-27，晚）：认证与 scope 表、
+  四步调用（发现 → 素材 → 预检 → 提交）、manifest 字段语义（`byteSize == 0` 是什么、
+  `checksum == null`、`remoteUrl` 会过期）、幂等与 `SUBMISSION_UNCERTAIN` 的重试边界、
+  常见错误码，以及"这个后端**不**负责什么"。没有新增接口——只是把已经存在的契约说准；
+  同时记下三处已知缺口（openapi 无请求/响应 schema、回调投递不可查、无服务化封装）。
+- **scope 的名字只有一份**（2026-10-27，晚）：`/actor-tokens` 的响应此前回
+  `"OperationsExecute"`（Rust 的 `Debug` 名），而请求收的是 `"operations:execute"`——
+  "读一把 token 的 scopes 再拿去签新 token"这条最自然的用法**当场失败**，错因还看起来像
+  "scope 不认识"。现在 `SCOPE_TABLE` 是唯一权威，`Scope::parse`（入）与 `wire_name`（出）
+  都查它；顺带补齐了此前根本发不出去的 `agents:*` / `deliveries:*`。
+  判据：`every_scope_has_one_wire_name_and_round_trips`（逐条往返 + 名字不重复）、
+  `issue_and_revoke_token_via_http`（响应与请求**同一写法**）。
 - **产物指纹：只在字节经过我们时才算，且不再用空串冒充"未知"**（2026-10-27，晚）：
   URL 型产物（RunningHub 只给链接不给你字节）在**取字节那一刻**顺手算 `sha256-<hex>` 落库；
   没取过的对外给 `checksum: null`（原来给 `""`——下游拿去去重会把所有"还没算过"的产物

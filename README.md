@@ -161,6 +161,7 @@ RenderLoft 自带一个 MCP 服务器（stdio），把本机 daemon 的能力暴
 **刻意不给 AI 的动词不在工具清单里，也调不到**：写密钥、写备注名、建/删连接、关 daemon、往磁盘写文件——它们属于人的动作，改的是「谁能跑什么」这条授权边界本身。
 
 > **带图提交、批量、回调、dry-run、分页与常见坑**：[`docs/agent-cookbook.md`](docs/agent-cookbook.md)。
+> **把它当后端接进你自己的流水线**（认证与 scope、四步调用、服务端给的字段语义、哪些错误能重试）：[`docs/http-api.md`](docs/http-api.md)。
 > **这套工具面的完整推导**（公理 → 设计律 → 物理边界 → 可证伪的判据、常驻 token 账单，以及"为什么压平成原生工具"这个**已经定下来**的岔路）：[`docs/mcp-surface.md`](docs/mcp-surface.md)。
 
 ## 产物怎么拿到手

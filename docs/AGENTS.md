@@ -54,11 +54,12 @@ scripts/                     dev / build / check-layers.mjs（分层守门）
 | `../ARCHITECTURE.md` | 长期架构不变量与技术选择 |
 | `status.md` | 当前已完成、进行中和暂缓事项 |
 
-另有一份**专题设计文档**（不是入口，改 MCP 工具面前必读）：
+另有**专题设计文档**（不是入口；改 MCP 工具面前必读 `mcp-surface.md`，改对外字段语义时同步 `http-api.md`）：
 
 | 文档 | 用途 |
 |---|---|
 | `mcp-surface.md` | MCP 工具面的设计律与判据：公理、推导、物理边界、可证伪的验收。**改工具面之前先读它**，否则很容易把"调用方需要的事实"留在服务端 |
+| `http-api.md` | 对外 HTTP 契约（"把它当后端"）：认证与 scope、四步调用、字段语义（`byteSize == 0` / `checksum == null` / `remoteUrl` 会过期）、幂等与"结果不明"的重试边界。**改对外字段语义时同步它** |
 
 ## 常用命令
 
