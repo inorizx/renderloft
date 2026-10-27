@@ -186,6 +186,11 @@ pub fn build_router(state: Arc<V2HttpState>) -> Router {
             "/api/v1/operations/{operation_id}/events",
             get(handlers::operation_events),
         )
+        .route(
+            // 交付清单：一批的 run + 产物一次给全，只读。
+            "/api/v1/operations/{operation_id}/manifest",
+            get(handlers::operation_manifest),
+        )
         .route("/api/v1/runs/{run_id}", get(handlers::get_run))
         .route(
             "/api/v1/assets",
@@ -3064,6 +3069,67 @@ mod tests {
     // - /recipes/import 与 comfyui 三条、/providers/llm/models：需要**外部网络**
     //   （RunningHub / ComfyUI / LLM 端点），要么造假要么跳过，属"要不要做集成测试"的决策；
     // - /settings/open-download-dir：会**真的在用户机器上打开资源管理器**，测试不该有这种副作用。
+
+    /// 交付清单：一次给出「这一批跑出了什么」。
+    ///
+    /// 判别点：run 的 `label`（提交时的 clientRunId，也是产物文件名前缀）、账号、产物的
+    /// `filename` 与 `bytesPath` 都在同一份响应里；下游不用再拼三个接口。
+    #[tokio::test]
+    async fn operation_manifest_lists_runs_and_their_artifacts() {
+        use crate::v2::domain::ids::ArtifactId;
+        use crate::v2::ports::stores::{ArtifactObject, ArtifactStore};
+
+        let (app, repositories) = test_app();
+        let token = issue_token(&repositories, &["operations:read", "operations:execute"]).await;
+        let (status, body) = post_json(
+            &app,
+            "/api/v1/operations",
+            &token,
+            create_operation_body("manifest-key"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let operation_id = body["data"]["operationId"].as_u64().unwrap();
+        let run_id = body["data"]["runIds"][0].as_u64().unwrap();
+
+        ArtifactStore::store(
+            &repositories,
+            ArtifactObject {
+                id: ArtifactId(90001),
+                run_id: Some(run_id),
+                filename: "image-1-Image Recipe-90001.png".to_string(),
+                mime_type: "image/png".to_string(),
+                byte_size: 4,
+                checksum: "sum".to_string(),
+                storage_key: "artifacts/90001".to_string(),
+                url: None,
+                bytes: vec![1, 2, 3, 4],
+            },
+        )
+        .await
+        .expect("种产物");
+
+        let (status, body) = get_json(
+            &app,
+            &format!("/api/v1/operations/{operation_id}/manifest"),
+            &token,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let data = &body["data"];
+        assert_eq!(data["runCount"], 1);
+        assert_eq!(data["artifactCount"], 1);
+        assert_eq!(data["runs"][0]["label"], "image-1", "标签就是提交时的 clientRunId");
+        assert_eq!(
+            data["runs"][0]["artifacts"][0]["filename"],
+            "image-1-Image Recipe-90001.png"
+        );
+        assert_eq!(
+            data["runs"][0]["artifacts"][0]["bytesPath"],
+            "/api/v1/artifacts/90001/bytes",
+            "下游拿这一条去取字节，不用自己拼 id"
+        );
+    }
 
     /// **产物列表的第二个方向**：`before` = "比这个 id 更旧的，最新在前"。
     ///

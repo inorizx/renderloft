@@ -121,6 +121,7 @@ pub const ROUTES: &[(&str, &str)] = &[
         "post",
     ),
     ("/api/v1/operations/{operation_id}/events", "get"),
+    ("/api/v1/operations/{operation_id}/manifest", "get"),
     ("/api/v1/runs/{run_id}", "get"),
     ("/api/v1/assets", "post"),
     ("/api/v1/assets/{asset_id}", "get"),
@@ -1163,6 +1164,87 @@ pub async fn list_operations(
             next_cursor,
             has_more,
         }))
+        .unwrap(),
+    ))
+}
+
+/// `GET /api/v1/operations/{id}/manifest` —— 这一批的**交付清单**。
+///
+/// 为什么单独一条：下游（脚本 / agent）要回答"这批跑出了什么、花在哪、文件叫什么、
+/// 从哪取字节"。现在得跨三个接口拼（任务 → run → 产物），每条 run 还得再发一次分页请求。
+/// 一份清单一次给全，顺序与提交顺序一致。
+///
+/// 刻意**不返回远端 URL**：平台的链接会过期，拿它当交付地址迟早 404。给的是本地
+/// `bytesPath`（带 token 就能取字节）与 `savePath`（落盘到下载目录），这两条是稳定的。
+pub async fn operation_manifest(
+    State(state): State<Arc<V2HttpState>>,
+    Extension(actor): Extension<ActorRef>,
+    Path(operation_id): Path<u64>,
+) -> HttpResult {
+    require_scope(&actor, Scope::OperationsRead)?;
+    let persisted = state
+        .operations
+        .find_operation(OperationId(operation_id))
+        .await
+        .map_err(domain_error)?
+        .ok_or_else(|| error::not_found("OPERATION_NOT_FOUND", "Operation 不存在"))?;
+    let operation = &persisted.operation;
+
+    let mut connection_of_revision: std::collections::HashMap<u64, Option<(u64, String)>> =
+        std::collections::HashMap::new();
+    let mut runs = Vec::with_capacity(persisted.runs.len());
+    let mut artifact_count = 0usize;
+    for run in &persisted.runs {
+        let connection = match connection_of_revision.get(&run.connection_revision_id.0) {
+            Some(cached) => cached.clone(),
+            None => {
+                let resolved =
+                    resolve_connection_label(&state.connections, run.connection_revision_id).await;
+                connection_of_revision.insert(run.connection_revision_id.0, resolved.clone());
+                resolved
+            }
+        };
+        let artifacts = state
+            .artifacts_repo
+            .list_by_run(run.id)
+            .await
+            .map_err(domain_error)?;
+        artifact_count += artifacts.len();
+        runs.push(json!({
+            "runId": run.id.0,
+            // 提交时给的名字：产物文件名就是照它起的，下游按它对齐自己的记录。
+            "label": run.client_run_id,
+            "sequence": run.sequence,
+            "status": run.status.as_str(),
+            "connectionId": connection.as_ref().map(|(id, _)| *id),
+            "connectionName": connection.as_ref().map(|(_, name)| name.clone()),
+            "usage": run.usage,
+            "inputs": run.inputs,
+            "error": run.error,
+            "artifacts": artifacts
+                .iter()
+                .map(|artifact| json!({
+                    "artifactId": artifact.id.0,
+                    "filename": artifact.filename,
+                    "mimeType": artifact.mime_type,
+                    "byteSize": artifact.byte_size,
+                    "checksum": artifact.checksum,
+                    "bytesPath": format!("/api/v1/artifacts/{}/bytes", artifact.id.0),
+                    "savePath": format!("/api/v1/artifacts/{}/save", artifact.id.0),
+                }))
+                .collect::<Vec<_>>(),
+        }));
+    }
+
+    Ok(Json(
+        serde_json::to_value(Envelope::new(json!({
+            "operationId": operation.id.0,
+            "status": operation.status.as_str(),
+            "createdAt": operation.created_at.0,
+            "runCount": runs.len(),
+            "artifactCount": artifact_count,
+            "runs": runs,
+        })))
         .unwrap(),
     ))
 }
