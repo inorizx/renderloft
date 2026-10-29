@@ -4,6 +4,15 @@
 
 ## 已完成
 
+- **导入工作流时能挑字段了**（2026-10-29）：`recipe import-workflow` 加了 `--fields <file>`
+  （JSON 数组，元素 `{key, label, widget, options}`），并新增 `recipe fields` 用来先问
+  「这个工作流有哪些字段」——它的输出可以直接喂给前者。两条都**只给 CLI**：勾哪些字段
+  暴露成表单是策展，与 `recipe.remove` 同一口径；MCP 侧照旧全暴露，`from_mcp` 会把硬塞进来的
+  `fields` 当未知参数拒掉（`UNKNOWN_PARAM`）。界面那条路（RunningHub 工作流导入的第二屏）
+  与 ComfyUI 共用同一个 `FieldSelectionList` 组件——同一份 UI，否则两边会各自漂移。
+  判据：486 个测试通过（含 MCP 常驻清单的 token 预算那条）、MCP `tools/list` 里
+  `renderloft_import_workflow` 的参数仍是 `connectionId, name, source`。
+
 - **「结果」页删掉，端点留着**（2026-10-29）：这页 10-18 建起来的前提是"产物会积累成资产库、
   用户会来这儿找图"，而产物本身是**跟着任务走的交付物**——`http-api.md` 写的是"不长期托管
   你的字节"，保留期到点连记录带产物一起清（默认 30 天）。一个会自动消失的画廊，撑不起"资产库"

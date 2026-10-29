@@ -549,3 +549,88 @@ renderloft-cli workspace backup --to /path/on/this/machine/backup
 > ⚠️ **必须交回给人的一步**：平台 API Key **不在这份快照里**（它们在系统凭据库，设计上不落库）。
 > 所以迁移的最后一步是**人在界面的「连接」页重新填一次**。在人来填之前**不要报告"迁移完成"**
 > ——之后的任务会因为缺少凭据而失败，而那看起来像是你的迁移做错了。
+
+### 只想搬「应用库」（不含任务历史与产物）
+
+整机迁移会把所有东西都搬过去。如果你要的只是**这套应用本身**——换机器后看到同样的应用库、
+或者把自己整理好的一套给同事——用应用库包：
+
+```bash
+renderloft-cli library export --to my-library.json
+renderloft-cli library import --from my-library.json
+```
+
+包里只有应用：名字、描述、标签、分组、收藏、**每个字段的中文备注名与控件**、默认值、平台类型。
+**不含**任务历史、产物、连接与密钥。
+
+- 导入时按包里的**驱动键**（`runninghub/runninghub`）去本机找一条连接并绑上；
+- 本机没有那个平台的连接 ⇒ 那条**不导入**，并在 `failed` 里说明缺哪种连接
+  （`IMPORT_CONNECTION_MISSING`）——不会给你一个点运行就报错的空壳；
+- 同名默认**跳过**（`IMPORT_NAME_EXISTS`）；`--replace` 才覆盖，且覆盖是**追加一份 revision**，
+  不改写历史；
+- 界面里也有这两个按钮（应用库页工具条）。
+
+## 13. 导入工作流：只暴露你要的那几个字段
+
+`recipe import-workflow` **默认把所有字段都摊成表单**。一个真实的工作流（Qwen 图像编辑）
+能给你九个框：`Load Image · image（节点 475）`、`Empty Latent Image · height`、
+`Text Encode Qwen Image 2.1 · resolution`……其中**四个都叫 `Load Image · image`**，
+只有括号里的节点号分得出谁是谁。
+
+要表单干净，**先问有哪些字段，再挑**：
+
+```bash
+# ① 看：只读，不建应用、不花钱
+renderloft-cli recipe fields --connection 1 \
+  --source https://www.runninghub.cn/post/2108034148131758082 \
+  | jq '.data.fields' > fields.json
+```
+
+每条长这样：
+
+```json
+{
+  "key": "475::image",
+  "classType": "LoadImage",
+  "nodeId": "475",
+  "fieldName": "image",
+  "media": true,
+  "suggested": true,
+  "defaultLabel": "Load Image · image（节点 475）"
+}
+```
+
+`key` 就是提交任务时用的**字段键**（见 §0），两处是同一个东西。
+
+```bash
+# ② 挑：删掉不要的，补 label（中文名）与 widget（控件）
+cat > picked.json <<'JSON'
+[
+  { "key": "874::text",  "label": "提示词", "widget": "textarea" },
+  { "key": "475::image", "label": "人物图", "widget": "file" },
+  { "key": "519::image", "label": "衣服图", "widget": "file" }
+]
+JSON
+
+# ③ 导：只有这三个进表单
+renderloft-cli recipe import-workflow --connection 1 \
+  --source https://www.runninghub.cn/post/2108034148131758082 \
+  --name "换装" --fields picked.json
+```
+
+`widget` 可选：`text` / `textarea` / `number` / `switch` / `dropdown` / `file`，不写就让引擎
+声明与值的形状决定。
+
+三条边界：
+
+- **没勾的字段不会消失**。工作流本身一个节点都不少——这条路我们只存 `workflowId` + 字段映射，
+  图留在平台上，没暴露的字段用平台那份的原值。所以「空的 LoadImage」这类字段**要记得勾上**，
+  否则跑起来缺图。
+- `fields.json` 里**多余的键会被忽略**（`nodeId`、`suggested` 那些原样留着也没事）；
+  不写 `label` 就用 `defaultLabel`。
+- **`--fields` 只有 CLI 有**。MCP 的 `renderloft_import_workflow` 拿不到它，`recipe fields`
+  也不在 MCP 工具清单里——勾哪些字段暴露成表单是**策展**，是人的决定。外界 Agent 能导入，
+  但表单长什么样不归它管（同类：`recipe.remove` / `recipe.restore` / `connection.set-key`）。
+
+`recipe import`（AI 应用，`/ai-detail/…`）**没有**这个能力：应用的字段由平台声明，
+后端那条路只做全量。要挑，就只能走工作流那条。
