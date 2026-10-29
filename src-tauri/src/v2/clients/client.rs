@@ -264,11 +264,41 @@ impl V2Client {
     /// 为什么要有它：界面早就导得进工作流（「从 RunningHub 工作流拉取」），但那条路只到
     /// "导入成 ComfyUI 配方"，而 CLI/MCP **完全够不着**——代价是"只有 MCP 没有界面时，
     /// 这个工作流根本进不来"。
+    /// 看一眼某个工作流有哪些字段（**只读**：拉图 + 问节点定义，不建应用、不花钱）。
+    ///
+    /// 两次读请求串起来：先把图拉成 ComfyUI 格式的 prompt，再问它有哪些字段。放在客户端
+    /// 而不是后端加一个合成端点，是因为这两步各自都有别的调用方（界面分两步走），
+    /// 合成一个只为 CLI 服务的端点等于多一份要同步的口径。
+    pub async fn recipe_fields(
+        &self,
+        connection_id: u64,
+        source: &str,
+    ) -> Result<serde_json::Value, ClientError> {
+        let fetched = self
+            .post(
+                "/api/v1/recipes/comfyui-fetch-workflow",
+                json!({ "connectionId": connection_id, "source": source }),
+            )
+            .await?;
+        let prompt = fetched.get("prompt").cloned().unwrap_or(serde_json::Value::Null);
+        self.post(
+            "/api/v1/recipes/comfyui-preview",
+            json!({ "prompt": prompt, "connectionId": connection_id }),
+        )
+        .await
+    }
+
+    /// 导入一个 RunningHub 工作流。
+    ///
+    /// `fields` 是**勾选的字段**（`[{key, label, widget, options}]`）：`None` = 他没挑过，
+    /// 后端按启发式给默认标签、全部暴露；传了就是他的决定（勾哪些、叫什么、用什么控件）。
+    /// 这个参数只从 CLI 来——勾字段是策展，MCP 那侧拿不到（见动词表里的 `channels`）。
     pub async fn import_recipe_workflow(
         &self,
         connection_id: u64,
         source: &str,
         name: Option<&str>,
+        fields: Option<serde_json::Value>,
     ) -> Result<Value, ClientError> {
         self.post(
             "/api/v1/recipes/import-workflow",
@@ -276,6 +306,7 @@ impl V2Client {
                 "connectionId": connection_id,
                 "source": source,
                 "name": name,
+                "fields": fields,
             }),
         )
         .await

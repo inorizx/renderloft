@@ -257,11 +257,21 @@ export const useV2WorkspaceStore = defineStore('v2-workspace', () => {
    * `workflowId` + 字段映射。与 `importComfyUIRecipe` 的区别是**谁来跑**——那条把图拉进
    * 库里、交给 ComfyUI 引擎（rh-proxy）执行。
    */
-  const importWorkflowRecipe = async (connectionId: number, source: string, name?: string) => {
+  const importWorkflowRecipe = async (
+    connectionId: number,
+    source: string,
+    name?: string,
+    /**
+     * 勾选的字段（不传 = 他没选过 ⇒ 后端按启发式给默认标签、全部暴露）。
+     * 传了就是**他的决定**：勾哪些、叫什么、用什么控件。
+     */
+    fields?: Array<{ key: string; label?: string; widget?: string; options?: string[] }>
+  ) => {
     const result = await v2.post<ImportedRecipeResult>('/api/v1/recipes/import-workflow', {
       connectionId,
       source,
-      ...(name ? { name } : {})
+      ...(name ? { name } : {}),
+      ...(fields && fields.length ? { fields } : {})
     })
     await loadRecipes(true)
     return result

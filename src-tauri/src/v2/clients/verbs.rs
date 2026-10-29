@@ -525,8 +525,11 @@ pub static VERBS: &[Verb] = &[
         group: "recipe",
         action: "import-workflow",
         summary: "从 RunningHub 工作流链接/ID 导入一个工作流应用",
-        // 给 MCP：与 `recipe.import`（AI 应用）同一口径——导入**不是**策展，
-        // 勾字段与写备注才是人的事（这里刻意一个字段都不挑，全暴露）。
+        // 给 MCP：与 `recipe.import`（AI 应用）同一口径。
+        // ⚠️ 但 `fields` 参数**只给 CLI**（见下面的 Param）：勾哪些字段暴露成表单是**策展**，
+        // 是人的判断，与 `recipe.remove` 同属一类。AI 可以导入（机械动作），但不该替人
+        // 决定表单长什么样——所以 MCP 那侧拿到的永远是"全暴露"，`from_mcp` 也会把
+        // 硬塞进来的 `fields` 当未知参数拒掉。
         mcp_name: Some("renderloft_import_workflow"),
         mcp_description: Some(
             "Import a RunningHub workflow (`/post/<id>` or bare id). `connectionId` must be \
@@ -552,6 +555,40 @@ pub static VERBS: &[Verb] = &[
                 help: "导入后的名字（不给就用平台的默认名）",
                 mcp: Some("Optional display name; defaults to a name built from the workflow id."),
                 ..opt("name", Kind::Text)
+            },
+            Param {
+                // **只给 CLI**：勾哪些字段暴露成表单是策展，是人的判断（与 `recipe.remove` 同一口径）。
+                // 界面已经能勾了；脚本批量导入时同样需要它，但 AI 不该替人决定表单长什么样。
+                help: "勾选要暴露的字段（JSON 数组文件，元素形如 {\"key\":\"874::text\",\"label\":\"提示词\",\"widget\":\"textarea\"}）；不给 = 全部暴露",
+                channels: Channels::CLI,
+                ..opt("fields", Kind::JsonArray)
+            },
+        ],
+    },
+    Verb {
+        id: "recipe.fields",
+        group: "recipe",
+        action: "fields",
+        summary: "看一个工作流有哪些字段（可直接喂给 import-workflow --fields）",
+        // **只给 CLI**。它存在的目的就一个：让 `import-workflow --fields` 的键有个出处。
+        // AI 即使看到这份清单也**不能**挑字段（那件事在 `--fields`/界面上，是人的决定），
+        // 所以它进常驻清单只是白占 token —— 常驻面是稀缺资源，不给"看了也用不上"的能力。
+        mcp_name: None,
+        mcp_description: None,
+        read_only: true,
+        destructive: false,
+        idempotent: true,
+        spends_credits: false,
+        params: &[
+            Param {
+                help: "RunningHub 连接 id（见 connection list）",
+                mcp: Some("RunningHub connection id to resolve the workflow through."),
+                ..req("connectionId", Kind::Id)
+            },
+            Param {
+                help: "平台工作流链接或工作流 ID",
+                mcp: Some("Platform workflow link (URL) or bare workflow id."),
+                ..req("source", Kind::Text)
             },
         ],
     },
@@ -1935,6 +1972,11 @@ pub async fn execute(
             }
         }
         "recipe.describe" => client.get_recipe(args.u64("recipeId")?).await,
+        "recipe.fields" => {
+            client
+                .recipe_fields(args.u64("connectionId")?, &args.text("source")?)
+                .await
+        }
         "recipe.remove" => client.remove_recipe(args.u64("recipeId")?).await,
         "recipe.restore" => client.restore_recipe(args.u64("recipeId")?).await,
         "recipe.import" => {
@@ -1948,6 +1990,7 @@ pub async fn execute(
                     args.u64("connectionId")?,
                     &args.text("source")?,
                     args.opt_text("name")?.as_deref(),
+                    args.opt_json("fields")?,
                 )
                 .await
         }
@@ -2828,7 +2871,8 @@ mod tests {
             ("recipe.describe", &["recipe"]),
             ("recipe.import", &["connection", "source"]),
             // 后加的：RH 工作流那一半此前只有界面够得着。
-            ("recipe.import-workflow", &["connection", "source", "name"]),
+            ("recipe.import-workflow", &["connection", "source", "name", "fields"]),
+            ("recipe.fields", &["connection", "source"]),
             ("recipe.remove", &["recipe"]),
             ("recipe.restore", &["recipe"]),
             ("operation.list", &["limit", "after"]),
@@ -3634,6 +3678,8 @@ mod tests {
         // `nextActions` 对"等确认"的 run 明确写了 `operation.retry`，而它此前只有 HTTP 路由
         // ——界面点得到，Agent 照着 nextActions 去调却够不着（表里没这个名字）。
         // 它花钱（新 operation 会被提交、每个 run 计费一次），所以表里 `spends_credits: true`。
+        // 数字**没变**：`recipe.fields` 虽然加了，但它只给 CLI（见那条动词的注释）——
+        // 常驻清单的 token 是稀缺资源，不给"AI 看了也决定不了"的能力。
         assert_eq!(
             VERBS.iter().filter(|verb| verb.mcp_name.is_some()).count(),
             16

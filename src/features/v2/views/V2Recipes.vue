@@ -4,7 +4,6 @@ import { useRoute, useRouter } from 'vue-router'
 import {
   useV2WorkspaceStore,
   type ImportedRecipeResult,
-  type V2ComfyFieldPreview,
   type V2Recipe
 } from '@/features/v2/stores/workspace'
 import Card from '@/components/ui/Card.vue'
@@ -17,6 +16,7 @@ import IconButton from '@/components/ui/IconButton.vue'
 import AppCover from '@/components/shared/AppCover.vue'
 import ConfirmDialog from '@/components/shared/ConfirmDialog.vue'
 import EmptyState from '@/components/shared/EmptyState.vue'
+import FieldSelectionList from '@/components/shared/FieldSelectionList.vue'
 import FormField from '@/components/shared/FormField.vue'
 import PageContainer from '@/components/layout/PageContainer.vue'
 import PageHeader from '@/components/PageHeader.vue'
@@ -24,6 +24,7 @@ import NoticePanel from '@/components/shared/NoticePanel.vue'
 import { stripHtml } from '@/lib/utils'
 import { V2ApiError } from '@/shared/api/v2'
 import { recipeTypeKey, recipeTypeLabel, type RecipeTypeKey } from '@/shared/lib/recipeType'
+import type { FieldSelectionRow } from '@/shared/types/fieldSelection'
 import { timestampOf } from '@/shared/lib/relativeTime'
 import { useLocale } from '@/shared/composables/useLocale'
 import {
@@ -396,6 +397,31 @@ const importForm = reactive({
 })
 
 /**
+ * 导入对话框的第二屏：**选字段**。
+ *
+ * 只有 RunningHub **工作流**那条路有这一屏——AI 应用的字段由平台声明，后端那条路只做全量
+ * （没有挑选入口）；而工作流的图能被拉成 ComfyUI 格式的 prompt，于是它和 ComfyUI 那条路
+ * 走**同一个解析器、同一份 UI**（`FieldSelectionList`）。
+ *
+ * 选完的字段进 `inputSchema`，没选的**不进表单也不进映射**——但底层工作流一个字段都不少，
+ * 平台那份图才是完整定义（我们只存 `workflowId`）。
+ */
+const rhStep = ref<'input' | 'fields'>('input')
+const rhFieldRows = ref<FieldSelectionRow[]>([])
+const rhEnrichment = ref<{
+  classesUsed: number
+  classesKnown: number
+  reason: string | null
+} | null>(null)
+const rhSelectedCount = computed(() => rhFieldRows.value.filter((row) => row.selected).length)
+
+const resetRhFields = () => {
+  rhStep.value = 'input'
+  rhFieldRows.value = []
+  rhEnrichment.value = null
+}
+
+/**
  * 打开导入对话框时：**只有一条可用连接就替你选中**。
  *
  * 直觉上"我只有一个 RunningHub 账号"不该出现一道选择题。两条以上（.cn / .ai 各一条）时才需要
@@ -408,6 +434,8 @@ watch(showImport, (open) => {
   if (open && !importForm.connectionId && runningHubConnections.value.length === 1) {
     importForm.connectionId = String(runningHubConnections.value[0].connectionId)
   }
+  // 关窗就回到第一屏：下次打开不该停在上一次勾了一半的字段上。
+  if (!open) resetRhFields()
 })
 
 const runningHubConnections = computed(() => {
@@ -542,6 +570,19 @@ const importFromRunningHub = async () => {
     importError.value = t('library.errEnterRhSource')
     return
   }
+
+  // 第二屏：已经在选字段了，这次就是"确认导入"。
+  if (rhStep.value === 'fields') {
+    await commitRunningHubWorkflow(connectionId, source)
+    return
+  }
+  // 第一屏且判定是工作流：先把图拉下来让他挑字段，而不是导进来一堆 `Load Image · image`。
+  // 应用那条路没有可挑的（后端只做全量），所以照旧直接导。
+  if (effectiveRhKind.value === 'workflow') {
+    await previewRunningHubFields(connectionId, source)
+    return
+  }
+
   importing.value = true
   importError.value = ''
   // 名字只对**工作流**那条路有用：AI 应用的默认名来自平台（比用户自己起的更准）。
@@ -597,6 +638,82 @@ const importFromRunningHub = async () => {
   }
 }
 
+/**
+ * 第一屏 → 第二屏：把工作流拉成一张图、问出它的字段。
+ *
+ * 为什么是"拉一次"而不是"导入后再说"：字段集合决定表单长什么样，**选完才建应用**
+ * 才能让表单从一开始就是干净的。拉图这一步本来就要发生（导入时后端会再拉一次），
+ * 这里只是把它提前，代价是一次读请求、不花钱。
+ */
+const previewRunningHubFields = async (connectionId: number, source: string) => {
+  importing.value = true
+  importError.value = ''
+  try {
+    const prompt = await workspace.fetchComfyUIWorkflow(connectionId, source)
+    const preview = await workspace.previewComfyUIFields(prompt, connectionId)
+    rhFieldRows.value = preview.fields.map((field) => ({
+      key: field.key,
+      nodeId: field.nodeId,
+      classType: field.classType,
+      fieldName: field.fieldName,
+      default: field.default,
+      media: field.media,
+      defaultLabel: field.defaultLabel,
+      // `suggested` 是后端给的"这个字段大概率该露出来"——它只是**初值**，勾不勾由他改。
+      selected: field.suggested,
+      label: '',
+      widget: '',
+      options: ''
+    }))
+    rhEnrichment.value = preview.enrichment
+    rhStep.value = 'fields'
+  } catch (caught) {
+    importError.value = caught instanceof Error ? caught.message : String(caught)
+  } finally {
+    importing.value = false
+  }
+}
+
+/** 第二屏：勾完之后真正建应用。 */
+const commitRunningHubWorkflow = async (connectionId: number, source: string) => {
+  if (!rhSelectedCount.value) {
+    importError.value = t('library.errSelectField')
+    return
+  }
+  importing.value = true
+  importError.value = ''
+  try {
+    const fields = rhFieldRows.value
+      .filter((row) => row.selected)
+      .map((row) => ({
+        key: row.key,
+        label: row.label.trim() || undefined,
+        // 不选就一个字段都不发 ⇒ 后端按"用户没覆盖"处理（引擎/值的形状说了算）。
+        widget: row.widget || undefined,
+        options:
+          row.widget === 'dropdown'
+            ? row.options
+                .split(/[,，\n]/)
+                .map((option) => option.trim())
+                .filter(Boolean)
+            : undefined
+      }))
+    await finishImport(
+      await workspace.importWorkflowRecipe(
+        connectionId,
+        source,
+        importForm.name.trim() || undefined,
+        fields
+      )
+    )
+    resetRhFields()
+  } catch (caught) {
+    importError.value = caught instanceof Error ? caught.message : String(caught)
+  } finally {
+    importing.value = false
+  }
+}
+
 // ---------- ComfyUI API Prompt 导入 ----------
 const showComfyUIImport = ref(false)
 const comfyImporting = ref(false)
@@ -608,15 +725,7 @@ const comfyImportForm = reactive({
   connectionId: '' as string,
   promptJson: ''
 })
-interface ComfyFieldRow extends V2ComfyFieldPreview {
-  selected: boolean
-  label: string
-  /** 用户选的控件；空串 = 默认（不覆盖，让引擎声明/值的形状决定）。 */
-  widget: string
-  /** 选了「下拉」时他填的候选项（逗号分隔的原文）。 */
-  options: string
-}
-const comfyFieldRows = ref<ComfyFieldRow[]>([])
+const comfyFieldRows = ref<FieldSelectionRow[]>([])
 const comfySelectedCount = computed(() => comfyFieldRows.value.filter((row) => row.selected).length)
 const promptPlaceholder = computed(
   () => `${t('library.comfyPromptPlaceholder')}
@@ -1186,14 +1295,19 @@ const onLibraryFileChange = async (event: Event) => {
       </template>
     </EmptyState>
 
-    <Dialog :open="showImport" :title="t('library.dialogAddRh')" @update:open="showImport = $event">
+    <Dialog
+      :open="showImport"
+      :class="rhStep === 'fields' ? 'max-w-2xl' : ''"
+      :title="rhStep === 'fields' ? t('library.dialogSelectFields') : t('library.dialogAddRh')"
+      @update:open="showImport = $event"
+    >
       <!--
         顶部这句只消掉他唯一的疑虑（我这条链接能不能用），**不解释机制**：
         前几版写的是"由平台判定 / 字段与默认值自动导入 / 无需手写 Schema"——那是在替我们的
         设计辩护，不是在告诉他下一步做什么，而且还和输入框下面那行重复了。
         口径见 useLocale 里 `library.dialogAddRhHint` 上面那段注释。
       -->
-      <div class="space-y-4">
+      <div v-if="rhStep === 'input'" class="space-y-4">
         <p class="text-sm text-muted-foreground">{{ t('library.dialogAddRhHint') }}</p>
         <div class="space-y-1.5">
           <label for="runninghub-import-connection" class="text-sm font-medium"
@@ -1282,13 +1396,43 @@ const onLibraryFileChange = async (event: Event) => {
         <p v-else class="text-xs text-muted-foreground">{{ t('library.rhNamePlatformOwned') }}</p>
         <p v-if="importError" class="text-sm text-destructive">{{ importError }}</p>
       </div>
+
+      <!--
+        第二屏：**选字段**。选完才建应用——表单从一开始就是干净的，
+        而不是先进来一堆 `Load Image · image（节点 519）` 再一个个改名。
+        没勾的字段不进表单也不进映射，但**底层工作流一个字段都不少**（平台那份图才是完整定义）。
+      -->
+      <div v-else class="space-y-3">
+        <p class="text-sm text-muted-foreground">
+          {{ t('library.comfyFieldsFound', { count: rhFieldRows.length }) }}
+        </p>
+        <FieldSelectionList :rows="rhFieldRows" :enrichment="rhEnrichment" />
+        <p v-if="importError" class="text-sm text-destructive">{{ importError }}</p>
+      </div>
+
       <template #footer>
-        <Button variant="ghost" @click="showImport = false">{{ t('common.cancel') }}</Button>
-        <Button
-          :disabled="importing || !runningHubConnections.length || !importForm.connectionId"
-          @click="importFromRunningHub"
-          >{{ importing ? t('library.importing') : t('library.import') }}</Button
-        >
+        <template v-if="rhStep === 'input'">
+          <Button variant="ghost" @click="showImport = false">{{ t('common.cancel') }}</Button>
+          <Button
+            :disabled="importing || !runningHubConnections.length || !importForm.connectionId"
+            @click="importFromRunningHub"
+            >{{
+              importing
+                ? t('library.importing')
+                : effectiveRhKind === 'workflow'
+                  ? t('library.nextSelectFields')
+                  : t('library.import')
+            }}</Button
+          >
+        </template>
+        <template v-else>
+          <Button variant="ghost" :disabled="importing" @click="rhStep = 'input'">
+            {{ t('library.previousStep') }}
+          </Button>
+          <Button :disabled="importing || !rhSelectedCount" @click="importFromRunningHub">{{
+            importing ? t('library.importing') : t('library.import')
+          }}</Button>
+        </template>
       </template>
     </Dialog>
 
@@ -1419,95 +1563,7 @@ const onLibraryFileChange = async (event: Event) => {
         <p class="text-sm text-muted-foreground">
           {{ t('library.comfyFieldsFound', { count: comfyFieldRows.length }) }}
         </p>
-        <div class="max-h-80 space-y-2 overflow-y-auto pr-1">
-          <div
-            v-for="row in comfyFieldRows"
-            :key="row.key"
-            class="flex items-center gap-3 rounded-md border border-border px-3 py-2"
-            :class="row.selected ? '' : 'opacity-60'"
-          >
-            <input
-              :id="`comfy-field-${row.key}`"
-              v-model="row.selected"
-              type="checkbox"
-              class="size-4 shrink-0 rounded border-input accent-primary"
-            />
-            <div class="min-w-0 flex-1">
-              <label :for="`comfy-field-${row.key}`" class="block truncate text-sm font-medium">
-                {{ row.fieldName }}
-                <span class="ml-1 font-mono text-xs font-normal text-muted-foreground">
-                  {{ row.classType }} · {{ t('library.node', { id: row.nodeId }) }}
-                </span>
-              </label>
-              <p
-                v-if="row.default !== undefined && row.default !== null"
-                class="truncate text-xs text-muted-foreground"
-              >
-                {{ t('library.currentValue', { value: String(row.default) }) }}
-              </p>
-            </div>
-            <Badge v-if="row.media" variant="secondary" class="shrink-0">{{
-              t('library.file')
-            }}</Badge>
-            <!--
-              **控件**：默认（推荐）= 不覆盖，让引擎声明/值的形状决定；用户一改就是他的决定。
-              这件事只有用户知道：`aspect_ratio` 其实只有三种画幅、他常用的采样器就那五个。
-              选了「下拉」才要他填候选项（没填就退回文本，不造空下拉）。
-            -->
-            <select
-              v-model="row.widget"
-              :disabled="!row.selected"
-              :aria-label="t('library.widgetFor', { name: row.fieldName })"
-              class="h-8 w-32 shrink-0 rounded-md border border-input bg-secondary px-2 text-xs"
-            >
-              <option value="">{{ t('library.widgetDefault') }}</option>
-              <option value="text">{{ t('library.widgetText') }}</option>
-              <option value="textarea">{{ t('library.widgetTextarea') }}</option>
-              <option value="number">{{ t('library.widgetNumber') }}</option>
-              <option value="switch">{{ t('library.widgetSwitch') }}</option>
-              <option value="dropdown">{{ t('library.widgetDropdown') }}</option>
-              <option value="file">{{ t('library.widgetFile') }}</option>
-            </select>
-            <Input
-              v-if="row.widget === 'dropdown'"
-              v-model="row.options"
-              :disabled="!row.selected"
-              :placeholder="t('library.widgetOptionsPlaceholder')"
-              class="h-8 w-56 shrink-0 text-xs"
-            />
-            <Input
-              v-model="row.label"
-              :disabled="!row.selected"
-              :placeholder="
-                row.defaultLabel || t('library.fieldLabelPlaceholder', { name: row.fieldName })
-              "
-              class="h-8 w-44 shrink-0 text-xs"
-            />
-          </div>
-        </div>
-        <!--
-          "控件是真控件还是通用控件"要说出来：拿不到引擎定义时我们会静默降级
-          （枚举变文本框、数字没有范围），不说的话用户只会觉得"这表单有点糙"。
-        -->
-        <p
-          v-if="comfyEnrichment && !comfyEnrichment.classesKnown"
-          class="text-xs leading-5 text-warning"
-        >
-          {{
-            t('library.enrichmentMissing', {
-              reason: comfyEnrichment.reason || t('library.enrichmentUnknown')
-            })
-          }}
-        </p>
-        <p v-else-if="comfyEnrichment" class="text-xs leading-5 text-muted-foreground">
-          {{
-            t('library.enrichmentOk', {
-              known: comfyEnrichment.classesKnown,
-              used: comfyEnrichment.classesUsed
-            })
-          }}
-        </p>
-        <p v-if="comfyImportError" class="text-sm text-destructive">{{ comfyImportError }}</p>
+        <FieldSelectionList :rows="comfyFieldRows" :enrichment="comfyEnrichment" />
       </div>
 
       <template #footer>
