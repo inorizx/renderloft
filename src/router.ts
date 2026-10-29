@@ -22,11 +22,12 @@ const router = createRouter({
       component: () => import('./features/v2/views/V2Tasks.vue')
     },
     {
-      // 「结果」：产物自己的入口。产品愿景把"结果"和连接/应用/任务并列为四个产品名词，
-      // 而在此之前产物**只能顺着任务找到**（要先想起是哪次跑的）。
+      // 「结果」页已删（2026-10-29）：它前提是"产物会积累成资产库"，而产物本来就是
+      // **跟着任务走的交付物**（`http-api.md`：「不长期托管你的字节」，保留期到点即清），
+      // 任务历史页也早已能看图、能批量取、能连产物一起删。
+      // 保留一条重定向只为旧书签：不落到首页，而是落到真正管这些东西的地方。
       path: '/results',
-      name: 'Results',
-      component: () => import('./features/v2/views/V2Results.vue')
+      redirect: '/tasks'
     },
     {
       path: '/connections',
