@@ -4,6 +4,18 @@
 
 ## 已完成
 
+- **应用库可以带走了**（2026-10-29）：`library export` / `library import` 只搬「应用」这一个
+  资产——名字、描述、标签、分组、收藏、**字段备注名与控件**、默认值、平台类型。刻意**不带**
+  `id`、连接主键、任何密钥、任务历史与产物：`id` 换个库就撞车；连接主键在新机器上可能指向
+  别的平台，所以包里只记驱动键（`runninghub/runninghub`），导入时按它去本机找一条连接。
+  找不到就**拒绝这一条并说清缺哪种连接**，不塞一个点运行就报错的空壳。同名默认跳过
+  （`IMPORT_NAME_EXISTS`），`--replace` 才覆盖，且覆盖是**追加 revision**、不改写历史。
+  界面侧是应用库页工具条的两个按钮：导入走**文件内容**（浏览器的文件选择器给不到绝对路径），
+  导出不传路径则落到下载目录。判据：`a_library_round_trips_into_another_workspace`
+  （真库往返——备注名/控件/分组/收藏逐项一致，且连接落在新库自己的那条上）、
+  `an_import_without_the_platform_connection_is_refused_not_faked`。
+  与 `workspace backup` 的分工：那份是**整机搬家**（库 + 产物缓存 + 设置），这里是**这套应用本身**。
+
 - **`docs/http-api.md`：把"当后端"的契约写成一页**（2026-10-27，晚）：认证与 scope 表、
   四步调用（发现 → 素材 → 预检 → 提交）、manifest 字段语义（`byteSize == 0` 是什么、
   `checksum == null`、`remoteUrl` 会过期）、幂等与 `SUBMISSION_UNCERTAIN` 的重试边界、
