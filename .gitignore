@@ -18,6 +18,10 @@ debug-app-load-failure.md
 /AGENTS.md
 opencode.jsonc
 
+# WorkBuddy 的项目数据目录：工作日志、下载的安装包、本机构建出的便携包
+# （体积几十 MB，且都只在这台机器上有意义）。
+.workbuddy/
+
 # Local browser-test traces and root-level review screenshots
 .playwright-mcp/
 /*.png
