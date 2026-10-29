@@ -270,6 +270,13 @@ impl V2Runtime {
             crate::v2::application::workspace_backup::WorkspaceBackupService::new(workspace),
         );
 
+        // 应用库：只搬「应用」这一个资产（名字、分组、备注名、控件、平台类型），
+        // 不含任务历史、产物、连接与密钥。
+        let library = Arc::new(crate::v2::application::library::LibraryService::new(
+            recipes.clone(),
+            connections.clone(),
+        ));
+
         let state = Arc::new(V2HttpState::new(
             token_service,
             secrets.clone(),
@@ -289,6 +296,7 @@ impl V2Runtime {
             import_service,
             Arc::new(crate::v2::infrastructure::providers::safety::ReqwestSafeHttpClient),
             workspace_backup,
+            library,
             paused.clone(),
         ));
 

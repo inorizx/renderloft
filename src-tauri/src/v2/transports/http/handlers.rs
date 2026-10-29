@@ -150,6 +150,8 @@ pub const ROUTES: &[(&str, &str)] = &[
     ("/api/v1/runninghub/account", "get"),
     ("/api/v1/runninghub/queue", "get"),
     ("/api/v1/workspace/backup", "post"),
+    ("/api/v1/library/export", "post"),
+    ("/api/v1/library/import", "post"),
     ("/api/v1/openapi.json", "get"),
 ];
 
@@ -1769,6 +1771,72 @@ pub async fn backup_workspace(
         .backup(target)
         .await
         .map_err(domain_error)?;
+    Ok(Json(
+        serde_json::to_value(Envelope::new(serde_json::to_value(report).unwrap())).unwrap(),
+    ))
+}
+
+// ---------- 应用库：导出 / 导入 ----------
+
+/// 把应用库导成一个文件。**只含应用本身**：名字、分组、备注名、字段控件、平台类型；
+/// 不含连接、密钥、任务历史与产物（见 `application/library.rs` 的说明）。
+pub async fn export_library(
+    State(state): State<Arc<V2HttpState>>,
+    Extension(actor): Extension<ActorRef>,
+    Json(body): Json<Value>,
+) -> HttpResult {
+    require_scope(&actor, Scope::RecipesRead)?;
+    // 界面不传 `to`：让它落到下载目录，人不用先想"存哪"。CLI 一定传（脚本要确定性）。
+    let mut target = body
+        .get("to")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    if target.trim().is_empty() {
+        let view = state.settings.view().await.map_err(domain_error)?;
+        // 用户没设置过下载目录时它是**空串**（`view` 不做默认填充）。这时必须换成系统下载目录，
+        // 否则 `Path::new("").join(...)` 会得到一个相对路径，文件落到 daemon 的当前工作目录。
+        let dir = if view.download_dir.trim().is_empty() {
+            crate::v2::application::settings::default_download_dir()
+        } else {
+            view.download_dir
+        };
+        target = std::path::Path::new(&dir)
+            .join("renderloft-library.json")
+            .to_string_lossy()
+            .to_string();
+    }
+    let report = state.library.export(&target).await.map_err(domain_error)?;
+    Ok(Json(
+        serde_json::to_value(Envelope::new(serde_json::to_value(report).unwrap())).unwrap(),
+    ))
+}
+
+/// 从一个文件导入应用库。缺连接的应用**不导入**，而是带原因回报——
+/// 不往库里塞一个点运行就报错的空壳。
+pub async fn import_library(
+    State(state): State<Arc<V2HttpState>>,
+    Extension(actor): Extension<ActorRef>,
+    Json(body): Json<Value>,
+) -> HttpResult {
+    require_scope(&actor, Scope::RecipesWrite)?;
+    // 导入要按驱动键去本机找连接，所以还需要读连接的权限。
+    require_scope(&actor, Scope::ConnectionsRead)?;
+    let source = body
+        .get("from")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    let replace = body
+        .get("replace")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    // 界面走 `content`（浏览器的文件选择器给不到绝对路径），CLI 走 `from`（路径）。
+    let report = match body.get("content").and_then(Value::as_str) {
+        Some(content) => state.library.import_text(content, replace).await,
+        None => state.library.import(&source, replace).await,
+    }
+    .map_err(domain_error)?;
     Ok(Json(
         serde_json::to_value(Envelope::new(serde_json::to_value(report).unwrap())).unwrap(),
     ))

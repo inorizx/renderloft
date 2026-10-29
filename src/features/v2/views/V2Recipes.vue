@@ -30,11 +30,13 @@ import {
   ArchiveRestore,
   ArrowRight,
   Boxes,
+  Download,
   FolderOpen,
   Search,
   Star,
   Pencil,
-  Trash2
+  Trash2,
+  Upload
 } from '@lucide/vue'
 
 const { t, dateLocale } = useLocale()
@@ -855,6 +857,73 @@ const resetComfyImport = () => {
 watch(showComfyUIImport, (open) => {
   if (!open) resetComfyImport()
 })
+
+// ---------- 应用库的导出 / 导入 ----------
+// 只搬「应用」这一个资产：名字、分组、备注名、控件、平台类型。
+// 任务历史、产物、连接与密钥都不在包里（整机搬家是 `workspace backup` 的事）。
+const libraryBusy = ref<'export' | 'import' | ''>('')
+const libraryNotice = ref<{ variant: 'success' | 'info' | 'destructive'; text: string } | null>(
+  null
+)
+const libraryFileInput = ref<HTMLInputElement | null>(null)
+
+const libraryErrorText = (error: unknown) =>
+  error instanceof V2ApiError ? error.message : String(error)
+
+const exportLibrary = async () => {
+  libraryBusy.value = 'export'
+  libraryNotice.value = null
+  try {
+    const report = await workspace.exportLibrary()
+    libraryNotice.value = {
+      variant: 'success',
+      text: t('library.exportDone', { count: report.recipeCount, path: report.path })
+    }
+  } catch (error) {
+    libraryNotice.value = { variant: 'destructive', text: libraryErrorText(error) }
+  } finally {
+    libraryBusy.value = ''
+  }
+}
+
+const pickLibraryFile = () => {
+  libraryNotice.value = null
+  libraryFileInput.value?.click()
+}
+
+const onLibraryFileChange = async (event: Event) => {
+  const input = event.target as HTMLInputElement
+  const file = input.files?.[0]
+  // 清空 value：否则再选**同一个文件**不会触发 change，用户重试时会以为按钮没反应。
+  input.value = ''
+  if (!file) return
+
+  libraryBusy.value = 'import'
+  try {
+    const content = await file.text()
+    const report = await workspace.importLibrary(content)
+    if (!report.imported.length && !report.skipped.length && !report.failed.length) {
+      libraryNotice.value = { variant: 'info', text: t('library.importNothing') }
+      return
+    }
+    const summary = t('library.importDone', {
+      imported: report.imported.length,
+      skipped: report.skipped.length,
+      failed: report.failed.length
+    })
+    // 原因**必须露出来**：最常见的一条是"本机没有这个平台的连接"（`IMPORT_CONNECTION_MISSING`），
+    // 只说"失败 1 个"等于把排查丢给用户。
+    const firstProblem = report.failed[0]?.reason ?? report.skipped[0]?.reason
+    libraryNotice.value = {
+      variant: report.failed.length ? 'destructive' : 'success',
+      text: firstProblem ? `${summary} · ${firstProblem}` : summary
+    }
+  } catch (error) {
+    libraryNotice.value = { variant: 'destructive', text: libraryErrorText(error) }
+  } finally {
+    libraryBusy.value = ''
+  }
+}
 </script>
 
 <template>
@@ -919,6 +988,27 @@ watch(showComfyUIImport, (open) => {
           <ArchiveRestore class="size-3.5" />
           {{ showRemoved ? t('library.hideRemoved') : t('library.showRemoved') }}
         </Button>
+        <!-- 导出/导入的是**应用库本身**（名字、分组、备注名、控件），不是任务历史。 -->
+        <Button
+          variant="outline"
+          size="sm"
+          :disabled="libraryBusy !== '' || !workspace.recipes.length"
+          @click="exportLibrary"
+        >
+          <Download class="size-3.5" />
+          {{ libraryBusy === 'export' ? t('library.exporting') : t('library.exportLibrary') }}
+        </Button>
+        <Button variant="outline" size="sm" :disabled="libraryBusy !== ''" @click="pickLibraryFile">
+          <Upload class="size-3.5" />
+          {{ libraryBusy === 'import' ? t('library.importing') : t('library.importLibrary') }}
+        </Button>
+        <input
+          ref="libraryFileInput"
+          type="file"
+          accept=".json,application/json"
+          class="hidden"
+          @change="onLibraryFileChange"
+        />
       </div>
       <div v-if="workspace.recipes.length" class="grid w-full gap-2 sm:grid-cols-4 lg:w-auto">
         <div class="relative sm:col-span-1">
@@ -956,6 +1046,11 @@ watch(showComfyUIImport, (open) => {
         </select>
       </div>
     </section>
+
+    <!-- 导出/导入的结果就地显示：尤其是"缺连接所以没导入"这种，必须说明白。 -->
+    <NoticePanel v-if="libraryNotice" class="mt-4" :variant="libraryNotice.variant">
+      {{ libraryNotice.text }}
+    </NoticePanel>
 
     <div
       v-if="availableGroups.length"

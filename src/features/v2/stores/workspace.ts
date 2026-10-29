@@ -214,6 +214,33 @@ export const useV2WorkspaceStore = defineStore('v2-workspace', () => {
     return result
   }
 
+  /**
+   * 导出应用库：只含应用本身（名字、分组、备注名、控件、平台类型），
+   * 不含任务历史、产物、连接与密钥。不传路径 ⇒ daemon 落到下载目录。
+   */
+  const exportLibrary = async () => {
+    return v2.post<{ path: string; recipeCount: number; bytes: number }>(
+      '/api/v1/library/export',
+      {}
+    )
+  }
+
+  /**
+   * 导入应用库。
+   *
+   * 传的是**文件文本**而不是路径：浏览器的文件选择器给不到绝对路径（安全限制）。
+   * 缺连接的应用不会进库，服务端把它们放进 `failed` 并带原因。
+   */
+  const importLibrary = async (content: string, replace = false) => {
+    const result = await v2.post<{
+      imported: string[]
+      skipped: { name: string; reason: string; code: string }[]
+      failed: { name: string; reason: string; code: string }[]
+    }>('/api/v1/library/import', { content, replace })
+    await loadRecipes(true)
+    return result
+  }
+
   const importRecipe = async (connectionId: number, source: string) => {
     const result = await v2.post<ImportedRecipeResult>('/api/v1/recipes/import', {
       connectionId,
@@ -519,6 +546,8 @@ export const useV2WorkspaceStore = defineStore('v2-workspace', () => {
     loadOperations,
     loadOperationSummaries,
     createRecipe,
+    exportLibrary,
+    importLibrary,
     importRecipe,
     importWorkflowRecipe,
     importComfyUIRecipe,

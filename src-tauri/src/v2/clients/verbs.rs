@@ -232,6 +232,10 @@ pub static GROUPS: &[Group] = &[
         about: "应用（Recipe）：列出、查看、导入",
     },
     Group {
+        name: "library",
+        about: "应用库：导出 / 导入成文件（只搬应用本身，不含历史与密钥）",
+    },
+    Group {
         name: "operation",
         about: "任务（Operation）：列出、提交、查询、等待、取消",
     },
@@ -585,6 +589,51 @@ pub static VERBS: &[Verb] = &[
             help: "Recipe id（见 recipe list --removed）",
             ..req("recipeId", Kind::Id)
         }],
+    },
+    // ---------- library ----------
+    Verb {
+        id: "library.export",
+        group: "library",
+        action: "export",
+        summary: "把应用库导出成一个文件（只含应用本身，不含历史/产物/连接/密钥）",
+        // **刻意不给 MCP**：它往本地磁盘写文件，落点由参数决定。与 `artifact.download`
+        // 同一种考虑——能力面要给得有意，不是顺手就给。
+        mcp_name: None,
+        mcp_description: None,
+        read_only: true,
+        destructive: false,
+        // 导两次得到同样的内容（`exportedAt` 除外），且不改动库。
+        idempotent: true,
+        spends_credits: false,
+        params: &[Param {
+            help: "导出到哪个文件（.json；目录不存在会创建）",
+            ..req("to", Kind::LocalFile)
+        }],
+    },
+    Verb {
+        id: "library.import",
+        group: "library",
+        action: "import",
+        summary: "从一个文件导入应用库（缺连接的应用带原因跳过，不塞空壳）",
+        // **刻意不给 MCP**：它往库里加应用，而"库里该有哪些"是人的判断，与
+        // `recipe.remove` / `recipe.restore` 同属策展。AI 可以跑应用，但不该决定库里有什么。
+        mcp_name: None,
+        mcp_description: None,
+        read_only: false,
+        destructive: false,
+        // 重复导入会撞同名 → 默认跳过，第二次调用不改变结果。
+        idempotent: true,
+        spends_credits: false,
+        params: &[
+            Param {
+                help: "从哪个文件导入（`library export` 产出的那个）",
+                ..req("from", Kind::LocalFile)
+            },
+            Param {
+                help: "覆盖同名应用（追加一份 revision，不改写历史）",
+                ..opt("replace", Kind::Flag)
+            },
+        ],
     },
     // ---------- operation ----------
     Verb {
@@ -1937,6 +1986,12 @@ pub async fn execute(
         "artifact.get" => client.get_artifact(args.u64("artifactId")?).await,
         "asset.upload" => upload_asset(client, args).await,
         "workspace.backup" => client.backup_workspace(&args.text("to")?).await,
+        "library.export" => client.export_library(&args.text("to")?).await,
+        "library.import" => {
+            client
+                .import_library(&args.text("from")?, args.flag("replace")?)
+                .await
+        }
         other => Err(argument_error(
             "UNKNOWN_VERB",
             format!("动词表里没有为 {other} 写分发（表与实现漂移了）"),
@@ -2811,6 +2866,10 @@ mod tests {
             ("asset.upload", &["file", "filename", "mime-type"]),
             // 后加的：迁移/备份——把工作区一致地导出一份（`--to <目录>`）。
             ("workspace.backup", &["to"]),
+            // 后加的：应用库的导出/导入（CLI 专属，不给 AI）。只搬应用本身——
+            // 不含任务历史、产物、连接与密钥。
+            ("library.export", &["to"]),
+            ("library.import", &["from", "replace"]),
         ];
         assert_eq!(
             expected.len(),

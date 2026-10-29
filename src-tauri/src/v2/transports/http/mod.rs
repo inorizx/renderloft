@@ -19,6 +19,7 @@ use crate::v2::application::create_operation::CreateOperation;
 use crate::v2::application::recipe_import::RecipeImportService;
 use crate::v2::application::settings::{RunningHubStatusService, SettingsService};
 use crate::v2::application::validate_operation::ValidateOperation;
+use crate::v2::application::library::LibraryService;
 use crate::v2::application::workspace_backup::WorkspaceBackupService;
 use crate::v2::domain::actor::ActorRef;
 use crate::v2::ports::provider::DriverRegistry;
@@ -52,6 +53,8 @@ pub struct V2HttpState {
     pub safe_http: Arc<dyn SafeHttpClient>,
     /// 迁移/备份：把工作区一致地导出一份（见 `application/workspace_backup.rs`）。
     pub workspace_backup: Arc<WorkspaceBackupService>,
+    /// 应用库的导出 / 导入：只搬「应用」这一个资产（见 `application/library.rs`）。
+    pub library: Arc<LibraryService>,
     /// 被冻结的连接（key 失效/余额不足时暂停接单）：与调度器**共享同一份**。
     pub paused: Arc<crate::v2::application::scheduler::PausedAccounts>,
 }
@@ -77,6 +80,7 @@ impl V2HttpState {
         import_service: Arc<RecipeImportService>,
         safe_http: Arc<dyn SafeHttpClient>,
         workspace_backup: Arc<WorkspaceBackupService>,
+        library: Arc<LibraryService>,
         paused: Arc<crate::v2::application::scheduler::PausedAccounts>,
     ) -> Self {
         Self {
@@ -98,6 +102,7 @@ impl V2HttpState {
             import_service,
             safe_http,
             workspace_backup,
+            library,
             paused,
         }
     }
@@ -261,6 +266,9 @@ pub fn build_router(state: Arc<V2HttpState>) -> Router {
         .route("/api/v1/runninghub/account", get(shell::runninghub_account))
         .route("/api/v1/runninghub/queue", get(shell::runninghub_queue))
         .route("/api/v1/workspace/backup", post(handlers::backup_workspace))
+        // 应用库：只搬应用本身，不含历史/产物/连接/密钥。
+        .route("/api/v1/library/export", post(handlers::export_library))
+        .route("/api/v1/library/import", post(handlers::import_library))
         .route("/api/v1/openapi.json", get(handlers::openapi))
         .fallback(api_not_found)
         .route_layer(middleware::from_fn_with_state(state.clone(), auth));
@@ -570,6 +578,12 @@ mod tests {
                     as std::sync::Arc<dyn crate::v2::ports::repositories::WorkspaceRepository>,
             ),
         );
+        let library = std::sync::Arc::new(
+            crate::v2::application::library::LibraryService::new(
+                std::sync::Arc::new(repositories.clone()),
+                std::sync::Arc::new(repositories.clone()),
+            ),
+        );
         std::sync::Arc::new(V2HttpState::new(
             std::sync::Arc::new(crate::v2::infrastructure::token_service::TokenService::new(
                 std::sync::Arc::new(repositories.clone()),
@@ -591,6 +605,7 @@ mod tests {
             import_service,
             safe_http,
             workspace_backup,
+            library,
             Default::default(),
         ))
     }
@@ -2106,6 +2121,12 @@ mod tests {
                     as std::sync::Arc<dyn crate::v2::ports::repositories::WorkspaceRepository>,
             ),
         );
+        let library = std::sync::Arc::new(
+            crate::v2::application::library::LibraryService::new(
+                std::sync::Arc::new(repositories.clone()),
+                std::sync::Arc::new(repositories.clone()),
+            ),
+        );
         std::sync::Arc::new(V2HttpState::new(
             std::sync::Arc::new(crate::v2::infrastructure::token_service::TokenService::new(
                 std::sync::Arc::new(repositories.clone()),
@@ -2129,6 +2150,7 @@ mod tests {
                 crate::v2::infrastructure::providers::safety::ReqwestSafeHttpClient,
             ),
             workspace_backup,
+            library,
             Default::default(),
         ))
     }

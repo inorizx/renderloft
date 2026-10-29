@@ -216,6 +216,21 @@ impl V2Client {
             .await
     }
 
+    /// 导出应用库：只含应用本身（名字、分组、备注名、控件、平台类型），
+    /// 不含连接、密钥、任务历史与产物。
+    pub async fn export_library(&self, to: &str) -> Result<Value, ClientError> {
+        self.post("/api/v1/library/export", json!({ "to": to })).await
+    }
+
+    /// 导入应用库。`replace` 为真时覆盖同名应用（追加一份 revision，不改写历史）。
+    pub async fn import_library(&self, from: &str, replace: bool) -> Result<Value, ClientError> {
+        self.post(
+            "/api/v1/library/import",
+            json!({ "from": from, "replace": replace }),
+        )
+        .await
+    }
+
     /// 从「已移除」里恢复一个应用（不在墓碑里的会拿到 404 `RECIPE_NOT_IN_TRASH`）。
     pub async fn restore_recipe(&self, recipe_id: u64) -> Result<Value, ClientError> {
         self.post(&format!("/api/v1/recipes/{recipe_id}/restore"), json!({}))
