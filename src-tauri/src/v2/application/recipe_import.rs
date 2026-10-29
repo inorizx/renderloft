@@ -804,7 +804,13 @@ fn build_input_schema(schema: &WebappSchema) -> DomainResult<BuiltSchema> {
         let (schema_value, constraints, default_value, is_media) = field_schema(node)?;
         let has_default = default_value.is_some();
         properties.insert(key.clone(), schema_value);
-        if !has_default {
+        // 判据是「**作者有没有预填值**」，不是「这个字段跑起来需不需要」——两者对媒体不是
+        // 一回事。空的 `image` 可能是：① 那个 LoadImage 在工作流里本来就有固定图，平台只是
+        // 没把它当 `fieldValue` 暴露；② 那个节点根本没被用到（一个四图工作流常常只用两张）。
+        // 我们区分不了，而**把它标成必填就是把这份不确定变成"你必须凑满四张才能跑"**——
+        // 代价是人在表单前直接放弃。所以媒体字段一律不强制；真缺图时平台报的错会指出节点，
+        // 那比卡在表单上点不下去强。
+        if !has_default && !is_media {
             required.push(key.clone());
         }
         if let Some(value) = default_value.clone() {
@@ -830,7 +836,7 @@ fn build_input_schema(schema: &WebappSchema) -> DomainResult<BuiltSchema> {
             field_type: node.field_type.clone(),
             description,
             description_en: node.description_en.trim().to_string(),
-            required: !has_default,
+            required: !has_default && !is_media,
             default: default_value,
             constraints,
             media: is_media,
@@ -1518,7 +1524,8 @@ fn build_comfyui_schema_with(
             schema.insert("default".to_string(), default_value.clone());
         }
         properties.insert(key.clone(), Value::Object(schema));
-        if !has_default {
+        // 与 `build_input_schema` 同一口径：媒体字段不因"没有预填值"而强制（见那边的注释）。
+        if !has_default && !is_media {
             required.push(key.clone());
         }
         if let Some(value) = default.clone() {
@@ -1536,7 +1543,7 @@ fn build_comfyui_schema_with(
             field_type,
             description: label,
             description_en: String::new(),
-            required: !has_default,
+            required: !has_default && !is_media,
             default,
             constraints: Value::Object(serde_json::Map::new()),
             media: is_media,
@@ -2210,7 +2217,10 @@ mod tests {
         let properties = input_schema["properties"].as_object().unwrap();
         assert_eq!(properties["17::image"]["type"], "string");
         assert_eq!(properties["17::image"]["format"], "file");
-        assert!(input_schema["required"]
+        // **不**因为"平台没预填值"就把媒体字段标成必填（见 `build_input_schema` 的注释）：
+        // 空的 image 可能是工作流里本来就有固定图，也可能是这个节点根本没被用到。
+        // 强制它等于逼人凑满所有图才能跑——那是表单前放弃的最短路径。
+        assert!(!input_schema["required"]
             .as_array()
             .unwrap()
             .contains(&json!("17::image")));
