@@ -65,9 +65,15 @@
           >
             <button
               class="preview-area"
-              :class="artifactLoading[task.operationId] && 'is-loading'"
+              :class="
+                (artifactLoading[task.operationId] || previewOpeningId === task.operationId) &&
+                'is-loading'
+              "
               type="button"
-              :disabled="!previewResults(task).length"
+              :disabled="
+                previewOpeningId === task.operationId ||
+                (!previewResults(task).length && artifactItems[task.operationId] !== undefined)
+              "
               @click="openPreview(task)"
             >
               <img
@@ -315,9 +321,26 @@ const drainArtifactQueue = () => {
     })
   }
 }
-const enqueueArtifactLoad = (job: () => Promise<void>) => {
-  artifactQueue.push(job)
+/**
+ * 入队并返回**这个任务做完**的 Promise。
+ *
+ * 返回 Promise 是为了 `openPreview` 能等"列表 + 首图"就绪再决定开不开框；
+ * 以前只有 fire-and-forget，打开预览时产物经常还没到。
+ */
+const enqueueArtifactLoad = (job: () => Promise<void>): Promise<void> => {
+  let settle: () => void = () => {}
+  const done = new Promise<void>((resolve) => {
+    settle = resolve
+  })
+  artifactQueue.push(async () => {
+    try {
+      await job()
+    } finally {
+      settle()
+    }
+  })
   drainArtifactQueue()
+  return done
 }
 
 const isActiveStatus = (status: string) => !isTerminalStatus(status)
@@ -495,44 +518,79 @@ const galleryPreview = (task: OperationDetail) => {
 }
 const galleryResultCount = (task: OperationDetail) => previewableArtifacts(task.operationId).length
 
-const loadArtifacts = (task: OperationDetail) => {
-  if (isActive(task) || artifactAttempted.has(task.operationId)) return
+/** 产物列表/字节失败后的重试节流：别把 5 秒轮询变成重试风暴。 */
+const ARTIFACT_RETRY_MILLIS = 30_000
+const artifactRetryAt = new Map<number, number>()
+/** 正在"打开预览"的任务：期间补拉其余图片，避免对话框里一半是空白。 */
+const previewOpeningId = ref<number>()
+/** 每个任务在途的加载：打开预览时能等它，而不是拿到一个"已早退"的空 Promise。 */
+const artifactLoadPromises = new Map<number, Promise<void>>()
+
+/** 拉一张产物的字节并落成 blob URL（已有就跳过）。 */
+const fetchArtifactBlob = async (operationId: number, artifactId: number, token: number) => {
+  if (artifactUrls.value[artifactId] || artifactLoading.value[artifactId]) return
+  artifactLoading.value[artifactId] = true
+  try {
+    const { blob } = await v2.fetchArtifactBytes(artifactId)
+    if (artifactRequestVersions[operationId] !== token) return
+    artifactUrls.value[artifactId] = URL.createObjectURL(blob)
+  } catch {
+    // 单张失败不阻断其余；卡片会显示占位。
+  } finally {
+    artifactLoading.value[artifactId] = false
+  }
+}
+
+const loadArtifacts = (task: OperationDetail, force = false): Promise<void> => {
+  const operationId = task.operationId
+  if (isActive(task) || artifactAttempted.has(operationId)) return Promise.resolve()
+  if (artifactLoading.value[operationId]) {
+    return artifactLoadPromises.get(operationId) ?? Promise.resolve()
+  }
+  if (!force) {
+    const retryAt = artifactRetryAt.get(operationId) ?? 0
+    if (retryAt && Date.now() - retryAt < ARTIFACT_RETRY_MILLIS) return Promise.resolve()
+  }
   const resolved =
-    workspace.operations.find((item) => item.operationId === task.operationId) ??
-    details.value[task.operationId] ??
+    workspace.operations.find((item) => item.operationId === operationId) ??
+    details.value[operationId] ??
     task
   const runIds = resolved.runs.filter((run) => run.runId > 0).map((run) => run.runId)
-  if (!runIds.length) return
-  const token = (artifactRequestVersions[task.operationId] ?? 0) + 1
-  artifactRequestVersions[task.operationId] = token
-  artifactLoading.value[task.operationId] = true
+  if (!runIds.length) return Promise.resolve()
+  const token = (artifactRequestVersions[operationId] ?? 0) + 1
+  artifactRequestVersions[operationId] = token
+  artifactLoading.value[operationId] = true
   // 并发受限：同一时间最多加载 ARTIFACT_CONCURRENCY 个任务，避免大量缩略图并行拉取造成卡顿。
-  enqueueArtifactLoad(async () => {
+  const job = enqueueArtifactLoad(async () => {
     try {
       const pages = await Promise.all(runIds.map((runId) => v2.listArtifacts(runId)))
-      if (artifactRequestVersions[task.operationId] !== token) return
-      artifactAttempted.add(task.operationId)
-      artifactItems.value[task.operationId] = pages.flatMap((page) => page.items)
-      for (const artifact of previewableArtifacts(task.operationId)) {
-        if (artifactUrls.value[artifact.artifactId]) continue
-        artifactLoading.value[artifact.artifactId] = true
-        try {
-          const { blob } = await v2.fetchArtifactBytes(artifact.artifactId)
-          if (artifactRequestVersions[task.operationId] !== token) return
-          artifactUrls.value[artifact.artifactId] = URL.createObjectURL(blob)
-        } catch {
-          // 预览失败不阻断列表。
-        } finally {
-          artifactLoading.value[artifact.artifactId] = false
-        }
-      }
+      if (artifactRequestVersions[operationId] !== token) return
+      artifactAttempted.add(operationId)
+      artifactRetryAt.delete(operationId)
+      artifactItems.value[operationId] = pages.flatMap((page) => page.items)
+      // 卡片只显示一张：**只预取首图**。此前这里把每个任务的**全部**图片都拉成 blob，
+      // 20 张卡 × 3～4 张图就是上百 MB，而"加载更多"会继续放大它。
+      // 其余图片在打开预览时再补（见 `ensureAllArtifactBytes`）。
+      const first = previewableArtifacts(operationId)[0]
+      if (first) await fetchArtifactBlob(operationId, first.artifactId, token)
     } catch {
-      // 产物读取失败保持列表可见。
+      // 记下失败时间：之后（用户点卡片 / 30 秒后的轮询）还能再试，而不是永久空白。
+      artifactRetryAt.set(operationId, Date.now())
     } finally {
-      if (artifactRequestVersions[task.operationId] === token)
-        artifactLoading.value[task.operationId] = false
+      if (artifactRequestVersions[operationId] === token) artifactLoading.value[operationId] = false
     }
   })
+  artifactLoadPromises.set(operationId, job)
+  void job.finally(() => artifactLoadPromises.delete(operationId))
+  return job
+}
+
+/** 把某个任务**全部**可预览产物的字节补齐（打开预览时用）。 */
+const ensureAllArtifactBytes = async (task: OperationDetail) => {
+  const token = artifactRequestVersions[task.operationId] ?? 0
+  for (const artifact of previewableArtifacts(task.operationId)) {
+    await fetchArtifactBlob(task.operationId, artifact.artifactId, token)
+  }
 }
 
 const playVideoPreview = (event: Event) => {
@@ -545,11 +603,23 @@ const resetVideoPreview = (event: Event) => {
   video.currentTime = 0
 }
 
-const openPreview = (task: OperationDetail) => {
-  previewTask.value = task
-  const first = previewResults(task)[0]
-  const index = previewGallery.value.findIndex((item) => item.result.nodeId === first?.nodeId)
-  previewIndex.value = index >= 0 ? index : 0
+const openPreview = async (task: OperationDetail) => {
+  if (previewOpeningId.value !== undefined) return
+  previewOpeningId.value = task.operationId
+  try {
+    // 还没加载过、或上次失败：用户点开就是明确的"我要看"，绕过 30 秒节流再试一次。
+    if (!artifactAttempted.has(task.operationId)) await loadArtifacts(task, true)
+    // 卡片只预取了首图，其余在这里补齐；否则预览框里一半是空白。
+    await ensureAllArtifactBytes(task)
+    const results = previewResults(task)
+    if (!results.length) return
+    previewTask.value = task
+    const first = results[0]
+    const index = previewGallery.value.findIndex((item) => item.result.nodeId === first.nodeId)
+    previewIndex.value = index >= 0 ? index : 0
+  } finally {
+    previewOpeningId.value = undefined
+  }
 }
 
 /**

@@ -155,6 +155,14 @@ interface BatchRow {
 }
 const variableKeys = ref<string[]>([])
 const batchRows = ref<BatchRow[]>([])
+/**
+ * 这一批行**上次提交到的 operation**（跟着草稿存）。
+ *
+ * 只用于恢复轮询 / 恢复行状态 / "整批重投"确认——**绝不出现在提交 payload 里**。
+ * 不存它的后果：重开应用后，一批正在跑的任务显示成"待提交"，再点一次就会再计费一轮，
+ * 而"已经提交过"的确认框也一并失效。
+ */
+const batchOperationId = ref<number>()
 const batchAddCount = ref('3')
 /**
  * 命名前缀：产物文件名会用它开头（`SKU135-1-应用名-1234.png`）。
@@ -198,17 +206,25 @@ const stopBatchPolling = () => {
 }
 const startBatchPolling = (operationId: number) => {
   stopBatchPolling()
+  let consecutiveFailures = 0
   batchPollTimer = window.setInterval(async () => {
     try {
       // 走 workspace store 刷新（详情+摘要同步落库），Runner 与任务中心共享同一份数据源。
       const detail = await workspace.refreshOperation(operationId)
-      const byClientRunId = new Map(detail.runs.map((run) => [run.clientRunId, run]))
-      const byRunId = new Map(detail.runs.map((run) => [run.runId, run]))
+      consecutiveFailures = 0
+      const runs = [...detail.runs].sort((a, b) => a.sequence - b.sequence)
+      const byClientRunId = new Map(runs.map((run) => [run.clientRunId, run]))
+      const byRunId = new Map(runs.map((run) => [run.runId, run]))
+      // 草稿刻意不存 clientRunId/runId（前者参与幂等、后者是上一轮的状态），所以重开应用后
+      // 行与 run 只能靠**顺序**对上：提交时就是按 batchRows 的顺序发的，条数一致才认。
+      // 条数不一致（用户提交后又加/删了行）就不猜——宁可让状态留空，也不把 A 的结果贴到 B 上。
+      const byIndex = runs.length === batchRows.value.length ? runs : []
       let active = 0
-      batchRows.value = batchRows.value.map((row) => {
+      batchRows.value = batchRows.value.map((row, index) => {
         const run =
           (row.clientRunId ? byClientRunId.get(row.clientRunId) : undefined) ??
-          (row.runId !== undefined ? byRunId.get(row.runId) : undefined)
+          (row.runId !== undefined ? byRunId.get(row.runId) : undefined) ??
+          byIndex[index]
         if (!run) return row
         const status = mapRunStatus(run.status)
         if (status === 'queued' || status === 'running') active += 1
@@ -222,7 +238,10 @@ const startBatchPolling = (operationId: number) => {
       })
       if (active === 0) stopBatchPolling()
     } catch {
-      // 轮询失败保持现状，下次继续。
+      // 轮询失败保持现状，下次继续——但连续失败就别一直打：operation 可能被删了、
+      // daemon 可能不在。五次（约 12 秒）之后停，等用户重新打开页面（那时会再试一次）。
+      consecutiveFailures += 1
+      if (consecutiveFailures >= 5) stopBatchPolling()
     }
   }, 2500)
 }
@@ -351,6 +370,9 @@ const deleteBatchRow = (rowId: number) => {
 
 const clearBatchRows = () => {
   batchRows.value = [makeRow()]
+  // 这批已经不是"上次提交的那一批"了：清掉引用，重投确认与轮询都不该再指向它。
+  batchOperationId.value = undefined
+  stopBatchPolling()
 }
 
 /**
@@ -378,6 +400,8 @@ const clearDraft = () => {
   fileRefs.value = {}
   batchRows.value = [makeRow()]
   variableKeys.value = []
+  batchOperationId.value = undefined
+  stopBatchPolling()
   runnerSessions.reset(appId)
   showClearDraftDialog.value = false
 }
@@ -497,14 +521,15 @@ const onRowDragDrop = (row: BatchRow, key: string, event: DragEvent) => {
 }
 
 watch(
-  [batchMode, values, fileRefs, variableKeys, batchRows],
+  [batchMode, values, fileRefs, variableKeys, batchRows, batchOperationId],
   () => {
     runnerSessions.update(String(route.params.id), {
       mode: batchMode.value,
       values,
       files: fileRefs.value,
       variableKeys: variableKeys.value,
-      batchRows: batchRows.value
+      batchRows: batchRows.value,
+      batchOperationId: batchOperationId.value
     })
   },
   { deep: true }
@@ -611,6 +636,11 @@ onMounted(async () => {
     }))
     for (const row of batchRows.value) rowSeq = Math.max(rowSeq, row.id + 1)
     if (batchMode.value === 'batch') ensureBatchRows()
+    // 上次这批提交过 ⇒ 把状态接上（并恢复轮询）。
+    // 重开应用后行状态是空的，一批**正在跑**的任务会显示成"待提交"——那是再点一次、
+    // 再计费一轮的最短路径。operation 已被删的话，轮询五次失败后自己停。
+    batchOperationId.value = session.batchOperationId
+    if (batchOperationId.value !== undefined) startBatchPolling(batchOperationId.value)
     const revisionDefaults = schema.value.defaults ?? {}
     for (const field of fields.value) {
       if (values[field.key] !== undefined) continue
@@ -831,16 +861,20 @@ const run = async () => {
 
     // 这批里已经有提交过的行 ⇒ 再点一次会把**它们也重新提交**（每行都是新 operation，
     // 会再计费一次）。先问清楚：这不是"重跑失败的几条"，是"整批重投"。
-    if (batchMode.value === 'batch' && !resubmitOk) {
-      const submitted = batchRows.value.filter((row) => row.clientRunId)
-      if (submitted.length) {
-        resubmitSummary.value = {
-          total: submitted.length,
-          done: submitted.filter((row) => row.status === 'succeeded').length
-        }
-        showResubmitDialog.value = true
-        return
+    //
+    // 判据同时看 `batchOperationId`：重开应用后行上的 clientRunId 已经被草稿刻意丢掉，
+    // 只剩这个引用还能证明"这批提交过"（否则确认框会静默消失）。
+    if (
+      batchMode.value === 'batch' &&
+      !resubmitOk &&
+      (batchOperationId.value !== undefined || batchRows.value.some((row) => row.clientRunId))
+    ) {
+      resubmitSummary.value = {
+        total: batchRows.value.length,
+        done: batchRows.value.filter((row) => row.status === 'succeeded').length
       }
+      showResubmitDialog.value = true
+      return
     }
 
     // 硬校验都过了，再确认一次"会花钱但可能白花"的两类空：
@@ -903,6 +937,7 @@ const run = async () => {
     appStore.showNotification('success', t('runner.submitted', { id: result.operationId }))
     // 批量模式：按 clientRunId 把 run 映射回任务行，并轮询每行状态。
     if (batchMode.value === 'batch') {
+      batchOperationId.value = result.operationId
       batchRows.value = batchRows.value.map((row, index) => ({
         ...row,
         clientRunId: clientRunIds[index]

@@ -19,6 +19,14 @@ export interface RunnerSession {
   variableKeys?: string[]
   /** 批量模式的任务行草稿。 */
   batchRows?: RunnerBatchRow[]
+  /**
+   * 这一批行**上次提交到的 operation**。
+   *
+   * 只用于三件事：回来时恢复批量轮询、恢复行状态、以及"整批重投"确认。
+   * **绝不进提交 payload**（与 `clientRunId` 的幂等语义无关），所以存它是安全的。
+   * 不存的话：重开应用后一批正在跑的任务会显示成"待提交"，再点一次就会再计费一轮。
+   */
+  batchOperationId?: number
 }
 
 export interface RunnerBatchRow {
@@ -67,6 +75,12 @@ interface PersistedDraft {
    *   把一个上一轮的 id 带回来，最坏的结果是服务端**去重**、于是"点了生成却什么都没发生"。
    */
   batchRows: Array<Pick<RunnerBatchRow, 'id' | 'values' | 'files' | 'clearedFiles'>>
+  /**
+   * 上次提交到的 operation（见 `RunnerSession.batchOperationId`）。
+   *
+   * 与 `clientRunId` 不同，它不参与任何提交/幂等语义：只用来"回来时把状态接上"。
+   */
+  batchOperationId?: number
 }
 
 const DRAFT_STORAGE_KEY = 'renderloft-runner-drafts'
@@ -101,7 +115,8 @@ const draftOf = (session: RunnerSession): PersistedDraft => ({
     values: row.values,
     files: row.files,
     clearedFiles: [...(row.clearedFiles ?? [])]
-  }))
+  })),
+  batchOperationId: session.batchOperationId
 })
 
 export const useRunnerSessionsStore = defineStore('runner-sessions', () => {
@@ -174,7 +189,8 @@ export const useRunnerSessionsStore = defineStore('runner-sessions', () => {
         values: { ...row.values },
         files: { ...row.files },
         clearedFiles: [...(row.clearedFiles ?? [])]
-      }))
+      })),
+      batchOperationId: draft?.batchOperationId
     }
     tabs.value.push(tab)
     return tab
@@ -185,7 +201,16 @@ export const useRunnerSessionsStore = defineStore('runner-sessions', () => {
   const update = (
     appId: string,
     patch: Partial<
-      Pick<RunnerSession, 'values' | 'files' | 'mode' | 'batchCount' | 'variableKeys' | 'batchRows'>
+      Pick<
+        RunnerSession,
+        | 'values'
+        | 'files'
+        | 'mode'
+        | 'batchCount'
+        | 'variableKeys'
+        | 'batchRows'
+        | 'batchOperationId'
+      >
     >
   ) => {
     const tab = get(appId)
@@ -202,6 +227,9 @@ export const useRunnerSessionsStore = defineStore('runner-sessions', () => {
         files: { ...row.files },
         clearedFiles: [...(row.clearedFiles ?? [])]
       }))
+    // 用 `in` 判存：清空这批行时要能把 id **显式设回 undefined**，
+    // `!== undefined` 的写法会让"清空后仍记得上次的 operation"。
+    if ('batchOperationId' in patch) tab.batchOperationId = patch.batchOperationId
     remember(tab)
   }
 
@@ -218,6 +246,7 @@ export const useRunnerSessionsStore = defineStore('runner-sessions', () => {
       tab.files = {}
       tab.batchRows = []
       tab.variableKeys = []
+      tab.batchOperationId = undefined
     }
     const rest = { ...drafts.value }
     delete rest[appId]
