@@ -15,6 +15,7 @@ import { useRunnerSessionsStore } from '@/features/v2/stores/runner-sessions'
 import { useExecutionConnections } from '@/shared/composables/useExecutionConnections'
 import { useLocale } from '@/shared/composables/useLocale'
 import { looksLikeLongText } from '@/shared/lib/fieldHeuristics'
+import { numberIssue, numberRangeText } from '@/shared/lib/numberField'
 import { formatUsage, type RunUsage } from '@/shared/lib/runUsage'
 
 const { t } = useLocale()
@@ -119,6 +120,13 @@ const modelOptions = ref<string[]>([])
 const values = reactive<Record<string, unknown>>({})
 const batchMode = ref<'single' | 'batch'>('single')
 const submitting = ref(false)
+/**
+ * 是否已经点过一次"生成"。
+ *
+ * 字段组件靠它决定"必填/范围"的错误什么时候亮：第一次打开表单时只显示 `*`，
+ * 不要一渲染就满屏红字（用户还没做任何事）。
+ */
+const submitAttempted = ref(false)
 const submitError = ref('')
 
 // ---------- V1 式批量：统一参数 + 变量字段 + 任务行 ----------
@@ -402,6 +410,7 @@ const clearDraft = () => {
   variableKeys.value = []
   batchOperationId.value = undefined
   stopBatchPolling()
+  submitAttempted.value = false
   runnerSessions.reset(appId)
   showClearDraftDialog.value = false
 }
@@ -691,12 +700,12 @@ const normalizeInputs = (raw: Record<string, unknown>) => {
   return inputs
 }
 
-const isInvalidNumber = (field: (typeof fields)['value'][number], value: unknown) => {
-  if (field.type !== 'integer' && field.type !== 'number') return false
-  if (value === undefined || value === null || value === '') return false
-  const raw = String(value)
-  return field.type === 'integer' ? !/^-?\d+$/.test(raw) : !Number.isFinite(Number(raw))
-}
+/**
+ * 数字字段的提交前校验：与 `ParameterField` 共用 `numberIssue`（同一份判据），
+ * 覆盖类型、**范围**与步长——范围以前只看得到、拦不住，用户要等后端拒一次才发现。
+ */
+const isInvalidNumber = (field: (typeof fields)['value'][number], value: unknown) =>
+  numberIssue(field, value) !== undefined
 
 const isMissingValue = (field: (typeof fields)['value'][number], value: unknown) => {
   if (field.type === 'boolean') return value === undefined
@@ -816,6 +825,7 @@ const run = async () => {
   // 双击/重复点击时 disabled 还没渲染生效，这里同步挡一次重复提交。
   if (submitting.value) return
   submitting.value = true
+  submitAttempted.value = true
   submitError.value = ''
   // 消费掉"已确认空值"这一次放行：改完再提交要重新问。
   const blankConfirmed = blankCellsConfirmed
@@ -836,7 +846,13 @@ const run = async () => {
       const rowTag = batchMode.value === 'batch' ? t('runner.rowTag', { n: index + 1 }) : ''
       const invalidNumbers = fields.value
         .filter((field) => isInvalidNumber(field, effective[field.key]))
-        .map((field) => field.description || field.key)
+        // 把范围一起报出来：批量表格的格子没有字段下方的提示，只报"哪个字段不合法"
+        // 等于让用户回去猜 16–16384 还是 1–4096。
+        .map((field) => {
+          const range = numberRangeText(field)
+          const label = field.description || field.key
+          return range ? `${label}（${range}）` : label
+        })
       if (invalidNumbers.length) {
         throw new Error(
           t('runner.invalidNumbers', {
@@ -1100,9 +1116,14 @@ const goEditFields = () => {
           :field="field"
           :model-value="values[field.key]"
           :disabled="batchMode === 'batch' && variableKeys.includes(field.key)"
+          :reveal-errors="submitAttempted"
           :file="
             fileRefs[field.key] || uploadingKey === field.key
-              ? { filename: fileRefs[field.key]?.filename, uploading: uploadingKey === field.key }
+              ? {
+                  filename: fileRefs[field.key]?.filename,
+                  assetId: fileRefs[field.key]?.assetId,
+                  uploading: uploadingKey === field.key
+                }
               : null
           "
           :id-prefix="`field`"
@@ -1188,7 +1209,12 @@ const goEditFields = () => {
                 <th class="batch-name-column">{{ t('runner.colName') }}</th>
                 <th class="batch-status-column">{{ t('runner.colStatus') }}</th>
                 <th v-for="field in variableFields" :key="field.key">
-                  {{ field.description || field.key }}
+                  <span class="block">{{ field.description || field.key }}</span>
+                  <span
+                    v-if="numberRangeText(field)"
+                    class="block text-[10px] font-normal text-muted-foreground"
+                    >{{ numberRangeText(field) }}</span
+                  >
                 </th>
                 <th class="batch-actions-column">{{ t('runner.colActions') }}</th>
               </tr>

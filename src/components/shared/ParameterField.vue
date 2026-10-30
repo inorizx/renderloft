@@ -3,8 +3,10 @@ import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { FileText, ImagePlus, LoaderCircle, X } from '@lucide/vue'
 import { cn } from '@/lib/utils'
 import { Input, Textarea, Button } from '@/components/ui'
+import { v2 } from '@/shared/api/v2'
 import { useLocale } from '@/shared/composables/useLocale'
 import { looksLikeLongText } from '@/shared/lib/fieldHeuristics'
+import { numberIssue, numberRangeText } from '@/shared/lib/numberField'
 
 export interface FieldSpec {
   key: string
@@ -24,16 +26,18 @@ interface Props {
   field: FieldSpec
   modelValue?: unknown
   /** 文件字段的当前上传态。 */
-  file?: { filename?: string; uploading?: boolean } | null
+  file?: { filename?: string; uploading?: boolean; assetId?: number } | null
   /** 父级显式注入的错误信息（优先级最高）。 */
   error?: string
+  /** 提交过一次之后，把"必填/范围"这类错误一次性亮出来（在那之前只在失焦后显示）。 */
+  revealErrors?: boolean
   idPrefix?: string
   /** 字段被上层逻辑接管（如批量变量字段）时禁用编辑。 */
   disabled?: boolean
   class?: string
 }
 
-const props = withDefaults(defineProps<Props>(), { idPrefix: 'field' })
+const props = withDefaults(defineProps<Props>(), { idPrefix: 'field', revealErrors: false })
 
 const emit = defineEmits<{
   // 本组件只从 Input/Textarea/Select（string）与复选框（boolean）转发，别再放宽成 unknown：
@@ -82,16 +86,20 @@ const isEmptyValue = computed(
   () =>
     props.modelValue == null || (typeof props.modelValue === 'string' && !props.modelValue.trim())
 )
-const numberInvalid = computed(() => {
-  if (!isNumber.value || isEmptyValue.value) return false
-  const s = String(props.modelValue)
-  return isInteger.value ? !/^-?\d+$/.test(s) : !Number.isFinite(Number(s))
-})
+/** 用户碰过这个字段（失焦）之后才显示错误；提交一次后 `revealErrors` 会全部亮出来。 */
+const touched = ref(false)
+const errorVisible = computed(() => touched.value || props.revealErrors)
+const numberProblem = computed(() => numberIssue(props.field, props.modelValue))
+const numberRange = computed(() => (isNumber.value ? numberRangeText(props.field) : undefined))
 
 const fieldError = computed(() => {
+  // 父级显式给的错误永远显示：那是"已经发生的事"，不是推测。
   if (props.error) return props.error
+  if (!errorVisible.value) return undefined
   if (props.field.required && isEmptyValue.value) return t('field.required')
-  if (numberInvalid.value)
+  if (numberProblem.value === 'range')
+    return t('field.outOfRange', { range: numberRange.value ?? '' })
+  if (numberProblem.value === 'type')
     return isInteger.value ? t('field.mustBeInteger') : t('field.mustBeNumber')
   return undefined
 })
@@ -102,10 +110,29 @@ const id = computed(() => `${props.idPrefix}-${props.field.key}`)
 const isDragging = ref(false)
 const pickedFile = ref<File | null>(null)
 const pickedPreviewUrl = ref('')
+/**
+ * 恢复会话/上传完成后，从资产服务拉回的缩略图。
+ *
+ * 草稿里只有文件名与 assetId，没有本地 `File`；只靠 `pickedFile` 的话，重开应用后
+ * 图片字段会退化成一个文件图标——而"我选的是哪张"正是图片生图片最要紧的信息。
+ */
+const restoredPreviewUrl = ref('')
+const restoredAssetId = ref<number>()
+
+const isImageName = (name?: string) => /\.(png|jpe?g|webp|gif|avif|bmp)(\?|$)/i.test(name ?? '')
+const revokeRestored = () => {
+  if (restoredPreviewUrl.value) URL.revokeObjectURL(restoredPreviewUrl.value)
+  restoredPreviewUrl.value = ''
+  restoredAssetId.value = undefined
+}
 
 const hasFile = computed(() => !!(props.file?.filename || pickedFile.value))
 const previewUrl = computed(() =>
-  pickedFile.value?.type.startsWith('image/') ? pickedPreviewUrl.value : ''
+  pickedFile.value
+    ? pickedFile.value.type.startsWith('image/')
+      ? pickedPreviewUrl.value
+      : ''
+    : restoredPreviewUrl.value
 )
 
 const formatSize = (bytes: number) => {
@@ -118,6 +145,24 @@ const setPickedFile = (file: File | null) => {
   if (pickedPreviewUrl.value) URL.revokeObjectURL(pickedPreviewUrl.value)
   pickedFile.value = file
   pickedPreviewUrl.value = file ? URL.createObjectURL(file) : ''
+  // 新选的文件优先：释放上一张"已上传缩略图"，别让两张图同时占内存。
+  if (file) revokeRestored()
+}
+
+const loadRestoredPreview = async () => {
+  const assetId = props.file?.assetId
+  if (!assetId || pickedFile.value || !isImageName(props.file?.filename)) return
+  if (restoredAssetId.value === assetId) return
+  try {
+    const blob = await v2.fetchAssetBytes(assetId)
+    // 期间换了文件/字段 ⇒ 这次结果作废。
+    if (props.file?.assetId !== assetId || pickedFile.value) return
+    revokeRestored()
+    restoredPreviewUrl.value = URL.createObjectURL(blob)
+    restoredAssetId.value = assetId
+  } catch {
+    // 拉不到缩略图就退回文件图标；不打断填写。
+  }
 }
 
 const acceptFile = (file: File | null | undefined) => {
@@ -152,8 +197,22 @@ watch(
   }
 )
 
+// 恢复会话/上传完成：文件名有了，但本地没有 File，需要从资产服务补一张缩略图。
+watch(
+  () => props.file?.assetId,
+  (assetId) => {
+    if (!assetId) {
+      revokeRestored()
+      return
+    }
+    void loadRestoredPreview()
+  },
+  { immediate: true }
+)
+
 onBeforeUnmount(() => {
   if (pickedPreviewUrl.value) URL.revokeObjectURL(pickedPreviewUrl.value)
+  revokeRestored()
 })
 
 // ---------- 长文本自动增高 ----------
@@ -288,6 +347,7 @@ onMounted(() => nextTick(autoGrow))
           class="h-9 w-full rounded-md border border-input bg-secondary px-3 text-sm focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
           :value="selectValue"
           :disabled="disabled"
+          @blur="touched = true"
           @change="emit('update:modelValue', ($event.target as HTMLSelectElement).value)"
         >
           <option v-for="option in field.enum" :key="option" :value="option">
@@ -306,8 +366,17 @@ onMounted(() => nextTick(autoGrow))
         :placeholder="field.description"
         :model-value="displayValue"
         :disabled="disabled"
+        @blur="touched = true"
         @update:model-value="(value) => emit('update:modelValue', value)"
       />
+      <!--
+        范围来自 schema（平台/引擎声明的真实约束），但浏览器不会替我们拦：
+        页面没有 `<form>` 提交，min/max 只是控件的箭头边界。所以把范围**写出来**，
+        并在失焦/提交时用同一条判据报错（见 shared/lib/numberField.ts）。
+      -->
+      <p v-if="numberRange && !fieldError" class="text-[11px] leading-4 text-muted-foreground">
+        {{ t('field.rangeHint', { range: numberRange }) }}
+      </p>
 
       <Textarea
         v-else
@@ -318,6 +387,7 @@ onMounted(() => nextTick(autoGrow))
         :rows="isLongField ? 3 : 1"
         :disabled="disabled"
         :class="isLongField ? 'min-h-20' : 'min-h-9'"
+        @blur="touched = true"
         @update:model-value="(value) => emit('update:modelValue', value)"
       />
 
