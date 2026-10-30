@@ -737,11 +737,28 @@ const assetRefForRow = (row: BatchRow, key: string) => {
 }
 
 /**
- * 这次提交里**空着**的图片位。
+ * 这一行**会继承统一参数里的那张图**（自己没有覆盖、也没点过移除）。
+ *
+ * 只用于**显示**：提交仍走 `assetRefForRow`，两者是同一套判据。
+ * 为什么要显示：此前格子里只有"行覆盖"这一层可见，于是"空着但会用统一图"看起来
+ * 和"真的没有图"一模一样——用户在表格里读不到最终值。
+ */
+const inheritedFile = (row: BatchRow, key: string) => {
+  if (row.files[key]) return undefined
+  if (row.clearedFiles?.includes(key)) return undefined
+  return fileRefs.value[key]
+}
+const inheritedFileName = (row: BatchRow, key: string) => inheritedFile(row, key)?.filename ?? ''
+
+/**
+ * 这次提交里**一张图都没选**吗？
  *
  * 为什么要问：媒体字段现在**永不 required**（空图可能是"工作流自带固定图"或"这个节点
- * 没被用到"，见 `recipe_import.rs`），硬拦会把人卡在表单前；但一声不响地提交，平台
- * 可能受理后失败、或用了它自带的默认图——两种都照常计费。所以不拦，只问一句。
+ * 没被用到"，见 `recipe_import.rs`），硬拦会把人卡在表单前；但一张都不选就提交，平台
+ * 可能受理后失败、或用了它自带的默认图——两种都照常计费。
+ *
+ * 判据刻意只抓"**全都没选**"这一档：多槽位工作流里"只用其中几个"是常态，每缺一个都问
+ * 会让确认变成无脑点击（高频确认 = 没有确认）。部分为空交给平台报错，这是可接受的成本。
  *
  * 单条模式没有"第几行"，`rows` 给空数组，模板只显示字段名。
  */
@@ -752,16 +769,12 @@ const emptyMediaSlots = () => {
     batchMode.value === 'batch'
       ? batchRows.value.map((row, index) => ({ index: index + 1, row }))
       : [{ index: 0, row: { id: 0, values: {}, files: {} } }]
-  const blanks: Array<{ label: string; rows: number[] }> = []
-  for (const field of fileFields) {
-    const emptyRows = rows.filter(({ row }) => !assetRefForRow(row, field.key))
-    if (!emptyRows.length) continue
-    blanks.push({
-      label: field.description || field.key,
-      rows: batchMode.value === 'batch' ? emptyRows.map(({ index }) => index) : []
-    })
-  }
-  return blanks
+  const hasAny = rows.some(({ row }) => fileFields.some((field) => assetRefForRow(row, field.key)))
+  if (hasAny) return []
+  return fileFields.map((field) => ({
+    label: field.description || field.key,
+    rows: batchMode.value === 'batch' ? rows.map(({ index }) => index) : []
+  }))
 }
 /** 弹窗标题按"到底是哪类空"来说，而不是永远说"格子空着"。 */
 const preSubmitTitle = computed(() => {
@@ -1229,11 +1242,13 @@ const goEditFields = () => {
                           :disabled="rowUploadingKey === `${row.id}:${field.key}`"
                           @click="openRowFilePicker(row, field.key)"
                           >{{
-                            row.files[field.key] ? t('runner.replace') : t('runner.choose')
+                            row.files[field.key] || inheritedFile(row, field.key)
+                              ? t('runner.replace')
+                              : t('runner.choose')
                           }}</Button
                         >
                         <Button
-                          v-if="row.files[field.key]"
+                          v-if="row.files[field.key] || inheritedFile(row, field.key)"
                           type="button"
                           variant="ghost"
                           size="sm"
@@ -1253,6 +1268,16 @@ const goEditFields = () => {
                         class="max-w-48 truncate text-xs text-muted-foreground"
                       >
                         {{ row.files[field.key].filename }}
+                      </p>
+                      <p
+                        v-else-if="inheritedFileName(row, field.key)"
+                        class="max-w-48 truncate text-xs italic text-muted-foreground"
+                      >
+                        {{
+                          t('runner.unifiedFile', {
+                            name: inheritedFileName(row, field.key)
+                          })
+                        }}
                       </p>
                       <p v-else class="text-[11px] text-muted-foreground">
                         {{ t('runner.dropHint') }}

@@ -59,7 +59,7 @@
         />
         <div class="archive-grid">
           <Card
-            v-for="task in filteredTasks"
+            v-for="task in visibleTasks"
             :key="task.operationId"
             class="archive-card overflow-hidden shadow-none"
           >
@@ -182,6 +182,11 @@
               </div>
             </div>
           </Card>
+        </div>
+        <div v-if="hiddenCount" class="mt-4 flex justify-center">
+          <Button variant="outline" size="sm" @click="showMoreTasks">
+            {{ t('history.loadMore', { count: hiddenCount }) }}
+          </Button>
         </div>
       </section>
 
@@ -392,22 +397,36 @@ const filters = computed<Array<{ value: TaskStatusFilter; label: string; count: 
 
 const filteredTasks = computed(() => {
   const query = keyword.value.trim().toLowerCase()
-  return (
-    tasks.value
-      .filter((task) => {
-        const matchesStatus =
-          statusFilter.value === 'all' ||
-          (statusFilter.value === 'active' ? isActive(task) : task.status === statusFilter.value)
-        return (
-          matchesStatus &&
-          (!query ||
-            operationLabel(task).toLowerCase().includes(query) ||
-            String(task.operationId).includes(query))
-        )
-      })
-      // 画廊最多展示最近 20 个任务，避免海量历史一次渲染/预取造成卡顿。
-      .slice(0, MAX_TASKS)
-  )
+  return tasks.value.filter((task) => {
+    const matchesStatus =
+      statusFilter.value === 'all' ||
+      (statusFilter.value === 'active' ? isActive(task) : task.status === statusFilter.value)
+    return (
+      matchesStatus &&
+      (!query ||
+        operationLabel(task).toLowerCase().includes(query) ||
+        String(task.operationId).includes(query))
+    )
+  })
+})
+/**
+ * 一次渲染多少张卡片。
+ *
+ * ⚠️ 这里以前直接 `slice(0, 20)` 且没有出口——统计条按全量算，列表却只有 20 条，
+ * 页面自己和自己对不上："全部 35 / 20 个归档任务"，还没有任何"仅显示 20 条"的提示。
+ * 历史页的存在意义就是"找得到"，所以改成分批渲染 + 加载更多。
+ */
+const visibleCount = ref(MAX_TASKS)
+const visibleTasks = computed(() => filteredTasks.value.slice(0, visibleCount.value))
+const hiddenCount = computed(() =>
+  Math.max(0, filteredTasks.value.length - visibleTasks.value.length)
+)
+const showMoreTasks = () => {
+  visibleCount.value += MAX_TASKS
+}
+// 换筛选/搜索词就回到第一批：否则用户会停在"第 60 条"看不见新结果的开头。
+watch([keyword, statusFilter], () => {
+  visibleCount.value = MAX_TASKS
 })
 const hasTasks = computed(() => tasks.value.length > 0)
 
@@ -667,9 +686,9 @@ const formatDate = (value: string) => {
 // 范围与渲染上限**同一个常量**：此前这里是写死的 40，而画廊只渲染 20 张——多预取的一倍
 // 完全是白拉的（每张都是原图，见下）。
 watch(
-  filteredTasks,
+  visibleTasks,
   (list) => {
-    list.slice(0, MAX_TASKS).forEach((task) => {
+    list.forEach((task) => {
       void (async () => {
         await ensureDetail(task.operationId)
         void loadArtifacts(task)

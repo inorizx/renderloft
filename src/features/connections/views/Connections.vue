@@ -2,7 +2,7 @@
 // 连接页：统一管理生成源（RunningHub 国内/国际、ComfyUI、OpenAI 图片）。
 // 每类可存在多个连接（如 RunningHub .cn 与 .ai 独立平台数据不互通，各配一个连接，
 // Recipe 通过 binding 绑定各自连接）。
-import { computed, onMounted, reactive, ref, watch } from 'vue'
+import { computed, nextTick, onMounted, reactive, ref, watch } from 'vue'
 import { v2 } from '@/shared/api/v2'
 import type { SecretHint } from '@/shared/api/v2'
 import { useAppStore } from '@/shared/stores/app'
@@ -778,16 +778,22 @@ const sourceBalance = computed(() => {
 })
 
 /**
- * 切到 RH 云端时默认选中"唯一的那条 RunningHub 连接"；切走时清掉引用。
+ * 切换预设/地址时维护"密钥来源"。
  *
- * 清掉是必须的：引用只对 RH 云端有意义，留在一条本地 ComfyUI 的配置里会让它
- * 拿着 RunningHub 的 Key 去请求本机（daemon 那边照借不误）。
+ * ① 切走 RH 云端 ⇒ 清掉引用：引用只对 RH 云端有意义，留在一条本地 ComfyUI 的配置里
+ *    会让它拿着 RunningHub 的 Key 去请求本机（daemon 那边照借不误）。
+ * ② 编辑已有连接时**不许自动补**：自动补只对"新建"有意义。对已有连接，它会在用户
+ *    什么都没改的情况下把"用自己填的 Key"悄悄变成"借别人的 Key"——保存后连 Key 输入框
+ *    都会消失，而被引用的那条一旦停用，这条连接立刻 401。用户的意图可能只是改个显示名，
+ *    不该顺带改"这把 Key 是谁的、钱记在谁头上"。
  */
+let suppressCredentialAutoFill = false
 watch(runningHubProxySelected, (isCloud) => {
   if (!isCloud) {
     form.sourceConnectionId = null
     return
   }
+  if (suppressCredentialAutoFill) return
   if (form.sourceConnectionId === null && runningHubConnections.value.length === 1) {
     form.sourceConnectionId = runningHubConnections.value[0].connectionId
   }
@@ -858,6 +864,8 @@ const openEdit = async (def: ConnectionTypeDef, conn: ConnItem) => {
   drawerMode.value = 'edit'
   drawerType.value = def.key
   editingId.value = conn.connectionId
+  // 编辑期间禁止自动补"密钥来源"（见 `suppressCredentialAutoFill`）。
+  suppressCredentialAutoFill = true
   form.displayName = conn.displayName || def.label
   form.baseUrl = conn.baseUrl || def.defaultBaseUrl
   form.apiKey = ''
@@ -903,6 +911,10 @@ const openEdit = async (def: ConnectionTypeDef, conn: ConnItem) => {
     form.comfyPresetId = rh ? rh.id : local ? local.id : user ? user.id : 'custom'
   }
   drawerOpen.value = true
+  // 等这一轮 watcher 跑完再放开：编辑期间对"密钥来源"的自动补全一律跳过。
+  void nextTick(() => {
+    suppressCredentialAutoFill = false
+  })
 }
 
 const resolveRunningHubConfig = (): Record<string, string> => {
