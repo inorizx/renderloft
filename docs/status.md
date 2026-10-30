@@ -4,6 +4,51 @@
 
 ## 已完成
 
+- **提交失败不再自动重投，已付费的结果不再丢**（2026-10-30）：OpenAI Images 的提交路径此前用
+  `map_http_error`——5xx 只被标成"可重试"，于是 scheduler 30 秒后自动重投；而同步出图 API 的
+  500 很可能发生在**生成并计费之后**，同一个提示词就扣两次。现在改走 `map_submit_http_error`
+  （5xx = 结果不明，等死线，不盲投）。同一处还修了反向的谎：HTTP 2xx 已经证明平台受理了，
+  之后读不到响应体 / 取不到图片字节**不再**落 `SUBMISSION_UNCERTAIN`——读不出体直接判
+  `PROVIDER_RESULT_UNREADABLE`；`url` 形态的结果取字节瞬时失败先重试一次，仍失败就把 URL
+  存成远端产物（`byteSize = 0`，与 RunningHub 同形），界面 / CLI 之后还能取。
+  判据：`submit_5xx_is_marked_as_submission_unknown`（负对照：改回 `map_http_error` ⇒ 红）、
+  `submit_4xx_is_a_plain_rejection`、`a_result_we_cannot_fetch_is_not_a_submission_uncertainty`、
+  `a_transient_fetch_failure_falls_back_to_the_remote_url`。
+
+- **会花钱的边界：重试、取消、对账、卫生、资产字节**（2026-10-30）：
+  ① `operation retry` 现在拒绝对**还在跑**的 run 重试（`RETRY_SOURCE_IN_FLIGHT`，HTTP 409）——
+  此前对 RUNNING 的 operation 点「重新运行」会在平台上再开一份、再扣一次；
+  `SUBMISSION_UNCERTAIN` 仍放行（那是"放弃重来"的出口）。
+  ② 取消时"远端可能还在跑"的判据改看**最新 attempt 的状态**，不再只信 `find_operation` 的快照：
+  快照 QUEUED、而 scheduler 已领走并在提交的那一瞬间，旧代码会告诉用户"平台上没有残留"。
+  ③ 对账不再让一个被取消的 run 打断整轮 tick：状态迁移撞 `ILLEGAL_RUN_TRANSITION` 时记日志并跳过
+  （此前那个 `?` 会让其余 run 的轮询一起停摆）。判据**不能**用 `complete_attempt` 返回 `None`
+  ——attempt 在提交成功那一刻就已终态，正常路径也返回 `None`（第一版就这么写错，被 3 条测试抓住）。
+  ④ 卫生清扫的"陈旧"判据从"operation 行 6 小时没写"改成"**没有任何 run 在最近 6 小时动过**"——
+  对账只写 run，配了 8 小时死线的长任务此前会被整体误判失败，而平台那边还在跑并计费。
+  ⑤ 资产字节缺失时在 `prepare` 之前判死（`ASSET_BYTES_MISSING`），不再拿空字节提交——
+  那会花钱跑一次、产出用空文件。
+  判据：`retry_refuses_a_run_that_is_still_in_flight` / `retry_over_http_refuses_an_operation_that_is_still_running`
+  （负对照：去掉守卫 ⇒ 红）、`a_stale_queued_snapshot_with_an_in_flight_attempt_still_reports_residue`
+  （负对照：忽略 attempt 状态 ⇒ 红）、`a_long_running_operation_stays_fresh_while_its_run_is_polled`
+  （负对照：去掉 `NOT EXISTS` ⇒ 红）、`a_missing_asset_byte_fails_the_run_before_the_provider_is_called`
+  （负对照：改回空字节 ⇒ run 会"成功"且素材是 0 字节，红）。对账③**没有直接用例**：要卡在
+  `list_active_runs` 与迁移之间，测试替身没有这个钩子。
+
+- **表单侧：清空 ≠ 继承，空图与整批重投先问一句**（2026-10-30）：批量行点「移除」此前只是删掉
+  行内文件，提交时又回落到统一参数里的那张——界面显示没图，实际带着另一张去花钱；现在用
+  显式 `clearedFiles` 分开"没覆盖"与"不要"，草稿一起存。媒体字段不再 required 之后，
+  空着的图片位改为提交前**软确认**（单条与批量都列出来），不拦但也不静默。一批已经提交过时
+  再点「开始批量生成」会先问"全部行会重新生成、再计费一次"。运行页的「编辑字段」终于能用了：
+  RouterView 的 key 从 `fullPath` 改成 `path`，页面自己清 `?edit=` 不再触发整页重挂载。
+  完成通知的判据从 `createdAt >= viewedAt` 改成**状态迁移差集**——跑 20 分钟的任务中途看一眼
+  面板，完成后照样会提醒。任务历史页的下载改成"下全部、汇总报"（与任务中心共用
+  `shared/lib/downloadArtifacts.ts`）。顺带：对话框 `v-if + :open="true"` 时补上初始焦点、
+  删掉零引用的 `usePolling.ts`、收口几处硬编码文案（`Recipe #`、排序 locale、连接默认名、顿号）。
+  判据：497 个 Rust 测试通过；`pnpm build`（vue-tsc + vite）、`eslint`、`prettier --check`、
+  分层 / 配色 / 版本守门通过。前端这几条**没有自动化用例**（仓库没有前端测试框架），
+  只到类型检查 + 构建。
+
 - **导入工作流时能挑字段了**（2026-10-29）：`recipe import-workflow` 加了 `--fields <file>`
   （JSON 数组，元素 `{key, label, widget, options}`），并新增 `recipe fields` 用来先问
   「这个工作流有哪些字段」——它的输出可以直接喂给前者。两条都**只给 CLI**：勾哪些字段
