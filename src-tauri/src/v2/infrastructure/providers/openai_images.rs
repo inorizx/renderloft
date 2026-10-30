@@ -3,7 +3,7 @@ use reqwest::Client;
 use serde_json::{json, Value};
 use std::sync::OnceLock;
 
-use crate::v2::domain::errors::{DomainResult, SafeError};
+use crate::v2::domain::errors::{DomainResult, ErrorKind, SafeError};
 use crate::v2::domain::execution::{
     ArtifactData, ArtifactDraft, CancelOutcome, ConnectionCheck, ProviderDescriptor, SubmitOutcome,
     TaskSnapshot,
@@ -15,8 +15,8 @@ use crate::v2::ports::provider::{
 use crate::v2::ports::stores::SecretStore;
 
 use super::safety::{
-    join_path, map_http_error, map_network_error, read_limited, validate_base_url,
-    validate_resolved_url, NetworkPolicy, MAX_RESPONSE_BYTES, MAX_RESULT_BYTES,
+    join_path, map_http_error, map_network_error, map_submit_http_error, read_limited,
+    validate_base_url, validate_resolved_url, NetworkPolicy, MAX_RESPONSE_BYTES, MAX_RESULT_BYTES,
 };
 
 /// 允许进请求体的字段。
@@ -295,6 +295,28 @@ impl OpenAiImagesDriver {
         read_limited(response, MAX_RESULT_BYTES).await
     }
 
+    /// 取一条 `url` 形态的结果（提交**已经成功**之后的取字节）。
+    ///
+    /// 判据：这一步失败**不是「提交结果不明」**。HTTP 2xx 已经证明平台受理并计费，
+    /// 抛一个 `Network` 出去只会让上层落 `SUBMISSION_UNCERTAIN`、等满死线再报
+    /// "无法确认"——而图其实已经生成好了。所以：
+    ///
+    /// * 网络/超时类抖动**重试一次**（连接被重置、握手超时常常是瞬时的）；
+    /// * 仍取不到就把 URL 原样存成**远端产物**（`byteSize = 0`，与 RunningHub 那条
+    ///   "只给链接不给字节"的产物同形），界面 / CLI 之后按需再取——不丢已付费的结果；
+    /// * **安全策略拒绝**（非 https、私网、重定向）照旧往上抛：那种 URL 存下来也取不到，
+    ///   存一个永远取不回的链接比报错更糟。
+    async fn download_artifact(&self, index: usize, url: &str) -> DomainResult<ArtifactDraft> {
+        let first = self.download_url(url).await;
+        // 只有"这次没取到、之后还能取"的那一类才值得再试一次；策略拒绝重试也是白试。
+        let retry = match &first {
+            Ok(_) => None,
+            Err(error) if is_transient_fetch_failure(error) => Some(self.download_url(url).await),
+            Err(_) => None,
+        };
+        settle_result_fetch(format!("image-{index}.png"), url, first, retry)
+    }
+
     fn artifact_draft(filename: &str, bytes: Vec<u8>) -> ArtifactDraft {
         ArtifactDraft {
             filename: filename.to_string(),
@@ -304,6 +326,66 @@ impl OpenAiImagesDriver {
             data: ArtifactData::Bytes(bytes),
         }
     }
+
+    /// 只有链接、没有字节的产物。约定与 RunningHub 一致：`byte_size = 0` 表示
+    /// "字节还在平台上、还没取过"，`checksum` 留空（取字节时由 `artifact bytes` 补算）。
+    fn artifact_url(filename: String, url: &str) -> ArtifactDraft {
+        ArtifactDraft {
+            filename,
+            mime_type: "image/png".to_string(),
+            byte_size: 0,
+            checksum: String::new(),
+            data: ArtifactData::Url {
+                url: url.to_string(),
+                expires_at: None,
+            },
+        }
+    }
+}
+
+/// 取结果字节时的失败里，哪些值得**退回远端链接**（而不是直接判失败）。
+///
+/// 只认网络/超时：那是"这次没取到，之后还能取"。策略拒绝（`Validation`）、
+/// 重定向、HTTP 4xx/5xx 都不在此列——链接本身有问题，存下来也取不到。
+fn is_transient_fetch_failure(error: &SafeError) -> bool {
+    matches!(error.kind, ErrorKind::Network | ErrorKind::Timeout)
+}
+
+/// 取结果字节的收尾：成功就落字节；瞬时失败重试一次仍失败 ⇒ **退回远端链接**；
+/// 非瞬时失败（策略拒绝 / 重定向 / HTTP 错误）⇒ 原样上报。
+///
+/// 单独抽成纯函数是为了能钉住"哪条路走哪个出口"——真去造一个"连得上但传到一半断开"
+/// 的服务既不稳定也不该出现在单测里。
+fn settle_result_fetch(
+    filename: String,
+    url: &str,
+    first: DomainResult<Vec<u8>>,
+    retry: Option<DomainResult<Vec<u8>>>,
+) -> DomainResult<ArtifactDraft> {
+    match (first, retry) {
+        (Ok(bytes), _) => Ok(OpenAiImagesDriver::artifact_draft(&filename, bytes)),
+        // 非瞬时失败：链接本身有问题，存一个永远取不回的远端地址比报错更糟。
+        (Err(error), None) => Err(error),
+        (Err(_), Some(Ok(bytes))) => Ok(OpenAiImagesDriver::artifact_draft(&filename, bytes)),
+        (Err(first_error), Some(Err(second_error))) => {
+            crate::v2::logging::log_line(&format!(
+                "[renderloft-openai] 结果「{filename}」取字节失败（{}），改存远端链接（首次：{}）",
+                second_error.code, first_error.message
+            ));
+            Ok(OpenAiImagesDriver::artifact_url(filename, url))
+        }
+    }
+}
+
+/// 2xx 之后读不出响应体 —— 明确**不是**「提交结果不明」。
+///
+/// 见 `submit` 里那段注释：这里换成 `Provider` 类错误（`retryable = false`），
+/// scheduler 就不会重投（重投就是再花一次钱），也不会把它当"平台收没收到不知道"。
+fn result_unreadable(context: &str, error: SafeError) -> SafeError {
+    SafeError::provider(
+        "PROVIDER_RESULT_UNREADABLE",
+        format!("平台已受理（HTTP 2xx），但{context}：{}", error.message),
+    )
 }
 
 fn simple_checksum(bytes: &[u8]) -> u64 {
@@ -479,9 +561,22 @@ impl ProviderDriver for OpenAiImagesDriver {
             ));
         }
         if !response.status().is_success() {
-            return Err(map_http_error(response.status().as_u16(), "图像生成失败"));
+            // 提交路径专用的映射：5xx 标成「提交结果不明」（平台可能已受理并计费）；
+            // 4xx 仍是明确拒绝（其中 429 照旧可重试）。用 `map_http_error` 会把 5xx
+            // 当成普通可重试错误 —— 30 秒后自动重投，而同步出图 API 可能已经生成、已经扣钱。
+            return Err(map_submit_http_error(
+                response.status().as_u16(),
+                "图像生成失败",
+            ));
         }
-        let bytes = read_limited(response, MAX_RESPONSE_BYTES).await?;
+        // ⚠️ 从这里往下，**HTTP 2xx 已经证明平台受理了这次提交**（并且很可能已经计费）。
+        // 之后的任何失败都不是"提交结果不明"：把它标成 `Network/Timeout` 会让 scheduler
+        // 落 `SUBMISSION_UNCERTAIN`，白等到死线再报"平台到底收没收到不知道"——而事实是
+        // 收到了、只是我们没读到。所以这两处一律换成一个明确的终态错误：不重投，
+        // 把原因说清楚，由人决定下一步。
+        let bytes = read_limited(response, MAX_RESPONSE_BYTES)
+            .await
+            .map_err(|error| result_unreadable("读取响应体失败", error))?;
         let parsed: Value = serde_json::from_slice(&bytes)
             .map_err(|_| SafeError::validation("PROVIDER_RESPONSE_INVALID", "响应不是有效 JSON"))?;
         let items = parsed
@@ -496,17 +591,17 @@ impl ProviderDriver for OpenAiImagesDriver {
         }
         let mut artifacts = Vec::with_capacity(items.len());
         for (index, item) in items.iter().enumerate() {
-            let bytes = if let Some(url) = item.get("url").and_then(Value::as_str) {
-                self.download_url(url).await?
+            if let Some(url) = item.get("url").and_then(Value::as_str) {
+                artifacts.push(self.download_artifact(index, url).await?);
             } else if let Some(data) = item.get("b64_json").and_then(Value::as_str) {
-                self.decode_base64(data).await?
+                let bytes = self.decode_base64(data).await?;
+                artifacts.push(Self::artifact_draft(&format!("image-{index}.png"), bytes));
             } else {
                 return Err(SafeError::validation(
                     "PROVIDER_RESPONSE_INVALID",
                     "图像结果缺少 url 或 b64_json",
                 ));
-            };
-            artifacts.push(Self::artifact_draft(&format!("image-{index}.png"), bytes));
+            }
         }
         Ok(SubmitOutcome::Completed(artifacts))
     }
@@ -615,6 +710,46 @@ mod tests {
             let _ = axum::serve(listener, app).await;
         });
         (format!("http://127.0.0.1:{}/v1", address.port()), state)
+    }
+
+    /// 提交端点固定回某个状态码（5xx / 4xx 的判据测试用）。
+    async fn status_mock_server(status: axum::http::StatusCode) -> String {
+        let app = axum::Router::new()
+            .route(
+                "/v1/images/generations",
+                axum::routing::post(move || async move { status }),
+            )
+            .into_make_service();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("绑定 mock 服务应成功");
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        format!("http://127.0.0.1:{}/v1", address.port())
+    }
+
+    /// 提交成功（200）但结果只有 `url` 形态——用来钉"取不到图 ≠ 提交不明"。
+    async fn url_mock_server(result_url: &str) -> String {
+        let payload = json!({ "created": 1, "data": [{ "url": result_url }] });
+        let app = axum::Router::new()
+            .route(
+                "/v1/images/generations",
+                axum::routing::post(move || {
+                    let payload = payload.clone();
+                    async move { axum::Json(payload) }
+                }),
+            )
+            .into_make_service();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("绑定 mock 服务应成功");
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        format!("http://127.0.0.1:{}/v1", address.port())
     }
 
     /// 带图的 mock：**第一次回 415**（模拟"只认 multipart"的官方口径被我们用错编码撞上，
@@ -918,6 +1053,146 @@ mod tests {
             .expect("prepare 应成功");
         driver.submit(prepared).await.expect("submit 应成功");
         assert_eq!(*state.authorization.lock().unwrap(), "Bearer sk-abc");
+    }
+
+    /// **提交路径的 5xx 必须标成「结果不明」**：网关/内部错误可能发生在受理之后，
+    /// 平台**可能已经收下并计费**。
+    ///
+    /// 负对照：把 `submit` 里那行改回 `map_http_error` ⇒ 这条会红。而当时 486 个测试
+    /// 里没有一条能照到它（`grep 500` 在这个文件里是空的），所以"全绿"并不等于这里对。
+    #[tokio::test]
+    async fn submit_5xx_is_marked_as_submission_unknown() {
+        let base = status_mock_server(axum::http::StatusCode::SERVICE_UNAVAILABLE).await;
+        let driver = OpenAiImagesDriver::new(Box::new(StubSecrets { value: None }));
+        let prepared = driver
+            .prepare(request(connection(base)))
+            .await
+            .expect("prepare 应成功");
+        let error = driver.submit(prepared).await.expect_err("5xx 必须报错");
+        assert!(error.retryable, "5xx 仍是可重试的（退避后），只是不许**自动**重投");
+        assert!(
+            error.submission_is_unknown(),
+            "5xx 可能是受理之后的网关错误 ⇒ 必须按「结果不明」处理，否则 scheduler 会 \
+             30 秒后自动重投，同步出图 API 就扣两次钱"
+        );
+    }
+
+    /// 4xx 是平台的**明确拒绝**（活没接）：不许升级成"结果不明"，也不该自动重试。
+    #[tokio::test]
+    async fn submit_4xx_is_a_plain_rejection() {
+        let base = status_mock_server(axum::http::StatusCode::BAD_REQUEST).await;
+        let driver = OpenAiImagesDriver::new(Box::new(StubSecrets { value: None }));
+        let prepared = driver
+            .prepare(request(connection(base)))
+            .await
+            .expect("prepare 应成功");
+        let error = driver.submit(prepared).await.expect_err("4xx 必须报错");
+        assert_eq!(error.code, "PROVIDER_REJECTED");
+        assert!(!error.retryable, "4xx 重试只会再撞一次");
+        assert!(
+            !error.submission_is_unknown(),
+            "明确拒绝不是「结果不明」——把它当不确定会白等一小时死线"
+        );
+    }
+
+    /// **200 已经回来了 ⇒ 这次提交被受理了。** 之后取不到结果字节**不是**「提交结果不明」：
+    /// 否则 run 会落 `SUBMISSION_UNCERTAIN`，等满死线再报"平台收没收到不知道"，
+    /// 而图其实已经生成好、钱也已经花了。
+    ///
+    /// 这里用 http 的结果地址触发安全策略拒绝（不发请求，判据稳定）；它属于
+    /// "不可退回远端链接"的那一类，所以直接报错——关键是错误**不能**是 unknown。
+    #[tokio::test]
+    async fn a_result_we_cannot_fetch_is_not_a_submission_uncertainty() {
+        let base = url_mock_server("http://127.0.0.1:9/image.png").await;
+        let driver = OpenAiImagesDriver::new(Box::new(StubSecrets { value: None }));
+        let prepared = driver
+            .prepare(request(connection(base)))
+            .await
+            .expect("prepare 应成功");
+        let error = driver
+            .submit(prepared)
+            .await
+            .expect_err("取不到结果应报错");
+        assert_eq!(error.code, "PROVIDER_URL_INSECURE");
+        assert!(
+            !error.submission_is_unknown(),
+            "HTTP 200 已证明平台受理：取不到图是「结果取不回」，不是「提交结果不明」"
+        );
+    }
+
+    /// 哪些取图失败值得退回远端链接：只认网络/超时（"这次没取到，之后还能取"）。
+    /// 策略拒绝 / 重定向 / HTTP 错误都不在此列——链接本身有问题，存下来也取不到。
+    #[test]
+    fn only_transient_fetch_failures_fall_back_to_the_remote_url() {
+        assert!(is_transient_fetch_failure(&SafeError::network("X", "y")));
+        assert!(is_transient_fetch_failure(&SafeError::timeout("X", "y")));
+        assert!(!is_transient_fetch_failure(&SafeError::validation("X", "y")));
+        assert!(!is_transient_fetch_failure(&map_http_error(500, "x")));
+    }
+
+    /// 远端产物：没有字节、只有链接（`byteSize = 0` = "还没取过"，与 RunningHub 同形）。
+    #[test]
+    fn a_remote_artifact_is_a_link_without_bytes() {
+        let artifact =
+            OpenAiImagesDriver::artifact_url("image-0.png".to_string(), "https://example.test/a.png");
+        assert_eq!(artifact.byte_size, 0);
+        assert!(artifact.checksum.is_empty(), "字节没取过，不该编一个 checksum");
+        assert_eq!(
+            artifact.data,
+            ArtifactData::Url {
+                url: "https://example.test/a.png".to_string(),
+                expires_at: None,
+            }
+        );
+    }
+
+    /// 取图收尾的三个出口：字节落地 / 退回远端链接 / 原样报错。
+    #[test]
+    fn a_transient_fetch_failure_falls_back_to_the_remote_url() {
+        let url = "https://example.test/a.png";
+
+        let direct = settle_result_fetch(
+            "image-0.png".to_string(),
+            url,
+            Ok(b"hello".to_vec()),
+            None,
+        )
+        .expect("第一次成功就直接落字节");
+        assert_eq!(direct.data, ArtifactData::Bytes(b"hello".to_vec()));
+
+        // 第一次网络失败、重试成功 ⇒ 字节落地（不回退链接）
+        let retried = settle_result_fetch(
+            "image-0.png".to_string(),
+            url,
+            Err(SafeError::network("IMAGE_DOWNLOAD", "连接被重置")),
+            Some(Ok(b"hello".to_vec())),
+        )
+        .expect("重试成功应落字节");
+        assert_eq!(retried.data, ArtifactData::Bytes(b"hello".to_vec()));
+
+        // 两次都是瞬时失败 ⇒ 退回远端链接，**不丢已付费的结果**
+        let fallback = settle_result_fetch(
+            "image-0.png".to_string(),
+            url,
+            Err(SafeError::network("IMAGE_DOWNLOAD", "连接被重置")),
+            Some(Err(SafeError::timeout("IMAGE_DOWNLOAD", "读超时"))),
+        )
+        .expect("瞬时失败应退回链接而不是报错");
+        assert_eq!(fallback.byte_size, 0);
+        match fallback.data {
+            ArtifactData::Url { url: stored, .. } => assert_eq!(stored, url),
+            other => panic!("期望远端链接，得到 {other:?}"),
+        }
+
+        // 非瞬时（安全策略拒绝）⇒ 原样报错，不落一个永远取不回的链接
+        let rejected = settle_result_fetch(
+            "image-0.png".to_string(),
+            "http://127.0.0.1/a.png",
+            Err(SafeError::validation("PROVIDER_URL_INSECURE", "必须 HTTPS")),
+            None,
+        )
+        .expect_err("策略拒绝应上报");
+        assert_eq!(rejected.code, "PROVIDER_URL_INSECURE");
     }
 
     #[tokio::test]
