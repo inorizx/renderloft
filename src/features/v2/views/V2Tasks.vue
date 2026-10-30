@@ -236,6 +236,7 @@ import EmptyState from '@/components/shared/EmptyState.vue'
 import ResultPreviewDialog from '@/components/shared/ResultPreviewDialog.vue'
 import { Button, Card, IconButton, Input, StatusBadge } from '@/components/ui'
 import { isTerminalStatus, v2, type OperationDetail, type OperationSummary } from '@/shared/api/v2'
+import { downloadOperationArtifacts as downloadAllArtifacts } from '@/shared/lib/downloadArtifacts'
 import { useV2WorkspaceStore } from '@/features/v2/stores/workspace'
 import { useAppStore } from '@/shared/stores/app'
 import { useLocale } from '@/shared/composables/useLocale'
@@ -615,17 +616,13 @@ const clearFinished = async () => {
   }
 }
 const downloadTask = async (task: OperationDetail) => {
-  const first = previewableArtifacts(task.operationId)[0]
-  if (!first || downloadingId.value !== undefined) return
+  if (downloadingId.value !== undefined) return
   downloadError.value = ''
   downloadingId.value = task.operationId
   try {
-    const { filename, path } = await v2.saveArtifact(first.artifactId)
-    // 成功也要说一句，并报出**完整路径**：桌面外壳不弹下载提示，不说用户就以为"点了没反应"。
-    appStore.showNotification('success', t('task.downloaded', { name: filename, path }), {
-      label: t('task.showInFolder'),
-      run: () => void v2.openDownloadDir(path).catch(() => undefined)
-    })
+    // 与任务中心共用同一个实现：逐个下、汇总报。
+    // 此前这里只取第一张，其余静默丢弃——一批 3 张图，用户点一下以为拿到了全部。
+    await downloadAllArtifacts(task.runs.map((run) => run.runId))
   } catch (error) {
     downloadError.value =
       error instanceof Error

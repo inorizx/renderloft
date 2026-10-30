@@ -170,14 +170,14 @@ const RUNNINGHUB_ENDPOINTS = computed(
          * 而它们默认同名的话，列表和运行页的连接选择器里就是两行一模一样的「RunningHub」，
          * 只能靠底下那行小字 URL 区分——选错就等于把任务发到了另一个账号。
          */
-        defaultName: 'RunningHub（国内）'
+        defaultName: t('connections.defaultNameDomestic')
       },
       {
         value: 'ai',
         label: t('connections.endpointAi'),
         baseUrl: 'https://www.runninghub.ai',
         region: 'global',
-        defaultName: 'RunningHub（国际）'
+        defaultName: t('connections.defaultNameGlobal')
       }
     ] as const
 )
@@ -1560,7 +1560,11 @@ onMounted(() => {
                   v-else-if="form.models.length"
                   class="mt-1.5 text-[11px] leading-4 text-muted-foreground"
                 >
-                  {{ t('connections.modelsDeclared', { models: form.models.join('、') }) }}
+                  {{
+                    t('connections.modelsDeclared', {
+                      models: form.models.join(t('common.listSeparator'))
+                    })
+                  }}
                 </p>
               </div>
             </div>

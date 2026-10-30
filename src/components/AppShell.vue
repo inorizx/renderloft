@@ -134,7 +134,17 @@
     <div class="app-main lg:ml-60">
       <main class="min-w-0">
         <RouterView v-slot="{ Component, route: matchedRoute }">
-          <component :is="Component" :key="matchedRoute.fullPath" />
+          <!--
+            key 用 **path**，不用 fullPath。
+
+            两者只差 query，但差别会咬人：`/library?edit=12` 是"从运行页带参数过来打开
+            编辑框"，页面自己会 `router.replace({ query: {} })` 把参数抹掉防止刷新重弹。
+            用 fullPath 当 key ⇒ 抹参数那一刻 key 变了 ⇒ 整页重挂载 ⇒ 刚打开的编辑框、
+            "关掉后送回运行页"的记录全丢（功能等于不可用）。
+            用 path ⇒ 换应用（`/library/1` → `/library/2`）、换页面照样重挂载，
+            只换 query 时保留页面状态——这正是 query 该有的语义。
+          -->
+          <component :is="Component" :key="matchedRoute.path" />
         </RouterView>
       </main>
     </div>

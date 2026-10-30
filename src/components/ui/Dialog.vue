@@ -58,7 +58,11 @@ watch(
       previouslyFocused?.focus?.()
       previouslyFocused = null
     }
-  }
+  },
+  // `immediate` 是必须的：不少调用方是 `v-if="x" + :open="true"` 的挂载即打开
+  // （任务中心的详情/批次详情、历史页的预览）。没有它，`open` 从没"变"过 ⇒
+  // 初始焦点不进对话框、关闭后也不归还，键盘/读屏用户会掉到 body 上。
+  { immediate: true }
 )
 
 const handleKeydown = (event: KeyboardEvent) => {

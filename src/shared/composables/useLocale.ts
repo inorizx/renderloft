@@ -494,10 +494,19 @@ const messages = {
     'runner.dialogClearTitle': '清空待处理任务？',
     'runner.dialogClearDescription': '将删除 {count} 条尚未提交的任务行，此操作不可撤销。',
     'runner.blankCellsTitle': '有单独填写的格子是空的',
+    'runner.recipeFallback': '应用 #{id}',
     'runner.blankCellsDescription':
       '下面这些格子为空。单独填写的字段不会回退到统一参数，空着就会按空值提交。',
     'runner.blankCellsItem': '{field}：第 {rows} 行',
     'runner.blankCellsConfirm': '仍要提交',
+    'runner.preSubmitTitle': '提交前确认一下',
+    'runner.emptyMediaTitle': '有图片位是空的',
+    'runner.emptyMediaDescription':
+      '下面这些图片位没有选文件。工作流可能失败，也可能用它自带的默认图——两种都会照常计费。',
+    'runner.resubmitTitle': '这批已经提交过',
+    'runner.resubmitDescription':
+      '这 {total} 行上次已经提交过（其中 {done} 行已完成）。再点一次会把全部行重新生成，并再计费一次。只想重跑失败的几条，请用任务页的「只重试失败的」。',
+    'runner.resubmitConfirm': '全部重新提交',
 
     // ---- 应用库（V2Recipes）----
     'library.title': '应用库',
@@ -694,6 +703,8 @@ const messages = {
     'library.formFieldLabelsHint':
       '平台描述通常与字段名相同，无法据此判断用途。填写的名称会同时用于运行表单与 AI 调用。',
     'library.formFieldLabelsEmpty': '这个应用没有可填参数。',
+    'library.formFieldLabelsLoadFailed':
+      '字段列表没读到（{message}）。这次保存不会改动字段备注；请稍后重试。',
     'library.formFieldLabelPlaceholder': '留空 = 没有备注',
     'library.formGroupPlaceholder': '例如：电商 / 工作流',
     'library.save': '保存',
@@ -802,6 +813,8 @@ const messages = {
     'connections.platform': '平台',
     'connections.endpointCn': '国内 · www.runninghub.cn',
     'connections.endpointAi': '国际 · www.runninghub.ai',
+    'connections.defaultNameDomestic': 'RunningHub（国内）',
+    'connections.defaultNameGlobal': 'RunningHub（国际）',
     'connections.customAddress': '自定义地址',
     'connections.execEnv': '执行环境',
     'connections.manage': '管理',
@@ -1357,10 +1370,19 @@ const messages = {
     'runner.dialogClearDescription':
       'This deletes {count} unsubmitted task rows and cannot be undone.',
     'runner.blankCellsTitle': 'Some per-row cells are empty',
+    'runner.recipeFallback': 'Recipe #{id}',
     'runner.blankCellsDescription':
       'These cells are empty. Per-row fields do not fall back to the shared value, so they will be submitted empty.',
     'runner.blankCellsItem': '{field}: row {rows}',
     'runner.blankCellsConfirm': 'Submit anyway',
+    'runner.preSubmitTitle': 'Check before submitting',
+    'runner.emptyMediaTitle': 'Some image slots are empty',
+    'runner.emptyMediaDescription':
+      'These image slots have no file selected. The workflow may fail, or fall back to its own default image — either way you are charged.',
+    'runner.resubmitTitle': 'This batch was already submitted',
+    'runner.resubmitDescription':
+      '{total} rows were submitted before ({done} of them finished). Submitting again regenerates every row and charges again. To retry only the failed ones, use “Retry failed” on the Tasks page.',
+    'runner.resubmitConfirm': 'Resubmit everything',
 
     // ---- App library (V2Recipes) ----
     'library.title': 'App library',
@@ -1531,6 +1553,8 @@ const messages = {
     'library.formFieldLabelsHint':
       'The platform description is usually the same as the field name, so it does not tell us what a field is for. Names set here are used by both the run form and AI calls.',
     'library.formFieldLabelsEmpty': 'This app has no inputs.',
+    'library.formFieldLabelsLoadFailed':
+      'Could not load the field list ({message}). Saving will leave field labels untouched — please try again.',
     'library.formFieldLabelPlaceholder': 'Empty = no label',
     'library.formGroupPlaceholder': 'e.g. E-commerce / Workflow',
     'library.save': 'Save',
@@ -1603,6 +1627,8 @@ const messages = {
     'connections.platform': 'Platform',
     'connections.endpointCn': 'China · www.runninghub.cn',
     'connections.endpointAi': 'International · www.runninghub.ai',
+    'connections.defaultNameDomestic': 'RunningHub (China)',
+    'connections.defaultNameGlobal': 'RunningHub (Global)',
     'connections.customAddress': 'Custom address',
     'connections.execEnv': 'Execution environment',
     'connections.manage': 'Manage',

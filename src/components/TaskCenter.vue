@@ -28,6 +28,7 @@ import SectionHeader from '@/components/shared/SectionHeader.vue'
 import StatusIndicator from '@/components/shared/StatusIndicator.vue'
 import ResultPreviewDialog from '@/components/shared/ResultPreviewDialog.vue'
 import { isTerminalStatus, v2, type OperationDetail, type RunRef } from '@/shared/api/v2'
+import { downloadOperationArtifacts as downloadAllArtifacts } from '@/shared/lib/downloadArtifacts'
 import { runGroupLabel } from '@/shared/lib/runLabel'
 import type { TaskResult } from '@/shared/types/runninghub'
 import { useV2WorkspaceStore } from '@/features/v2/stores/workspace'
@@ -219,67 +220,14 @@ const downloadPreviewResult = async (result: TaskResult, index: number) => {
   }
 }
 /**
- * 下载**一个操作产出的全部产物**。
+ * 下载**一个操作产出的全部产物**（实现见 `shared/lib/downloadArtifacts.ts`）。
  *
- * ⚠️ 这个函数替换掉了一个说谎的版本：它只取 `previewableArtifacts(id)[0]` —— **只下第一张**，
- * 对其余的只字不提。一批 100 张图，用户点一下就以为拿到了全部。
- *
- * 落盘仍由 daemon 做（`v2.saveArtifact`），所以这里只做两件本地的事：逐个调、把结果**汇总报出来**。
- * 失败必须能被看见——"静默少几张"是最坏的一种收尾。
- *
- * 产物按 run 列（按 runId 查的那个端点**不分页**，一次给全），所以这里逐 run 取。
+ * ⚠️ 这里原来是一个说谎的版本：只取 `previewableArtifacts(id)[0]` —— **只下第一张**，
+ * 对其余的只字不提。一批 100 张图，用户点一下就以为拿到了全部。任务历史页那份也没跟上；
+ * 抽到 shared 之后两个入口共用同一套"逐个下、汇总报"的判据。
  */
-const downloadOperationArtifacts = async (operation: OperationDetail) => {
-  const runIds = operation.runs.map((run) => run.runId).filter((runId) => runId > 0)
-  let artifactIds: number[] = []
-  try {
-    const pages = await Promise.all(runIds.map((runId) => v2.listArtifacts(runId)))
-    artifactIds = pages.flatMap((page) => page.items).map((item) => item.artifactId)
-  } catch (error) {
-    appStore.showNotification(
-      'error',
-      t('task.downloadFailedDetail', {
-        message: error instanceof Error ? error.message : t('task.downloadFailed')
-      })
-    )
-    return
-  }
-  if (!artifactIds.length) {
-    appStore.showNotification('info', t('task.downloadNothing'))
-    return
-  }
-  appStore.showNotification('info', t('task.downloadingMany', { count: artifactIds.length }))
-  let done = 0
-  let directory = ''
-  let firstError = ''
-  for (const artifactId of artifactIds) {
-    try {
-      const saved = await v2.saveArtifact(artifactId)
-      done += 1
-      if (!directory) directory = saved.directory
-    } catch (error) {
-      if (!firstError) {
-        firstError = error instanceof Error ? error.message : t('task.downloadFailed')
-      }
-    }
-  }
-  const failed = artifactIds.length - done
-  if (!failed) {
-    appStore.showNotification(
-      'success',
-      t('task.downloadedMany', { count: done, path: directory }),
-      {
-        label: t('task.showInFolder'),
-        run: () => void v2.openDownloadDir().catch(() => undefined)
-      }
-    )
-    return
-  }
-  appStore.showNotification(
-    done > 0 ? 'warning' : 'error',
-    t('task.downloadPartial', { done, failed, message: firstError })
-  )
-}
+const downloadOperationArtifacts = (operation: OperationDetail) =>
+  downloadAllArtifacts(operation.runs.map((run) => run.runId))
 /**
  * 下载一个产物。
  *
@@ -687,8 +635,12 @@ const refresh = async () => {
   if (isRefreshing.value) return
   isRefreshing.value = true
   const succeeded = await workspace.loadOperationSummaries(200)
-  if (succeeded) lastRefreshedAt.value = new Date()
-  scanCompletions()
+  if (succeeded) {
+    lastRefreshedAt.value = new Date()
+    // 只在**真的读到了列表**之后才扫描：首次加载失败时列表是空的，若此时就建立基线，
+    // 等下次成功加载会把所有历史终态当成"刚完成"，一次弹一堆通知。
+    scanCompletions()
+  }
   isRefreshing.value = false
 }
 
@@ -805,9 +757,19 @@ const cancelOperation = async (operation: OperationDetail) => {
 }
 
 // ---- 完成通知 + 未读角标 ----
-const viewedAt = ref(Date.now())
+/**
+ * 已经"结过账"的 operation：第一次扫描时就已经是终态的（历史，不补提醒），
+ * 或者这一轮已经计过未读 / 发过通知的。
+ *
+ * ⚠️ 判据必须是**状态迁移**（上次还在跑 → 这次终态），不能是 `createdAt`：
+ * 一个跑 20 分钟的任务，创建时间早于"上次打开面板"的时刻，于是它完成时既不计未读、
+ * 也不弹通知——而它恰恰是最需要提醒的那一类。`createdAt` 回答的是"什么时候开始的"，
+ * 这里问的是"什么时候结束的"，两者本来就不是一回事。
+ */
+const settledCompletions = new Set<number>()
+/** 第一次扫描只建立基线（把当时已经终态的记录当历史），避免一打开就为过去 100 个任务弹通知。 */
+let completionScanPrimed = false
 const unread = ref(0)
-const unreadMarked = ref<Set<number>>(new Set())
 const notifyCompletion = (summary: { operationId: number }) => {
   if (typeof window === 'undefined' || !('Notification' in window)) return
   if (Notification.permission !== 'granted') {
@@ -825,22 +787,21 @@ const notifyCompletion = (summary: { operationId: number }) => {
   }
 }
 const scanCompletions = () => {
+  const firstScan = !completionScanPrimed
   for (const summary of workspace.operationSummaries) {
     if (!isTerminalStatus(summary.status)) continue
-    if (viewedAt.value === 0) continue
-    if (unreadMarked.value.has(summary.operationId)) continue
-    // 在本面板上次打开之后才进入终态 → 计入未读；后台时再补系统通知。
-    if (timestampOf(summary.createdAt) >= viewedAt.value) {
-      unreadMarked.value.add(summary.operationId)
-      unread.value += 1
-      if (document.hidden) notifyCompletion(summary)
-    }
+    if (settledCompletions.has(summary.operationId)) continue
+    settledCompletions.add(summary.operationId)
+    if (firstScan) continue
+    // 窗口看不见 ⇒ 补一条系统通知；面板关着 ⇒ 记一枚未读角标。
+    // 两个条件独立：通知被拒 / 被系统静音时，角标仍然是唯一的线索。
+    if (document.hidden) notifyCompletion(summary)
+    if (!taskCenter.isOpen) unread.value += 1
   }
+  completionScanPrimed = true
 }
 const markViewed = () => {
-  viewedAt.value = Date.now()
   unread.value = 0
-  unreadMarked.value = new Set()
 }
 
 const retryOperation = async (operation: OperationDetail) => {
@@ -1017,8 +978,11 @@ const closeOnMobile = () => {
 
 onMounted(async () => {
   const succeeded = await workspace.loadOperationSummaries(200)
-  if (succeeded) lastRefreshedAt.value = new Date()
-  scanCompletions()
+  if (succeeded) {
+    lastRefreshedAt.value = new Date()
+    // 同上：只有真读到列表才建立"历史基线"。
+    scanCompletions()
+  }
   refreshTimer = window.setInterval(() => {
     void refresh()
   }, 5000)

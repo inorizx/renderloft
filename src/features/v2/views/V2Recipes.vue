@@ -40,7 +40,7 @@ import {
   Upload
 } from '@lucide/vue'
 
-const { t, dateLocale } = useLocale()
+const { t, dateLocale, locale } = useLocale()
 const route = useRoute()
 const router = useRouter()
 const workspace = useV2WorkspaceStore()
@@ -109,7 +109,8 @@ const filteredRecipes = computed(() => {
           .includes(term)
     )
   return [...list].sort((a, b) => {
-    if (sortBy.value === 'name') return a.name.localeCompare(b.name, 'zh')
+    // 按名字排序用**当前界面语言**的排序规则：写死 'zh' 会让英文界面按拼音排。
+    if (sortBy.value === 'name') return a.name.localeCompare(b.name, locale.value)
     const added = (value: V2Recipe) => value.createdAt ?? value.lastOpenedAt ?? ''
     if (sortBy.value === 'added') return added(b).localeCompare(added(a))
     const recent = (value: V2Recipe) => value.lastOpenedAt ?? value.createdAt ?? ''
@@ -165,6 +166,19 @@ const editForm = reactive({
 })
 const editLoadingFields = ref(false)
 /**
+ * 字段 schema **真的加载成功过**吗？
+ *
+ * 为什么需要它：保存时 `fieldLabels` 是**整体替换**语义（传 `{}` 即清空全部备注，
+ * 见 `workspace.ts` 的注释）。而 schema 拉取失败时字段列表是空的——"空列表"在这里
+ * 有两种完全不同的含义（"这个应用没有字段" vs "我们没读到字段"）。分不清就直接提交，
+ * 会**静默清空用户写过的全部备注名**，而那正是这个产品最贵的那份数据。
+ *
+ * 所以：没加载成功 ⇒ 保存时不带 `fieldLabels`（只改备注/分组），并在对话框里说清
+ * 为什么列表是空的。
+ */
+const editFieldsLoaded = ref(false)
+const editFieldsError = ref('')
+/**
  * 这次编辑是**刚导入完自动打开的**（而不是用户点「编辑」）。
  *
  * 为什么要自动打开：导入进来的字段名往往就是键本身——AI 应用的 `description` 实测就等于字段名
@@ -179,6 +193,8 @@ const openEdit = async (recipe: V2Recipe, afterImport = false) => {
   editForm.note = recipe.note ?? ''
   editForm.group = recipe.group ?? ''
   editForm.fields = []
+  editFieldsLoaded.value = false
+  editFieldsError.value = ''
   editLoadingFields.value = true
   try {
     const schema = await workspace.fetchRecipeSchema(recipe.recipeId)
@@ -190,9 +206,13 @@ const openEdit = async (recipe: V2Recipe, afterImport = false) => {
       options: '',
       source: String(schema.properties?.[key]?.['x-widget-source'] ?? '')
     }))
-  } catch {
-    // 取不到 schema 不该挡住"改备注/分组"这件本来就能做的事。
+    editFieldsLoaded.value = true
+  } catch (caught) {
+    // 取不到 schema 不该挡住"改备注/分组"这件本来就能做的事——但**绝不能**让保存
+    // 顺手把备注名清空（见 `editFieldsLoaded`）。这里把原因说出来，别让用户以为
+    // "这个应用没有字段"。
     editForm.fields = []
+    editFieldsError.value = caught instanceof Error ? caught.message : String(caught)
   } finally {
     editLoadingFields.value = false
   }
@@ -230,7 +250,9 @@ const saveEdit = async () => {
   await workspace.updateRecipe(editingRecipe.value.recipeId, {
     note: editForm.note.trim() || undefined,
     group: editForm.group.trim() || undefined,
-    fieldLabels,
+    // ⚠️ 只有**真的读到过字段**才提交备注名：`fieldLabels` 是整体替换，
+    // schema 拉取失败时提交 `{}` 会把用户写过的全部备注清空（见 `editFieldsLoaded`）。
+    ...(editFieldsLoaded.value ? { fieldLabels } : {}),
     ...(fieldWidgets.length ? { fieldWidgets } : {})
   })
   closeEdit()
@@ -1715,6 +1737,9 @@ const onLibraryFileChange = async (event: Event) => {
           </p>
           <p v-if="editLoadingFields" class="text-xs text-muted-foreground">
             {{ t('common.loading') }}
+          </p>
+          <p v-else-if="editFieldsError" class="text-xs text-destructive">
+            {{ t('library.formFieldLabelsLoadFailed', { message: editFieldsError }) }}
           </p>
           <p v-else-if="!editForm.fields.length" class="text-xs text-muted-foreground">
             {{ t('library.formFieldLabelsEmpty') }}

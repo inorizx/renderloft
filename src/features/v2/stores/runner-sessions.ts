@@ -26,6 +26,13 @@ export interface RunnerBatchRow {
   values: Record<string, unknown>
   files: Record<string, RunnerFileRef>
   /**
+   * 被用户**显式移除**的文件槽位（详见 `V2Runner.vue` 的 `BatchRow.clearedFiles`）。
+   *
+   * 必须跟着草稿一起存：否则关掉应用再打开，"这一行明确不要那张统一图片"会退化成
+   * "这一行没覆盖"，提交时统一图片又回来了——付费行为，不能靠运气。
+   */
+  clearedFiles?: string[]
+  /**
    * 这一条自己的名字（可选，进产物文件名）。
    *
    * **只在内存里**（见 `PersistedDraft` 的说明）：它在提交时就是 `clientRunId`，
@@ -59,7 +66,7 @@ interface PersistedDraft {
    * * `clientRunId` 参与**幂等**（见 `clients/verbs.rs`：调用方给了就用它）——
    *   把一个上一轮的 id 带回来，最坏的结果是服务端**去重**、于是"点了生成却什么都没发生"。
    */
-  batchRows: Array<Pick<RunnerBatchRow, 'id' | 'values' | 'files'>>
+  batchRows: Array<Pick<RunnerBatchRow, 'id' | 'values' | 'files' | 'clearedFiles'>>
 }
 
 const DRAFT_STORAGE_KEY = 'renderloft-runner-drafts'
@@ -92,7 +99,8 @@ const draftOf = (session: RunnerSession): PersistedDraft => ({
   batchRows: (session.batchRows ?? []).map((row) => ({
     id: row.id,
     values: row.values,
-    files: row.files
+    files: row.files,
+    clearedFiles: [...(row.clearedFiles ?? [])]
   }))
 })
 
@@ -164,7 +172,8 @@ export const useRunnerSessionsStore = defineStore('runner-sessions', () => {
       batchRows: (draft?.batchRows ?? []).map((row) => ({
         id: row.id,
         values: { ...row.values },
-        files: { ...row.files }
+        files: { ...row.files },
+        clearedFiles: [...(row.clearedFiles ?? [])]
       }))
     }
     tabs.value.push(tab)
@@ -190,7 +199,8 @@ export const useRunnerSessionsStore = defineStore('runner-sessions', () => {
       tab.batchRows = patch.batchRows.map((row) => ({
         ...row,
         values: { ...row.values },
-        files: { ...row.files }
+        files: { ...row.files },
+        clearedFiles: [...(row.clearedFiles ?? [])]
       }))
     remember(tab)
   }

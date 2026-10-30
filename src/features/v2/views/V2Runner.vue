@@ -128,6 +128,15 @@ interface BatchRow {
   values: Record<string, unknown>
   files: Record<string, { assetId: number; checksum: string; filename: string }>
   /**
+   * 这一行被**显式清空**的文件槽位（点过「移除」）。
+   *
+   * 为什么不能只删 `files[key]`：`files` 是"这一行的覆盖值"，**键缺席 = 用统一参数**。
+   * 而「移除」的意思是"这一行没有这张图"——两件事混在一起，提交时就会把统一参数里的
+   * 图片悄悄塞回这一行：界面显示"选择"（没图），实际带着另一张图去花钱。
+   * 显式记下"清空过"，提交时才分得清"没覆盖"与"不要"。
+   */
+  clearedFiles?: string[]
+  /**
    * 这一条**自己的名字**（可选）。留空就用「前缀-序号」。
    *
    * 为什么要逐条：一批 20 张里常常是"同一批货的不同角度/不同款式"，下游按 `SKU135-正面`、
@@ -163,6 +172,12 @@ const showClearDraftDialog = ref(false)
 /** 「单独填写的格子是空的」提交前确认弹窗。 */
 const showBlankCellsDialog = ref(false)
 const blankCells = ref<Array<{ label: string; rows: number[] }>>([])
+/** 空着的**图片位**（单条与批量都算）：媒体字段不再强制，空着提交会白花一次钱。 */
+const emptyMedia = ref<Array<{ label: string; rows: number[] }>>([])
+/** 「这批已经提交过」的整批重投确认（不确认就再点一次 = 全部重新生成、再计费一轮）。 */
+const showResubmitDialog = ref(false)
+const resubmitSummary = ref({ total: 0, done: 0 })
+let resubmitConfirmed = false
 /** 用户在弹窗里点过"仍要提交"后放行一次；每次提交前重新问（非响应式，进 run() 即消费）。 */
 let blankCellsConfirmed = false
 let rowSeq = 1
@@ -278,6 +293,9 @@ const toggleVariableField = (key: string) => {
     for (const row of batchRows.value) {
       delete row.values[key]
       delete row.files[key]
+      if (row.clearedFiles?.length) {
+        row.clearedFiles = row.clearedFiles.filter((item) => item !== key)
+      }
     }
     return
   }
@@ -316,7 +334,8 @@ const duplicateBatchRow = (row: BatchRow) => {
   const copy: BatchRow = {
     id: nextRowId(),
     values: { ...row.values },
-    files: { ...row.files }
+    files: { ...row.files },
+    clearedFiles: [...(row.clearedFiles ?? [])]
   }
   batchRows.value = [
     ...batchRows.value.slice(0, index + 1),
@@ -543,6 +562,8 @@ const onRowFileSelected = async (row: BatchRow, key: string, file: File | null) 
   uploadError.value = ''
   try {
     row.files = { ...row.files, [key]: await uploadAssetFile(file) }
+    // 重新选了文件 ⇒ 这条"清空"记录作废，之后按这一行的文件提交。
+    row.clearedFiles = (row.clearedFiles ?? []).filter((item) => item !== key)
     row.values[key] = file.name
   } catch (caught) {
     uploadError.value = caught instanceof Error ? caught.message : String(caught)
@@ -555,6 +576,10 @@ const clearRowFile = (row: BatchRow, key: string) => {
   const next = { ...row.files }
   delete next[key]
   row.files = next
+  // 显式记下"这一行不要这张图"：否则提交时会回落到统一参数里的那张（见 `clearedFiles`）。
+  if (!row.clearedFiles?.includes(key)) {
+    row.clearedFiles = [...(row.clearedFiles ?? []), key]
+  }
   delete row.values[key]
 }
 
@@ -581,7 +606,8 @@ onMounted(async () => {
     batchRows.value = (session.batchRows ?? []).map((row) => ({
       ...row,
       values: { ...row.values },
-      files: { ...row.files }
+      files: { ...row.files },
+      clearedFiles: [...(row.clearedFiles ?? [])]
     }))
     for (const row of batchRows.value) rowSeq = Math.max(rowSeq, row.id + 1)
     if (batchMode.value === 'batch') ensureBatchRows()
@@ -593,7 +619,10 @@ onMounted(async () => {
       else if (field.type === 'boolean') values[field.key] = false
       else if (field.enum?.length) values[field.key] = field.enum[0]
     }
-    runnerSessions.open(String(route.params.id), recipe.value?.name ?? `Recipe #${recipeId}`)
+    runnerSessions.open(
+      String(route.params.id),
+      recipe.value?.name ?? t('runner.recipeFallback', { id: recipeId })
+    )
   } catch (caught) {
     recipeLoadFailed.value = true
     submitError.value = caught instanceof Error ? caught.message : String(caught)
@@ -690,6 +719,56 @@ const confirmBlankCellsAndRun = () => {
   void run()
 }
 
+/** 「这批已经提交过」弹窗里点确认：同样是一次性放行。 */
+const confirmResubmitAndRun = () => {
+  showResubmitDialog.value = false
+  resubmitConfirmed = true
+  void run()
+}
+
+/**
+ * 这一行最终会用哪个文件（提交与"空位检查"共用同一处判据）。
+ *
+ * 顺序：行里点过「移除」⇒ 明确没有；否则行覆盖值优先；再否则统一参数。
+ */
+const assetRefForRow = (row: BatchRow, key: string) => {
+  if (row.clearedFiles?.includes(key)) return undefined
+  return row.files[key] ?? fileRefs.value[key]
+}
+
+/**
+ * 这次提交里**空着**的图片位。
+ *
+ * 为什么要问：媒体字段现在**永不 required**（空图可能是"工作流自带固定图"或"这个节点
+ * 没被用到"，见 `recipe_import.rs`），硬拦会把人卡在表单前；但一声不响地提交，平台
+ * 可能受理后失败、或用了它自带的默认图——两种都照常计费。所以不拦，只问一句。
+ *
+ * 单条模式没有"第几行"，`rows` 给空数组，模板只显示字段名。
+ */
+const emptyMediaSlots = () => {
+  const fileFields = fields.value.filter((field) => field.format === 'file')
+  if (!fileFields.length) return []
+  const rows: Array<{ index: number; row: BatchRow }> =
+    batchMode.value === 'batch'
+      ? batchRows.value.map((row, index) => ({ index: index + 1, row }))
+      : [{ index: 0, row: { id: 0, values: {}, files: {} } }]
+  const blanks: Array<{ label: string; rows: number[] }> = []
+  for (const field of fileFields) {
+    const emptyRows = rows.filter(({ row }) => !assetRefForRow(row, field.key))
+    if (!emptyRows.length) continue
+    blanks.push({
+      label: field.description || field.key,
+      rows: batchMode.value === 'batch' ? emptyRows.map(({ index }) => index) : []
+    })
+  }
+  return blanks
+}
+/** 弹窗标题按"到底是哪类空"来说，而不是永远说"格子空着"。 */
+const preSubmitTitle = computed(() => {
+  if (blankCells.value.length && emptyMedia.value.length) return t('runner.preSubmitTitle')
+  return emptyMedia.value.length ? t('runner.emptyMediaTitle') : t('runner.blankCellsTitle')
+})
+
 const run = async () => {
   // 双击/重复点击时 disabled 还没渲染生效，这里同步挡一次重复提交。
   if (submitting.value) return
@@ -698,6 +777,8 @@ const run = async () => {
   // 消费掉"已确认空值"这一次放行：改完再提交要重新问。
   const blankConfirmed = blankCellsConfirmed
   blankCellsConfirmed = false
+  const resubmitOk = resubmitConfirmed
+  resubmitConfirmed = false
   try {
     const revisionId = schema.value.revisionId
     if (!revisionId) throw new Error(t('runner.revisionExpired'))
@@ -735,12 +816,29 @@ const run = async () => {
       }
     }
 
-    // 硬校验都过了，再确认一次"空的单独填写项"：这类格子没有统一值兜底，
-    // 空着就会按空值提交——花的是真钱，值得多问一句。
-    if (batchMode.value === 'batch' && !blankConfirmed) {
-      const blanks = blankVariableCells()
-      if (blanks.length) {
+    // 这批里已经有提交过的行 ⇒ 再点一次会把**它们也重新提交**（每行都是新 operation，
+    // 会再计费一次）。先问清楚：这不是"重跑失败的几条"，是"整批重投"。
+    if (batchMode.value === 'batch' && !resubmitOk) {
+      const submitted = batchRows.value.filter((row) => row.clientRunId)
+      if (submitted.length) {
+        resubmitSummary.value = {
+          total: submitted.length,
+          done: submitted.filter((row) => row.status === 'succeeded').length
+        }
+        showResubmitDialog.value = true
+        return
+      }
+    }
+
+    // 硬校验都过了，再确认一次"会花钱但可能白花"的两类空：
+    // ① 批量里单独填写、又没有统一值兜底的格子；② 任何模式的空图片位（媒体字段不再 required）。
+    // 两者都只问一句、不拦——拦了会把人卡在表单前，而空着提交平台照样计费。
+    if (!blankConfirmed) {
+      const blanks = batchMode.value === 'batch' ? blankVariableCells() : []
+      const media = emptyMediaSlots()
+      if (blanks.length || media.length) {
         blankCells.value = blanks
+        emptyMedia.value = media
         showBlankCellsDialog.value = true
         return
       }
@@ -773,7 +871,9 @@ const run = async () => {
       // 槽位是合法的——不必从第一个文件字段开始连续填）。
       const assets: Record<string, { assetId: number; checksum: string }> = {}
       for (const field of fileFields) {
-        const ref = row.files[field.key] ?? fileRefs.value[field.key]
+        // 行里点过「移除」= 这一行**明确不要**这张图，不能回落到统一参数；
+        // 只有"从没覆盖过"才继承统一值（见 `assetRefForRow` / `BatchRow.clearedFiles`）。
+        const ref = assetRefForRow(row, field.key)
         if (ref) assets[field.key] = { assetId: ref.assetId, checksum: ref.checksum }
       }
       return {
@@ -840,7 +940,9 @@ const goEditFields = () => {
       <Button variant="ghost" size="sm" @click="goBackToLibrary">{{
         t('runner.backToLibrary')
       }}</Button>
-      <h1 class="text-xl font-semibold">{{ recipe?.name ?? `Recipe #${recipeId}` }}</h1>
+      <h1 class="text-xl font-semibold">
+        {{ recipe?.name ?? t('runner.recipeFallback', { id: recipeId }) }}
+      </h1>
     </header>
 
     <EmptyState
@@ -1304,14 +1406,14 @@ const goEditFields = () => {
 
     <Dialog
       :open="showBlankCellsDialog"
-      :title="t('runner.blankCellsTitle')"
+      :title="preSubmitTitle"
       class="max-w-sm"
       @update:open="showBlankCellsDialog = $event"
     >
-      <p class="text-sm leading-6 text-muted-foreground">
+      <p v-if="blankCells.length" class="text-sm leading-6 text-muted-foreground">
         {{ t('runner.blankCellsDescription') }}
       </p>
-      <ul class="mt-3 space-y-1 text-sm">
+      <ul v-if="blankCells.length" class="mt-3 space-y-1 text-sm">
         <li v-for="item in blankCells" :key="item.label">
           {{
             t('runner.blankCellsItem', {
@@ -1321,12 +1423,55 @@ const goEditFields = () => {
           }}
         </li>
       </ul>
+      <p
+        v-if="emptyMedia.length"
+        class="text-sm leading-6 text-muted-foreground"
+        :class="{ 'mt-3': blankCells.length }"
+      >
+        {{ t('runner.emptyMediaDescription') }}
+      </p>
+      <ul v-if="emptyMedia.length" class="mt-2 space-y-1 text-sm">
+        <li v-for="item in emptyMedia" :key="item.label">
+          {{
+            item.rows.length
+              ? t('runner.blankCellsItem', {
+                  field: item.label,
+                  rows: item.rows.join(t('common.listSeparator'))
+                })
+              : item.label
+          }}
+        </li>
+      </ul>
       <template #footer>
         <Button type="button" variant="outline" @click="showBlankCellsDialog = false">{{
           t('common.cancel')
         }}</Button>
         <Button type="button" variant="outline" @click="confirmBlankCellsAndRun">{{
           t('runner.blankCellsConfirm')
+        }}</Button>
+      </template>
+    </Dialog>
+
+    <Dialog
+      :open="showResubmitDialog"
+      :title="t('runner.resubmitTitle')"
+      class="max-w-sm"
+      @update:open="showResubmitDialog = $event"
+    >
+      <p class="text-sm leading-6 text-muted-foreground">
+        {{
+          t('runner.resubmitDescription', {
+            total: resubmitSummary.total,
+            done: resubmitSummary.done
+          })
+        }}
+      </p>
+      <template #footer>
+        <Button type="button" variant="outline" @click="showResubmitDialog = false">{{
+          t('common.cancel')
+        }}</Button>
+        <Button type="button" variant="outline" @click="confirmResubmitAndRun">{{
+          t('runner.resubmitConfirm')
         }}</Button>
       </template>
     </Dialog>
