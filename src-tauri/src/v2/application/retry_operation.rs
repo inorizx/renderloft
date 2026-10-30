@@ -7,6 +7,7 @@ use crate::v2::domain::actor::ActorRef;
 use crate::v2::domain::errors::{DomainResult, SafeError};
 use crate::v2::domain::ids::IdempotencyKey;
 use crate::v2::domain::model::Timestamp;
+use crate::v2::domain::operation::RunStatus;
 use crate::v2::ports::repositories::OperationRepository;
 
 use super::create_operation::{CreateOperation, CreateOperationRequest, RunRequest};
@@ -60,6 +61,34 @@ impl RetryOperation {
         if selected_runs.is_empty() {
             return Err(SafeError::not_found("RUN_NOT_FOUND", "Run 不存在"));
         }
+        // 只有**已经停下**的 run 才谈得上重试：对正在跑的 run 调 retry，等于在平台上
+        // 再开一份、再扣一次钱，而原来那份还在跑——这不是"重试"，是"重复提交"。
+        //
+        // `SUBMISSION_UNCERTAIN` **不在此列**：它没有确定的结果，文档把它作为"放弃重来"
+        // 的出口（用户明确要求，才会接受"可能再付一次"）。
+        let in_flight = selected_runs
+            .iter()
+            .filter(|run| is_in_flight(run.status))
+            .map(|run| {
+                format!(
+                    "{}（{}）",
+                    run.display_label()
+                        .map(str::to_string)
+                        .unwrap_or_else(|| format!("run-{}", run.id.0)),
+                    run.status.as_str()
+                )
+            })
+            .collect::<Vec<_>>();
+        if !in_flight.is_empty() {
+            return Err(SafeError::conflict(
+                "RETRY_SOURCE_IN_FLIGHT",
+                format!(
+                    "任务还在进行中：{}。等它结束，或先取消再重试——现在重试会在平台上\
+                     再开一份、再计费一次。",
+                    in_flight.join("、")
+                ),
+            ));
+        }
         let suffix = Timestamp::now_millis();
         let runs = selected_runs
             .iter()
@@ -96,6 +125,22 @@ impl RetryOperation {
     }
 }
 
+/// 还在本地队列或平台上的 run：重试它就是重复提交。
+///
+/// `SUBMISSION_UNCERTAIN` 刻意**不**在此列：它的语义是"平台收没收到不知道"，
+/// 而不是"确定还在跑"；文档把 `operation retry` 写作这条路的出口（放弃重来）。
+fn is_in_flight(status: RunStatus) -> bool {
+    matches!(
+        status,
+        RunStatus::Queued
+            | RunStatus::Preparing
+            | RunStatus::Submitting
+            | RunStatus::Accepted
+            | RunStatus::Running
+            | RunStatus::RetryWait
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -108,7 +153,7 @@ mod tests {
         Connection, ConnectionOverride, ConnectionRevision, LifecycleFeatures, Recipe,
         RecipeBinding, RecipeRevision, RecipeSource, RecipeVisibility, Timestamp,
     };
-    use crate::v2::domain::operation::{Operation, OperationStatus};
+    use crate::v2::domain::operation::{Operation, OperationStatus, Transition};
     use crate::v2::infrastructure::fakes::{InMemoryRepositories, PermitAllAuthorizationPolicy};
     use crate::v2::infrastructure::schema::BasicSchemaValidator;
     use crate::v2::ports::repositories::{NewOperation, NewRun, OperationRepository};
@@ -179,7 +224,10 @@ mod tests {
         repositories.seed_recipe(recipe, vec![revision]);
     }
 
-    async fn seed_failed_operation(operations: &Arc<dyn OperationRepository>) -> OperationId {
+    async fn seed_operation(
+        operations: &Arc<dyn OperationRepository>,
+        status: OperationStatus,
+    ) -> OperationId {
         let now = Timestamp::now();
         let mut inputs = BTreeMap::new();
         inputs.insert("prompt".to_string(), Value::String("hello".to_string()));
@@ -195,7 +243,7 @@ mod tests {
             origin: "test".to_string(),
             idempotency_key: IdempotencyKey("orig-key".to_string()),
             request_hash: "h".to_string(),
-            status: OperationStatus::Failed,
+            status,
             metadata: Default::default(),
             callback: None,
             created_at: now.clone(),
@@ -215,6 +263,31 @@ mod tests {
             .await
             .expect("seed 应成功");
         persisted.operation.id
+    }
+
+    /// 真实的"失败任务"：operation 与 run **都**是终态。
+    ///
+    /// `NewRun` 默认从 `Queued` 开始，所以只把 operation 标成 FAILED 会造出一个现实里
+    /// 不存在的组合（任务失败、run 还在排队）；而"能不能重试"的判据看的是 run，
+    /// 那条假数据会让测试比生产宽松。
+    async fn seed_failed_operation(operations: &Arc<dyn OperationRepository>) -> OperationId {
+        let id = seed_operation(operations, OperationStatus::Failed).await;
+        let persisted = operations
+            .find_operation(id)
+            .await
+            .expect("读取应成功")
+            .expect("刚建的操作应存在");
+        for transition in [
+            Transition::ToPreparing,
+            Transition::ToSubmitting,
+            Transition::ToFailed,
+        ] {
+            operations
+                .transition_run(persisted.runs[0].id, transition, vec![])
+                .await
+                .expect("seed 应把 run 推到失败");
+        }
+        id
     }
 
     #[tokio::test]
@@ -253,6 +326,63 @@ mod tests {
         assert_eq!(
             created.runs[0].inputs.get("prompt"),
             Some(&Value::String("hello".to_string()))
+        );
+    }
+
+    /// 对**还在跑**的 run 调 retry 必须被拒：否则平台上会多一份、钱多扣一次，
+    /// 而原来那份还在跑。判据是错误码，不是"不报错"——调用方要能分辨原因。
+    #[tokio::test]
+    async fn retry_refuses_a_run_that_is_still_in_flight() {
+        let repos = InMemoryRepositories::default();
+        seed_environment(&repos);
+        let operations: Arc<dyn OperationRepository> = Arc::new(repos.clone());
+        let source_id = seed_operation(&operations, OperationStatus::Queued).await;
+        let created = operations
+            .find_operation(source_id)
+            .await
+            .expect("读取应成功")
+            .expect("刚建的操作应存在");
+        let run_id = created.runs[0].id;
+        // Queued → Preparing → Submitting：模拟 scheduler 已经领走、正在提交
+        operations
+            .transition_run(run_id, Transition::ToPreparing, vec![])
+            .await
+            .expect("Queued → Preparing 应合法");
+        operations
+            .transition_run(run_id, Transition::ToSubmitting, vec![])
+            .await
+            .expect("Preparing → Submitting 应合法");
+
+        let create = Arc::new(CreateOperation::new(
+            Repositories {
+                recipes: Box::new(repos.clone()),
+                connections: Box::new(repos.clone()),
+                operations: Box::new(operations.clone()),
+                assets: Box::new(repos.clone()),
+            },
+            Box::new(PermitAllAuthorizationPolicy),
+            Box::new(BasicSchemaValidator),
+        ));
+        let retry = RetryOperation {
+            create,
+            repositories: operations.clone(),
+        };
+        let actor = ActorRef {
+            id: "test".to_string(),
+            kind: ActorKind::Cli,
+            client_id: ClientId("test".to_string()),
+            scopes: vec![Scope::OperationsExecute],
+            label: None,
+        };
+        let error = retry
+            .execute(actor, source_id, "test")
+            .await
+            .expect_err("在跑的 run 不许重试");
+        assert_eq!(error.code, "RETRY_SOURCE_IN_FLIGHT");
+        assert!(
+            error.message.contains("SUBMITTING"),
+            "错误里要指出是哪条 run、什么状态：{}",
+            error.message
         );
     }
 }

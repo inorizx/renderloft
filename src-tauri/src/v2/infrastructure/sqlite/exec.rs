@@ -1647,10 +1647,20 @@ impl OperationRepository for SqliteRepositories {
         let connection = self.connection.lock().unwrap_or_else(|e| e.into_inner());
         let mut statement = connection
             .prepare(
-                "SELECT id FROM v2_operations
-                 WHERE status IN ('QUEUED', 'RUNNING')
-                   AND updated_at < ?1
-                 ORDER BY updated_at ASC LIMIT ?2",
+                // ⚠️ 判据是"**没有任何东西在动**"，不是"operation 行很久没被写"。
+                //
+                // `v2_operations.updated_at` 只在状态迁移时刷新；而对账/轮询每轮只写
+                // `v2_runs`（`set_tracking`）。配了 > 6 小时对账死线的长任务因此会长得像
+                // "陈旧的孤儿"，被卫生清扫整体判失败——而平台那边还在跑并计费。
+                // 只要还有 run 在最近一个窗口内动过，这个 operation 就不算陈旧。
+                "SELECT o.id FROM v2_operations o
+                 WHERE o.status IN ('QUEUED', 'RUNNING')
+                   AND o.updated_at < ?1
+                   AND NOT EXISTS (
+                       SELECT 1 FROM v2_runs r
+                       WHERE r.operation_id = o.id AND r.updated_at >= ?1
+                   )
+                 ORDER BY o.updated_at ASC LIMIT ?2",
             )
             .map_err(|_| SafeError::storage("无法读取陈旧 Operations"))?;
         let rows = statement

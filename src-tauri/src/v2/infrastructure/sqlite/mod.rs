@@ -2356,6 +2356,86 @@ mod tests {
         assert_eq!(deliverer.delivered_count(), 1, "补扫必须幂等");
     }
 
+    /// **长任务不该被卫生清扫误杀**：`v2_operations.updated_at` 只在状态迁移时刷新，
+    /// 而 reconcile 每轮只写 `v2_runs`（`set_tracking`）。配了 > 6 小时对账死线的任务
+    /// 因此会长得像"没人管的孤儿"，被整体判失败——而平台那边还在跑、还在计费。
+    ///
+    /// 判据：run 还在动 ⇒ 不算陈旧；run 也一起停了 ⇒ 才算。
+    /// 负对照：把 `list_stale_operations` 里的 `NOT EXISTS` 去掉 ⇒ 前半段红。
+    #[tokio::test]
+    async fn a_long_running_operation_stays_fresh_while_its_run_is_polled() {
+        use crate::v2::ports::repositories::OperationRepository;
+
+        let repositories = Arc::new(SqliteRepositories::in_memory().unwrap());
+        {
+            let connection = repositories
+                .connection
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            seed_recipe(&connection);
+            seed_connection(&connection);
+        }
+        let persisted = repositories
+            .create_operation(new_operation(actor()))
+            .await
+            .expect("创建应成功");
+        let operation_id = persisted.operation.id;
+        let run_id = persisted.runs[0].id;
+
+        let now = Timestamp::now_millis();
+        let stale_at = (now - 7 * 60 * 60 * 1000) as i64;
+        let cutoff = Timestamp::from_millis(now - 6 * 60 * 60 * 1000);
+        {
+            let connection = repositories
+                .connection
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            connection
+                .execute(
+                    "UPDATE v2_operations SET updated_at = ?1 WHERE id = ?2",
+                    params![stale_at, operation_id.0],
+                )
+                .expect("改 operation 时间应成功");
+            // run 1 分钟前刚被轮询过（reconcile 一直在动）
+            connection
+                .execute(
+                    "UPDATE v2_runs SET updated_at = ?1 WHERE id = ?2",
+                    params![(now - 60_000) as i64, run_id.0],
+                )
+                .expect("改 run 时间应成功");
+        }
+        assert!(
+            repositories
+                .list_stale_operations(cutoff.clone(), 10)
+                .await
+                .expect("查询应成功")
+                .is_empty(),
+            "run 还在被轮询，operation 就**不算**陈旧（否则 8 小时的长任务会被 6 小时兜底误杀）"
+        );
+
+        // 负对照的另一半：run 也停了 7 小时 ⇒ 真正的孤儿，必须被选中。
+        {
+            let connection = repositories
+                .connection
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            connection
+                .execute(
+                    "UPDATE v2_runs SET updated_at = ?1 WHERE id = ?2",
+                    params![stale_at, run_id.0],
+                )
+                .expect("改 run 时间应成功");
+        }
+        assert_eq!(
+            repositories
+                .list_stale_operations(cutoff, 10)
+                .await
+                .expect("查询应成功"),
+            vec![operation_id],
+            "没人动过的操作才是陈旧"
+        );
+    }
+
     #[tokio::test]
     async fn callback_delivery_persists_and_mark_attempts() {
         let repositories = SqliteRepositories::in_memory().unwrap();

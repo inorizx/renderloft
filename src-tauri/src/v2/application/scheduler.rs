@@ -411,11 +411,23 @@ impl SchedulerService {
         };
         let mut resolved_assets = Vec::with_capacity(claimed.run.assets.len());
         for asset_ref in &claimed.run.assets {
-            let bytes = self
-                .assets
-                .read_bytes(asset_ref.asset_id)
-                .await?
-                .unwrap_or_default();
+            let Some(bytes) = self.assets.read_bytes(asset_ref.asset_id).await? else {
+                // 资产行在、字节没了（库被换回更旧的快照 / 手工修库 / 将来的清理路径）。
+                // **绝不能拿空字节去调上游**：那会花钱跑一次，产出用的是空文件。
+                // 与创建期的资产校验同一条判据——在花钱之前报稳定错误码，并把 run 判死；
+                // 走 `resolve_submit_error` 而不是直接冒泡：直接冒泡会让 run 留在
+                // SUBMITTING 等对账，用户看到的是"卡住"而不是"素材没了"。
+                let error = SafeError::validation(
+                    "ASSET_BYTES_MISSING",
+                    format!(
+                        "资产 #{}（字段键 `{}`）的字节不存在。重新上传这份素材再运行。",
+                        asset_ref.asset_id.0,
+                        asset_ref.field_key.as_deref().unwrap_or("(按位置)")
+                    ),
+                );
+                self.resolve_submit_error(claimed, &error).await?;
+                return Ok(error_outcome(&error, false));
+            };
             resolved_assets.push(crate::v2::ports::provider::ResolvedAsset {
                 asset_ref: asset_ref.clone(),
                 bytes,
@@ -2415,6 +2427,70 @@ mod tests {
         assert_eq!(
             attempt.status,
             crate::v2::domain::operation::AttemptStatus::Uncertain
+        );
+    }
+
+    /// **资产字节没了 ⇒ 在花钱之前判死**，绝不用空字节去跑一次。
+    ///
+    /// 负对照：把 `execute_claimed` 里那段改回 `read_bytes(...).unwrap_or_default()` ⇒
+    /// 这条红（驱动会收到 0 字节的素材，并且 run 会被标成成功——钱照扣）。
+    #[tokio::test]
+    async fn a_missing_asset_byte_fails_the_run_before_the_provider_is_called() {
+        use crate::v2::domain::ids::{AssetId, IdempotencyKey};
+        use crate::v2::domain::media::AssetRef;
+        use crate::v2::domain::operation::{Operation, OperationStatus};
+        use crate::v2::ports::repositories::{NewOperation, NewRun};
+
+        let repositories = InMemoryRepositories::new();
+        seed_environment(&repositories);
+        let now = Timestamp::now();
+        let persisted = repositories
+            .create_operation(NewOperation {
+                operation: Operation {
+                    id: OperationId(0),
+                    actor: actor(),
+                    origin: "mcp".to_string(),
+                    idempotency_key: IdempotencyKey("missing-bytes".to_string()),
+                    request_hash: "v1:deadbeef".to_string(),
+                    status: OperationStatus::Queued,
+                    metadata: Default::default(),
+                    callback: None,
+                    created_at: now.clone(),
+                    updated_at: now,
+                },
+                runs: vec![NewRun {
+                    recipe_revision_id: RecipeRevisionId(1),
+                    connection_revision_id: ConnectionRevisionId(1),
+                    client_run_id: "image-1".to_string(),
+                    inputs: BTreeMap::from([("prompt".to_string(), json!("a red house"))]),
+                    // 只引用、不落字节：模拟"库被换回旧快照 / 手工修库"之后资产丢了。
+                    assets: vec![
+                        AssetRef::new(AssetId(424242), "sha1-missing").with_field_key("475::image")
+                    ],
+                }],
+            })
+            .await
+            .expect("种子操作应成功");
+        let operation_id = persisted.operation.id;
+
+        let driver = driver_with(SubmitOutcome::Completed(vec![completed_artifact_draft(
+            "image.png",
+        )]));
+        let service = scheduler(repositories.clone(), driver.clone());
+        let tick = service.tick().await.expect("tick 应成功");
+        assert_eq!(tick.failed, 1, "缺字节应当直接判失败：{tick:?}");
+
+        let persisted = repositories
+            .find_operation(operation_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(persisted.runs[0].status, RunStatus::Failed);
+        let error = persisted.runs[0].error.clone().expect("错误必须落库");
+        assert_eq!(error.code, "ASSET_BYTES_MISSING");
+        assert!(
+            driver.prepare_slots().is_empty(),
+            "不该走到 prepare——更不该提交，那样就是花一次钱跑空文件"
         );
     }
 }

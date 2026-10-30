@@ -5,7 +5,7 @@ use crate::v2::application::credential_reference;
 use crate::v2::domain::errors::{DomainResult, SafeError};
 use crate::v2::domain::execution::CancelOutcome;
 use crate::v2::domain::ids::{OperationId, RunId};
-use crate::v2::domain::operation::Transition;
+use crate::v2::domain::operation::{AttemptStatus, RunStatus, Transition};
 use crate::v2::ports::provider::{driver_key, CancelRequest, DriverRegistry};
 use crate::v2::ports::repositories::{ConnectionRepository, EventSpec, OperationRepository};
 
@@ -41,20 +41,20 @@ impl CancelOperation {
                 result.already_terminal.push(run.id);
                 continue;
             }
-            let handle = self
-                .repositories
-                .find_latest_attempt(run.id)
-                .await?
-                .and_then(|attempt| attempt.remote_handle);
+            let latest_attempt = self.repositories.find_latest_attempt(run.id).await?;
+            let handle = latest_attempt
+                .as_ref()
+                .and_then(|attempt| attempt.remote_handle.clone());
+            // ⚠️ 判据取**最新 attempt 的状态**，不是 `find_operation` 的快照：快照里的 run
+            // 可能还是 `QUEUED`，而 scheduler 已经把它领走、正在提交。领走时状态迁移与
+            // attempt 插入在同一个事务里（`claim_next_run`），所以 attempt 比快照新。
+            // 用旧状态会把"字节可能已经发出去"误报成"平台上没有残留"——那是最贵的一种谎。
+            let attempt_status = latest_attempt.as_ref().map(|attempt| attempt.status);
             if let Some(handle) = handle {
                 if let CancelOutcome::RemoteMayContinue = self.remote_cancel(&run, &handle).await? {
                     result.remote_may_continue.push(run.id);
                 }
-            } else if matches!(
-                run.status,
-                crate::v2::domain::operation::RunStatus::Submitting
-                    | crate::v2::domain::operation::RunStatus::SubmissionUncertain
-            ) {
+            } else if might_have_remote_residue(run.status, attempt_status) {
                 // ⚠️ **没有远端句柄 ≠ 远端没有这个任务**（2026-10-18 修）。
                 //
                 // 这两个状态的含义正是"提交发出去了但结果不明"（`SUBMITTING` 是租约还在，
@@ -146,6 +146,21 @@ pub fn cancel_response(result: &CancelResult) -> Value {
         "pending": result.pending.iter().map(|id| id.0).collect::<Vec<_>>(),
         "remoteMayContinue": result.remote_may_continue.iter().map(|id| id.0).collect::<Vec<_>>(),
     })
+}
+
+/// 没有远端句柄时，**远端可能还有一份在跑**吗？
+///
+/// 句柄只在"拿到平台回执"时才有；恰恰是 `SUBMITTING` / `SUBMISSION_UNCERTAIN`——
+/// 以及"`find_operation` 的快照还是 QUEUED、但 attempt 已经在提交"这种竞态——没有句柄。
+/// 宁可多报残留（用户会去平台确认），也不能少报：平台上那份照常跑、照常计费。
+fn might_have_remote_residue(
+    run_status: RunStatus,
+    attempt_status: Option<AttemptStatus>,
+) -> bool {
+    matches!(
+        run_status,
+        RunStatus::Submitting | RunStatus::SubmissionUncertain
+    ) || attempt_status == Some(AttemptStatus::Submitting)
 }
 
 #[cfg(test)]
@@ -629,5 +644,34 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(persisted.runs[0].status, RunStatus::Cancelled);
+    }
+
+    /// **快照过期**的那一档：`find_operation` 读到 QUEUED，但这一刻 scheduler 已经领走、
+    /// attempt 已经在提交。句柄还没有（要等平台回执），旧判据只看 run 状态 ⇒ 会告诉
+    /// 用户"平台上没有残留"，而字节可能已经发出去了。
+    ///
+    /// 判据必须是"最新 attempt 也在提交"——它是同一个事务里写的，比快照新。
+    #[test]
+    fn a_stale_queued_snapshot_with_an_in_flight_attempt_still_reports_residue() {
+        assert!(
+            might_have_remote_residue(RunStatus::Queued, Some(AttemptStatus::Submitting)),
+            "快照 QUEUED + attempt SUBMITTING ⇒ 字节可能已发出，必须报远端可能残留"
+        );
+        assert!(
+            !might_have_remote_residue(RunStatus::Queued, None),
+            "还没被领走的排队 run 不该吓唬人"
+        );
+        assert!(
+            might_have_remote_residue(RunStatus::Submitting, None),
+            "提交中一律报残留（没有句柄不代表没发出去）"
+        );
+        assert!(
+            might_have_remote_residue(RunStatus::SubmissionUncertain, None),
+            "不确定态同理"
+        );
+        assert!(
+            !might_have_remote_residue(RunStatus::RetryWait, Some(AttemptStatus::Failed)),
+            "退避等待、上一次 attempt 已失败 ⇒ 远端没有在跑的任务"
+        );
     }
 }

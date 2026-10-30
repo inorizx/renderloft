@@ -352,6 +352,7 @@ mod tests {
     use crate::v2::domain::execution::ProviderDescriptor;
     use crate::v2::domain::ids::{ConnectionId, ConnectionRevisionId, RecipeId, RecipeRevisionId};
     use crate::v2::domain::media::{MediaKind, MediaObject, MediaObjectId};
+    use crate::v2::domain::operation::Transition;
     use crate::v2::domain::model::{
         Connection, ConnectionOverride, ConnectionRevision, LifecycleFeatures, Recipe,
         RecipeBinding, RecipeRevision, RecipeSource, RecipeVisibility,
@@ -2923,6 +2924,24 @@ mod tests {
         assert_eq!(status, StatusCode::OK, "{detail}");
         let source_revision = detail["data"]["runs"][0]["recipeRevisionId"].clone();
 
+        // 真实的"重试"发生在任务停下之后：新建的操作一开始是 QUEUED，这里把源 run
+        // 推到 FAILED（与生产的失败任务同形），否则测的是"重试一个还没跑的任务"。
+        let source_run = detail["data"]["runs"][0]["runId"].as_u64().unwrap();
+        for transition in [
+            Transition::ToPreparing,
+            Transition::ToSubmitting,
+            Transition::ToFailed,
+        ] {
+            repositories
+                .transition_run(
+                    crate::v2::domain::ids::RunId(source_run),
+                    transition,
+                    Vec::new(),
+                )
+                .await
+                .expect("把源 run 推到失败");
+        }
+
         let (status, retried) = post_json(
             &app,
             &format!("/api/v1/operations/{source_id}/retry"),
@@ -2949,6 +2968,34 @@ mod tests {
             client_run_id.contains("-retry-"),
             "重试的 clientRunId 应带 -retry- 后缀: {client_run_id}"
         );
+    }
+
+    /// 对**还在进行**的任务调 retry 必须 409：否则平台上会多一份、钱多扣一次。
+    ///
+    /// 负对照：去掉 `retry_operation` 里的在途守卫 ⇒ 这条会拿到 200 + 一个新 operation。
+    #[tokio::test]
+    async fn retry_over_http_refuses_an_operation_that_is_still_running() {
+        let (app, repositories) = test_app();
+        let token = issue_token(&repositories, &["operations:execute"]).await;
+        let (status, created) = post_json(
+            &app,
+            "/api/v1/operations",
+            &token,
+            create_operation_body("retry-inflight-key"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{created}");
+        let operation_id = created["data"]["operationId"].as_u64().unwrap();
+
+        let (status, body) = post_json(
+            &app,
+            &format!("/api/v1/operations/{operation_id}/retry"),
+            &token,
+            json!({}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT, "{body}");
+        assert_eq!(body["error"]["code"], "RETRY_SOURCE_IN_FLIGHT", "{body}");
     }
 
     #[tokio::test]

@@ -310,7 +310,16 @@ impl ReconcileService {
                             },
                         )
                         .await?;
-                    self.repositories
+                    // 这次对账来晚了一步：cancel 可能已经把 run 置成 CANCELLED。
+                    // 产物在上面已经落库（随任务删除一起清，无害），但**状态不能再推进**：
+                    // `ToSucceeded` 从 CANCELLED 出发是非法的，那个 `?` 会把整轮 tick
+                    // （其余 run 的轮询）一起打断——一个被取消的任务不该有这样的杀伤半径。
+                    //
+                    // ⚠️ 判据**不能**用 `complete_attempt` 返回的 `None`：attempt 在提交成功
+                    // 那一刻就已经是终态（SUCCEEDED），对账再调一次本来就返回 `None`。
+                    // 真正的判据是**迁移是否合法**。
+                    if let Err(error) = self
+                        .repositories
                         .transition_run(
                             run_id,
                             Transition::ToSucceeded,
@@ -324,7 +333,17 @@ impl ReconcileService {
                                 }),
                             }],
                         )
-                        .await?;
+                        .await
+                    {
+                        if error.code == "ILLEGAL_RUN_TRANSITION" {
+                            log_line(&format!(
+                                "[renderloft-reconcile] run={} 已被取消/已终态，跳过成功状态推进",
+                                run_id.0
+                            ));
+                            continue;
+                        }
+                        return Err(error);
+                    }
                     // 平台报的用量**原样落库**：`None` = "平台没说"，与 `0`（这次免费）不是一回事。
                     // 写不进去不能反过来毁掉一个已经成功的任务，但**绝不能静默**——日志里留痕。
                     if let Err(error) = self
@@ -353,10 +372,11 @@ impl ReconcileService {
                             },
                         )
                         .await?;
-                    self.repositories
-                        .set_run_error(run_id, Some(error.clone()))
-                        .await?;
-                    self.repositories
+                    // 同 Succeeded 分支：判据是**迁移是否合法**，不是 `complete_attempt`
+                    // 的返回值（attempt 可能是提交时就已终态的正常情况）。只有真的
+                    // `ILLEGAL_RUN_TRANSITION`（多半是被取消）才跳过，其余错误照旧上报。
+                    if let Err(transition_error) = self
+                        .repositories
                         .transition_run(
                             run_id,
                             Transition::ToFailed,
@@ -364,11 +384,25 @@ impl ReconcileService {
                                 event_type: "run.failed".to_string(),
                                 run_id: Some(run_id),
                                 safe_payload: json!({
-                                    "reason": error.message,
-                                    "error": error,
+                                    "reason": error.message.clone(),
+                                    "error": error.clone(),
                                 }),
                             }],
                         )
+                        .await
+                    {
+                        if transition_error.code == "ILLEGAL_RUN_TRANSITION" {
+                            log_line(&format!(
+                                "[renderloft-reconcile] run={} 已被取消/已终态，跳过失败状态推进",
+                                run_id.0
+                            ));
+                            continue;
+                        }
+                        return Err(transition_error);
+                    }
+                    // 先迁移成功再写错误：给一个已经取消的 run 写"失败原因"是另一种谎。
+                    self.repositories
+                        .set_run_error(run_id, Some(error.clone()))
                         .await?;
                     result.failed += 1;
                 }
